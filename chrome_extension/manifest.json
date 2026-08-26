@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "多代理下載器",
+  "version": "1.0",
+  "description": "將下載請求發送到多代理下載器應用程式",
+  "permissions": [
+    "contextMenus",
+    "storage",
+    "downloads",
+    "tabs",
+    "notifications"
+  ],
+  "host_permissions": [
+    "http://localhost:8765/*",
+    "http://127.0.0.1:8765/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "images/icon16.png",
+      "48": "images/icon48.png",
+      "128": "images/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "images/icon16.png",
+    "48": "images/icon48.png",
+    "128": "images/icon128.png"
+  }
+} 

@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>多代理下載器連接器</title>
+  <style>
+    body {
+      width: 300px;
+      padding: 10px;
+      font-family: 'Microsoft JhengHei', Arial, sans-serif;
+    }
+    .container {
+      display: flex;
+      flex-direction: column;
+      gap: 15px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .header img {
+      width: 24px;
+      height: 24px;
+    }
+    .header h1 {
+      margin: 0;
+      font-size: 16px;
+    }
+    .toggle-container {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .toggle {
+      position: relative;
+      display: inline-block;
+      width: 50px;
+      height: 24px;
+    }
+    .toggle input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: #ccc;
+      transition: .4s;
+      border-radius: 24px;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 16px;
+      width: 16px;
+      left: 4px;
+      bottom: 4px;
+      background-color: white;
+      transition: .4s;
+      border-radius: 50%;
+    }
+    input:checked + .slider {
+      background-color: #2196F3;
+    }
+    input:checked + .slider:before {
+      transform: translateX(26px);
+    }
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .form-group label {
+      font-weight: bold;
+    }
+    .form-group input {
+      padding: 5px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+    .status {
+      padding: 10px;
+      border-radius: 4px;
+      background-color: #f0f0f0;
+      margin-top: 10px;
+    }
+    .tasks-list {
+      padding: 10px;
+      border-radius: 4px;
+      background-color: #fafafa;
+      border: 1px solid #e0e0e0;
+      color: #555;
+      font-size: 13px;
+    }
+    .task-item {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      padding: 8px;
+      margin-bottom: 6px;
+      border-radius: 4px;
+      background-color: #fff;
+      border: 1px solid #e8e8e8;
+    }
+    .task-item:last-child {
+      margin-bottom: 0;
+    }
+    .task-title {
+      font-weight: bold;
+      color: #333;
+      word-break: break-all;
+    }
+    .task-meta {
+      color: #777;
+      font-size: 12px;
+    }
+    .buttons {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+    button {
+      padding: 5px 10px;
+      border: none;
+      border-radius: 4px;
+      background-color: #2196F3;
+      color: white;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #0b7dda;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <img src="images/icon48.png" alt="Logo">
+      <h1>多代理下載器連接器</h1>
+    </div>
+
+    <div class="toggle-container">
+      <span>啟用下載攔截</span>
+      <label class="toggle">
+        <input type="checkbox" id="enableToggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="toggle-container">
+      <span>取消 Chrome 原始下載</span>
+      <label class="toggle">
+        <input type="checkbox" id="cancelOriginalToggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="form-group">
+      <label for="serverUrl">應用程式伺服器地址：</label>
+      <input type="text" id="serverUrl" placeholder="http://localhost:8765">
+    </div>
+
+    <div class="status" id="connectionStatus">
+      連接狀態：檢查中...
+    </div>
+
+    <div class="tasks-list" id="tasksList">
+      沒有進行中的任務
+    </div>
+
+    <div class="buttons">
+      <button id="testConnection">測試連接</button>
+      <button id="saveSettings">儲存設定</button>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html> 

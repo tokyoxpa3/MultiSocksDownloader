@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# 虛擬環境
+env/
+venv/
+.venv/
+
+# 下載暫存檔
+*.downloading
+*.progress
+
+# 建置產物
+build/
+dist/
+*.exe
+*.spec
+*.build/
+*.dist/
+*.log
+
+# IDE / 編輯器
+.idea/
+.vscode/
+*.swp
