@@ -174,7 +174,7 @@ class DownloadTask:
 
     def _base_headers(self):
         return {
-            'User-Agent': 'Multi-Socks-Downloader/1.0',
+            'User-Agent': 'Multi-Socks-Downloader/1.1',
             'Accept-Encoding': 'identity',
             'Connection': 'keep-alive',
         }

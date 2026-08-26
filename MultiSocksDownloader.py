@@ -4,12 +4,23 @@
 """
 
 import sys
+import ctypes
 from ui import QApplication, MainWindow
 from http_server import HttpServer
 from downloader import DownloadManager
+from app_icon import load_app_icon
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setWindowIcon(load_app_icon())
+
+    # 設定 Windows AppUserModelID，讓執行中的任務列按鈕使用自訂圖示並正確分組
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "MultiSocksDownloader.1.1")
+        except Exception:
+            pass
 
     # 創建下載管理器實例（以後將通過共享單例模式優化）
     download_manager = DownloadManager()

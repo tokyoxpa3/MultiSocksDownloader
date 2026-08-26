@@ -20,6 +20,7 @@ dist/
 *.build/
 *.dist/
 *.log
+*.zip
 
 # IDE / 編輯器
 .idea/

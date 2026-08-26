@@ -8,14 +8,15 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QSpinBox, QFileDialog,
     QFormLayout, QGroupBox, QProgressBar, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QAbstractItemView, QMenu, QTabWidget,
-    QCheckBox, QSizePolicy, QScrollArea, QFrame, QSystemTrayIcon, QStyle,
+    QCheckBox, QSizePolicy, QScrollArea, QFrame, QSystemTrayIcon,
     QDialog, QPlainTextEdit
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QSize, QEvent, QPointF, QRectF
-from PySide6.QtGui import QIcon, QFont, QColor, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QFont, QColor, QPainter, QPainterPath, QPen
 from urllib.parse import urlparse, unquote, parse_qs
 
 from downloader import DownloadManager, format_size
+from app_icon import load_app_icon
 
 # 格式化時間顯示
 def format_time(seconds):
@@ -334,8 +335,10 @@ class MainWindow(QMainWindow):
         # 已通知完成的任務 ID，避免重複通知
         self.notified_completed = set()
 
-        # 系統列圖示（延遲建立）
+        # 系統匣圖示與相關狀態
         self._tray_icon = None
+        self._force_quit = False
+        self._tray_hint_shown = False
 
         self.setup_ui()  # 首先設置 UI，確保 task_table 被初始化
 
@@ -371,8 +374,12 @@ class MainWindow(QMainWindow):
         # 載入歷史下載紀錄
         self.load_history()
 
+        # 建立系統匣圖示
+        self._setup_tray()
+
     def setup_ui(self):
         self.setWindowTitle("多線程下載器")
+        self.setWindowIcon(load_app_icon())
         self.setMinimumSize(800, 600)
 
         # 主佈局
@@ -614,6 +621,11 @@ class MainWindow(QMainWindow):
         self.clipboard_checkbox = QCheckBox("剪貼簿自動偵測（複製連結即自動下載）")
         self.clipboard_checkbox.setToolTip("開啟後，複製網址/連結會自動加入下載")
         misc_layout.addWidget(self.clipboard_checkbox)
+
+        self.tray_checkbox = QCheckBox("最小化視窗時縮到系統匣")
+        self.tray_checkbox.setToolTip("開啟後，點最小化鈕會縮到系統匣繼續下載")
+        self.tray_checkbox.setChecked(True)
+        misc_layout.addWidget(self.tray_checkbox)
 
         settings_layout.addWidget(misc_group)
         settings_layout.addStretch()
@@ -937,14 +949,9 @@ class MainWindow(QMainWindow):
         """顯示下載完成通知（非阻塞）"""
         msg = f"下載完成: {filename}"
         try:
-            if QSystemTrayIcon.isSystemTrayAvailable():
-                tray = self._tray_icon
-                if tray is None:
-                    tray = QSystemTrayIcon(self)
-                    tray.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
-                    self._tray_icon = tray
-                tray.show()
-                tray.showMessage("下載完成", msg, QSystemTrayIcon.MessageIcon.Information, 5000)
+            if self._tray_icon is not None and QSystemTrayIcon.isSystemTrayAvailable():
+                self._tray_icon.show()
+                self._tray_icon.showMessage("下載完成", msg, QSystemTrayIcon.MessageIcon.Information, 5000)
                 return
         except Exception as e:
             print(f"系統列通知失敗: {e}")
@@ -1221,8 +1228,105 @@ class MainWindow(QMainWindow):
         if filepath:
             self.open_file_location(filepath)
 
+    # --- 系統匣（System Tray）支援 ---
+
+    def _setup_tray(self):
+        """建立系統匣圖示與右鍵選單；系統不支援時不建立。"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray_icon = None
+            return
+
+        tray = QSystemTrayIcon(load_app_icon(), self)
+        tray.setToolTip("多線程下載器")
+
+        menu = QMenu(self)
+        show_action = menu.addAction("顯示主視窗")
+        show_action.triggered.connect(self.show_main_window)
+        menu.addSeparator()
+        quit_action = menu.addAction("退出")
+        quit_action.triggered.connect(self.quit_app)
+        tray.setContextMenu(menu)
+
+        tray.activated.connect(self._on_tray_activated)
+        tray.show()
+        self._tray_icon = tray
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.show_main_window()
+
+    def show_main_window(self):
+        """從系統匣還原主視窗。"""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self):
+        """真正結束程式（觸發 closeEvent 執行清理）。"""
+        self._force_quit = True
+        self.close()
+
+    def _minimize_to_tray(self):
+        self.hide()
+        self._show_tray_hint()
+
+    def _show_tray_hint(self):
+        """首次縮到系統匣時以氣泡訊息提示仍在背景執行。"""
+        if self._tray_hint_shown:
+            return
+        self._tray_hint_shown = True
+        if self._tray_icon is not None:
+            self._tray_icon.showMessage(
+                "多線程下載器",
+                "程式仍在背景執行，點擊此圖示可重新開啟主視窗",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000,
+            )
+
+    def changeEvent(self, event):
+        """最小化視窗時依設定縮到系統匣。"""
+        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
+            if (getattr(self, 'tray_checkbox', None) and self.tray_checkbox.isChecked()
+                    and QSystemTrayIcon.isSystemTrayAvailable()):
+                QTimer.singleShot(0, self._minimize_to_tray)
+        super().changeEvent(event)
+
+    def _ask_close_action(self):
+        """關閉時詢問要縮到系統匣或完全關閉，回傳 'tray' / 'quit' / 'cancel'。"""
+        box = QMessageBox(self)
+        box.setWindowTitle("關閉程式")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("要縮到系統匣繼續下載，還是完全關閉程式？")
+        box.setInformativeText("縮到系統匣後，下載會在背景繼續進行。")
+        tray_btn = box.addButton("縮到系統匣", QMessageBox.ButtonRole.AcceptRole)
+        quit_btn = box.addButton("完全關閉", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(tray_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked == tray_btn:
+            return "tray"
+        if clicked == quit_btn:
+            return "quit"
+        return "cancel"
+
     def closeEvent(self, event):
-        # 不再詢問用戶是否關閉，直接保存進度
+        # 點右上角關閉時，彈窗詢問要縮到系統匣或完全關閉
+        if not self._force_quit and QSystemTrayIcon.isSystemTrayAvailable():
+            action = self._ask_close_action()
+            if action == "tray":
+                self._minimize_to_tray()
+                event.ignore()
+                return
+            if action == "cancel":
+                event.ignore()
+                return
+            # action == "quit"：繼續往下真正關閉
+            self._force_quit = True
+
+        # 真正關閉：保存進度並清理執行緒
 
         # 停止監控線程
         self.monitor_thread.stop()
