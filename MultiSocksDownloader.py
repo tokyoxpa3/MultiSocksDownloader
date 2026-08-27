@@ -10,7 +10,32 @@ from http_server import HttpServer
 from downloader import DownloadManager
 from app_icon import load_app_icon
 
+# 保留 mutex 控制代碼，避免程式執行期間釋放而失去鎖定
+_single_instance_mutex = None
+
+
+def _ensure_single_instance():
+    """確保同時只有一個程式實例在執行；已存在時直接結束。"""
+    if sys.platform != "win32":
+        return
+
+    ERROR_ALREADY_EXISTS = 183
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.restype = ctypes.c_void_p
+    create_mutex.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+
+    global _single_instance_mutex
+    _single_instance_mutex = create_mutex(
+        None, False, "MultiSocksDownloader_SingleInstance_Mutex"
+    )
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        sys.exit(0)
+
+
 if __name__ == "__main__":
+    _ensure_single_instance()
+
     app = QApplication(sys.argv)
     app.setWindowIcon(load_app_icon())
 

@@ -1,2 +1,2 @@
 -r requirements.txt
-nuitka==2.6.8
+nuitka==4.1.3
