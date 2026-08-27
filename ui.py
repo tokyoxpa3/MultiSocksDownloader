@@ -1219,14 +1219,26 @@ class MainWindow(QMainWindow):
         else:  # Linux 無統一選取檔案方式，退回開啟資料夾
             self.open_folder(filepath)
 
+    def open_file(self, filepath):
+        """用系統預設程式直接開啟檔案。"""
+        import subprocess
+        import platform
+
+        if platform.system() == "Windows":
+            os.startfile(filepath)
+        elif platform.system() == "Darwin":  # macOS
+            subprocess.call(["open", filepath])
+        else:  # Linux
+            subprocess.call(["xdg-open", filepath])
+
     def on_history_double_clicked(self, row, column):
-        """歷史紀錄雙擊：開啟檔案所在資料夾並選取該檔案。"""
+        """歷史紀錄雙擊：直接開啟檔案。"""
         filepath_item = self.history_table.item(row, 2)
         if not filepath_item:
             return
         filepath = filepath_item.text()
         if filepath:
-            self.open_file_location(filepath)
+            self.open_file(filepath)
 
     # --- 系統匣（System Tray）支援 ---
 
