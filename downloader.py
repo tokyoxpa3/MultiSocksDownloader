@@ -12,6 +12,9 @@ import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+from ftp_downloader import SocksFTP, parse_ftp_url
+from bt_downloader import BTTask, source_kind
+
 logger = logging.getLogger('downloader')
 
 # 區塊（切片）自適應大小：依檔案大小決定區塊數，避免大檔案切出上百 MB 的巨片。
@@ -83,7 +86,21 @@ class DownloadTask:
                  rate_limiter=None):
         self.url = url
         self.save_dir = save_dir
+
+        # FTP 相關欄位：is_ftp 由 URL scheme 判定；FTP 的連線參數在 __init__
+        # 解析一次，load_progress 不會覆寫它們（url 不變即保持）。
+        self.is_ftp = urlparse(self.url).scheme.lower() == 'ftp'
+        self._ftp_host = ''
+        self._ftp_port = 21
+        self._ftp_user = ''
+        self._ftp_pass = ''
+        self._ftp_path = '/'
+        if self.is_ftp:
+            (self._ftp_host, self._ftp_port, self._ftp_user,
+             self._ftp_pass, self._ftp_path) = parse_ftp_url(self.url)
         self.proxies = proxies or []
+        # 分線位元組計數（line_key -> 累計位元組），供 UI 顯示各線速度
+        self._line_bytes = {}
         self.threads_per_proxy = max(1, int(threads_per_proxy))
         self.chunks_per_part = int(chunks_per_part or 0)
         self.headers = dict(headers or {})
@@ -135,6 +152,9 @@ class DownloadTask:
         self._last_time = time.time()
 
         self._resumed_size = 0
+
+        # 完成回呼（由 DownloadManager 注入，供 .torrent 下載完成後自動接續 BT）
+        self.on_complete = None
 
         self.task_id = None
         self.threads = []
@@ -207,6 +227,12 @@ class DownloadTask:
         for p in self.proxies:
             lines.append(p)
         return lines
+
+    def _line_key(self, line):
+        """線路識別鍵：直連為 'direct'，代理為 'proxy:host:port'。"""
+        if line is None:
+            return 'direct'
+        return f"proxy:{line.get('host')}:{line.get('port')}"
 
     # ------------------------------------------------------------------ #
     # 進度單一資料源：bitmap，每一位元代表一個區塊，1=已完成（且已 fsync 落盤）。
@@ -385,7 +411,10 @@ class DownloadTask:
 
         try:
             os.makedirs(self.save_dir, exist_ok=True)
-            info = self._probe(self._build_lines())
+            if self.is_ftp:
+                info = self._probe_ftp()
+            else:
+                info = self._probe(self._build_lines())
             if info is None:
                 self.status = 'error'
                 self.error_message = '無法連接伺服器或取得檔案資訊'
@@ -478,6 +507,68 @@ class DownloadTask:
         logger.warning("所有線路探測失敗或逾時")
         return None
 
+    def _probe_ftp(self):
+        """並行探測所有線路的 FTP 連線，回傳 {'supports_range','total_size','headers'}。
+
+        與 HTTP 的 _probe 不同：FTP 只要成功登入就視為探測成功，
+        即使取不到檔案大小（total_size=0）也回傳，交由 prepare() 依
+        supports_range 與 total_size 決定分段或單一模式。
+        """
+        lines = self._build_lines()
+        result = {}
+        done = threading.Event()
+        lock = threading.Lock()
+        deadline = time.time() + 15
+
+        def _attempt(line):
+            ftp = None
+            try:
+                ftp = SocksFTP(line)
+                ftp.connect(self._ftp_host, self._ftp_port)
+                self._ftp_login(ftp)
+                supports_range = True
+                try:
+                    # REST 0 成功回 350，不支援的伺服器會回 5xx 拋例外
+                    ftp.sendcmd('REST 0')
+                except Exception:
+                    supports_range = False
+                total_size = 0
+                try:
+                    total_size = ftp.size(self._ftp_path) or 0
+                except Exception:
+                    total_size = 0
+                with lock:
+                    if 'info' not in result:
+                        result['info'] = {
+                            'supports_range': supports_range,
+                            'total_size': total_size,
+                            'headers': {},
+                        }
+                done.set()
+            except Exception as e:
+                logger.debug("FTP 探測線路失敗: %s", e)
+            finally:
+                if ftp is not None:
+                    try:
+                        ftp.close()
+                    except Exception:
+                        pass
+
+        threads = [threading.Thread(target=_attempt, args=(p,), daemon=True)
+                   for p in lines]
+        for t in threads:
+            t.start()
+        done.wait(timeout=max(0.0, deadline - time.time()))
+
+        with lock:
+            info = result.get('info')
+        if info is not None:
+            logger.debug("FTP 探測成功: range=%s, total=%s",
+                         info['supports_range'], info['total_size'])
+            return info
+        logger.warning("所有 FTP 線路探測失敗或逾時")
+        return None
+
     def _compute_chunk_size(self):
         """依檔案大小挑選讀取區塊大小，減少高速下載時的讀取呼叫開銷。"""
         if self.total_size <= 0:
@@ -565,7 +656,7 @@ class DownloadTask:
                 with self._lock:
                     self._active_blocks.add(idx)
                 try:
-                    result = self._download_block(idx, session, stop)
+                    result = self._download_block(idx, session, stop, proxy)
                 finally:
                     with self._lock:
                         self._active_blocks.discard(idx)
@@ -581,7 +672,7 @@ class DownloadTask:
             except Exception:
                 pass
 
-    def _download_block(self, idx, session, stop):
+    def _download_block(self, idx, session, stop, proxy=None):
         start, end = self._block_bounds(idx)
         end -= 1  # inclusive
         if start >= self.total_size:
@@ -607,7 +698,7 @@ class DownloadTask:
             return self._handle_block_failure(idx, f"連接失敗: {e}", stop)
 
         if r.status_code == 206:
-            return self._write_block(idx, req_start, end, r, stop)
+            return self._write_block(idx, req_start, end, r, stop, proxy)
         elif r.status_code == 200:
             r.close()
             return 'fallback'
@@ -618,10 +709,11 @@ class DownloadTask:
             r.close()
             return self._handle_block_failure(idx, f"HTTP {r.status_code}", stop)
 
-    def _write_block(self, idx, start, end, r, stop):
+    def _write_block(self, idx, start, end, r, stop, proxy=None):
         need = end - start + 1
         with self._lock:
             self._partial[idx] = 0
+        key = self._line_key(proxy)
         try:
             with open(self.temp_filepath, 'r+b') as f:
                 f.seek(start)
@@ -641,6 +733,7 @@ class DownloadTask:
                     pos += len(data)
                     with self._lock:
                         self._partial[idx] = pos - start
+                        self._line_bytes[key] = self._line_bytes.get(key, 0) + len(data)
                 r.close()
                 f.flush()
                 os.fsync(f.fileno())
@@ -700,6 +793,7 @@ class DownloadTask:
             if cl:
                 self.total_size = int(cl)
             bytes_since_fsync = 0
+            key = self._line_key(proxy)
             with open(self.temp_filepath, 'wb') as f:
                 for chunk in r.iter_content(self.chunk_size):
                     if stop.is_set():
@@ -711,6 +805,7 @@ class DownloadTask:
                     f.write(chunk)
                     with self._lock:
                         self.downloaded_size += len(chunk)
+                        self._line_bytes[key] = self._line_bytes.get(key, 0) + len(chunk)
                     bytes_since_fsync += len(chunk)
                     if bytes_since_fsync >= 8 * 1024 * 1024:
                         f.flush()
@@ -729,6 +824,168 @@ class DownloadTask:
         # 只有仍是當前世代（stop 未被新 start() 取代）才允許完成收尾，
         # 避免暫停/恢復後舊 worker 誤把新世代的下載標記為完成。
         if stop is self._stop:
+            self.complete_download()
+
+    # ------------------------------------------------------------------ #
+    # FTP workers
+    # ------------------------------------------------------------------ #
+    def _ftp_login(self, ftp):
+        """登入 FTP：URL 有帳密則用帳密，否則匿名登入；一律切到二進位模式。
+
+        REST/RETR 都需要二進位模式（ASCII 模式會拒絕 REST 且會轉譯換行），
+        而直接使用 transfercmd 不會像 retrbinary 那樣自動送 TYPE I，故在此統一送出。
+        """
+        if self._ftp_user or self._ftp_pass:
+            ftp.login(self._ftp_user, self._ftp_pass)
+        else:
+            ftp.login()
+        ftp.voidcmd('TYPE I')
+
+    def _ftp_worker(self, line, stop):
+        """單一線路的 FTP worker：反覆 pop 區塊，每個區塊以獨立連線下載。"""
+        while not stop.is_set():
+            idx = self._pop_block()
+            if idx is None:
+                break
+            if self._is_block_done(idx):
+                continue
+            with self._lock:
+                self._active_blocks.add(idx)
+            try:
+                result = self._ftp_download_block(idx, line, stop)
+            finally:
+                with self._lock:
+                    self._active_blocks.discard(idx)
+            if result == 'ok':
+                if self._all_blocks_done():
+                    break
+            elif result == 'fail' and stop.is_set():
+                break
+
+    def _ftp_download_block(self, idx, line, stop):
+        """下載單一 FTP 區塊：REST 定位到區塊內偏移、RETR 後只讀取本區塊位元組。
+
+        每個區塊都以獨立 FTP 連線抓取（控制+資料用完即丟），避免 ftplib
+        控制連線在中途中斷資料傳輸後、回應串流狀態難以同步的問題。
+        """
+        start, end = self._block_bounds(idx)
+        end -= 1  # inclusive
+        full_len = end - start + 1
+        if start >= self.total_size:
+            return 'ok'
+
+        with self._lock:
+            off = self._partial.get(idx, 0)
+        req_start = start + off
+        if req_start > end:
+            with self._lock:
+                self._set_block_done(idx)
+                self._partial.pop(idx, None)
+            return 'ok'
+
+        need = full_len - off  # 本輪要抓取的位元組數
+        ftp = None
+        try:
+            ftp = SocksFTP(line)
+            ftp.connect(self._ftp_host, self._ftp_port)
+            self._ftp_login(ftp)
+            conn = ftp.transfercmd('RETR ' + self._ftp_path, rest=req_start)
+            fp = conn.makefile('rb')
+            pos = req_start
+            key = self._line_key(line)
+            try:
+                with open(self.temp_filepath, 'r+b') as f:
+                    f.seek(req_start)
+                    remaining = need
+                    while remaining > 0 and not stop.is_set():
+                        chunk = fp.read(min(self.chunk_size, remaining))
+                        if not chunk:
+                            break
+                        if self.rate_limiter is not None:
+                            self.rate_limiter.acquire(len(chunk))
+                        f.write(chunk)
+                        pos += len(chunk)
+                        remaining -= len(chunk)
+                        with self._lock:
+                            self._partial[idx] = pos - start  # 累計偏移
+                            self._line_bytes[key] = self._line_bytes.get(key, 0) + len(chunk)
+            finally:
+                fp.close()
+                conn.close()
+        except Exception as e:
+            with self._lock:
+                self._partial.pop(idx, None)
+            return self._handle_block_failure(
+                idx, f"FTP 區塊下載失敗: {e}", stop)
+        finally:
+            if ftp is not None:
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+
+        if stop.is_set():
+            with self._lock:
+                self._partial.pop(idx, None)
+            return 'fail'
+
+        if pos - start >= full_len:
+            with self._lock:
+                self._set_block_done(idx)
+                self._partial.pop(idx, None)
+            return 'ok'
+
+        with self._lock:
+            self._partial.pop(idx, None)
+        return self._handle_block_failure(
+            idx, f"FTP 區塊下載不完整: {pos - start}/{full_len}", stop)
+
+    def _ftp_single_worker(self, line, stop):
+        """FTP 單一模式：整檔串流下載（不支援 REST 或取不到大小時）。"""
+        class _Stopped(Exception):
+            pass
+
+        ftp = None
+        try:
+            ftp = SocksFTP(line)
+            ftp.connect(self._ftp_host, self._ftp_port)
+            self._ftp_login(ftp)
+            try:
+                size = ftp.size(self._ftp_path)
+                if size:
+                    with self._lock:
+                        self.total_size = size
+            except Exception:
+                pass
+
+            key = self._line_key(line)
+            with open(self.temp_filepath, 'wb') as f:
+                def _write(chunk):
+                    if stop.is_set():
+                        raise _Stopped()
+                    if self.rate_limiter is not None:
+                        self.rate_limiter.acquire(len(chunk))
+                    f.write(chunk)
+                    with self._lock:
+                        self.downloaded_size += len(chunk)
+                        self._line_bytes[key] = self._line_bytes.get(key, 0) + len(chunk)
+
+                ftp.retrbinary('RETR ' + self._ftp_path, _write,
+                               blocksize=self.chunk_size)
+        except _Stopped:
+            pass
+        except Exception as e:
+            if not stop.is_set():
+                self.status = 'error'
+                self.error_message = str(e)
+        finally:
+            if ftp is not None:
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+        # 未中斷（未被暫停）且仍是當前世代才收尾，避免把半成品當完成
+        if not stop.is_set() and stop is self._stop:
             self.complete_download()
 
     def _completion_loop(self, stop):
@@ -767,6 +1024,9 @@ class DownloadTask:
         self._last_time = time.time()
         self._speed_history.clear()
 
+        if self.is_ftp:
+            return self._start_ftp(stop)
+
         if self._single_mode:
             proxy = self.proxies[0] if self.proxies else None
             self.threads = []
@@ -787,6 +1047,45 @@ class DownloadTask:
                 if spawned >= max_workers:
                     break
                 t = threading.Thread(target=self._worker, args=(line, stop), daemon=True)
+                self._workers.append(t)
+                self.threads.append(t)
+                t.start()
+                spawned += 1
+            if spawned >= max_workers:
+                break
+
+        self._completion_thread = threading.Thread(
+            target=self._completion_loop, args=(stop,), daemon=True)
+        self.threads.append(self._completion_thread)
+        self._completion_thread.start()
+        return True
+
+    def _start_ftp(self, stop):
+        """啟動 FTP 下載：分段模式每條線路多個 worker，單一模式一條連線。"""
+        lines = self._build_lines()
+        self.threads = []
+        self._workers = []
+
+        if self._single_mode:
+            line = lines[0] if lines else None
+            t = threading.Thread(
+                target=self._ftp_single_worker, args=(line, stop), daemon=True)
+            self.threads.append(t)
+            t.start()
+            return True
+
+        self._rebuild_pool()
+        # 每條線路開 threads_per_proxy 個 worker，各自建立獨立 FTP 連線抓不同
+        # 區塊，以多連線並行榨取單一線路（如 5G）的頻寬。工作者數不超過剩餘
+        # 區塊數，避免空轉的線程。
+        max_workers = self.block_count if self.block_count > 0 else len(lines) * self.threads_per_proxy
+        spawned = 0
+        for line in lines:
+            for _ in range(self.threads_per_proxy):
+                if spawned >= max_workers:
+                    break
+                t = threading.Thread(
+                    target=self._ftp_worker, args=(line, stop), daemon=True)
                 self._workers.append(t)
                 self.threads.append(t)
                 t.start()
@@ -843,6 +1142,7 @@ class DownloadTask:
     def complete_download(self):
         if not self._completion_lock.acquire(blocking=False):
             return
+        succeeded = False
         try:
             if self.status == 'completed':
                 return
@@ -857,11 +1157,17 @@ class DownloadTask:
                     os.replace(self.temp_filepath, self.filepath)
                 if os.path.exists(self.progress_filepath):
                     os.remove(self.progress_filepath)
+                succeeded = True
             except Exception as e:
                 self.status = 'error'
                 self.error_message = f"完成下載時出錯: {e}"
         finally:
             self._completion_lock.release()
+        if succeeded and self.on_complete is not None:
+            try:
+                self.on_complete(self)
+            except Exception as e:
+                logger.warning("下載完成回呼失敗: %s", e)
 
     def is_running(self):
         return self.status == 'downloading'
@@ -894,6 +1200,12 @@ class DownloadTask:
         if self.start_time:
             elapsed = (self.end_time or time.time()) - self.start_time
         speed = self.get_current_speed()
+        with self._lock:
+            line_bytes = dict(self._line_bytes)
+        line_labels = {
+            key: ('直連' if key == 'direct' else key[6:])
+            for key in line_bytes
+        }
         return {
             'total_size': total,
             'downloaded_size': downloaded,
@@ -905,6 +1217,8 @@ class DownloadTask:
             'thread_count': max(1, len(self._workers or [])),
             'block_count': self.block_count,
             'blocks': self._get_blocks_state(),
+            'line_bytes': line_bytes,
+            'line_labels': line_labels,
         }
 
 
@@ -921,6 +1235,10 @@ class DownloadManager:
 
         self.default_chunks_per_part = 0   # 0 = 自適應切片
         self.default_threads_per_proxy = 6
+
+        # BT / PT 防封號與做種設定
+        self.bt_seed_hours = 0.0      # 下載完成後繼續做種時數，0 表示不做種
+        self.bt_upload_rate = 0       # BT 上傳限速（bytes/sec），0 表示不限速
 
         self.speed_limit = 0  # bytes/sec，0 表示不限速
         self.rate_limiter = RateLimiter()
@@ -957,6 +1275,10 @@ class DownloadManager:
                         int(k) for k in self.socks_proxies.keys()) + 1
             if 'speed_limit' in config:
                 self.set_speed_limit(int(config['speed_limit']))
+            if 'bt_seed_hours' in config:
+                self.bt_seed_hours = max(0.0, float(config['bt_seed_hours']))
+            if 'bt_upload_rate' in config:
+                self.bt_upload_rate = max(0, int(config['bt_upload_rate']))
             if 'custom_headers' in config and isinstance(config['custom_headers'], dict):
                 self.custom_headers = config['custom_headers']
             if 'history' in config and isinstance(config['history'], list):
@@ -973,6 +1295,8 @@ class DownloadManager:
                 'download_dirs': list(self.download_dirs),
                 'socks_proxies': self.socks_proxies,
                 'speed_limit': self.speed_limit,
+                'bt_seed_hours': self.bt_seed_hours,
+                'bt_upload_rate': self.bt_upload_rate,
                 'custom_headers': self.custom_headers,
                 'history': self.history,
                 'next_history_id': self.next_history_id,
@@ -1118,7 +1442,15 @@ class DownloadManager:
     # ------------------------------------------------------------------ #
     def add_task(self, url, filename=None, save_dir=None,
                  use_proxy=True, chunks_per_part=None, threads_per_proxy=None,
-                 headers=None):
+                 headers=None, line=None, selected_files=None,
+                 seed_hours=None, upload_rate_limit=None):
+        # BT 來源（magnet 連結或 .torrent 檔路徑）走獨立任務類別
+        if source_kind(url) is not None:
+            return self._add_bt_task(url, filename, save_dir, line=line,
+                                     use_proxy=use_proxy, selected_files=selected_files,
+                                     seed_hours=seed_hours,
+                                     upload_rate_limit=upload_rate_limit)
+
         with self._lock:
             if url in self.tasks:
                 existing = self.tasks[url]
@@ -1153,11 +1485,68 @@ class DownloadManager:
             headers=merged_headers,
             rate_limiter=self.rate_limiter,
         )
+        task.on_complete = self._on_download_completed
         with self._lock:
             task_id = self.next_id
             self.next_id += 1
             task.task_id = task_id
             self.tasks[url] = task
+            self.task_ids[task_id] = task
+        return task_id
+
+    def _on_download_completed(self, task):
+        """一般下載任務完成後的回呼：若下載的是 .torrent 檔，自動接續建立並啟動 BT 任務。"""
+        if not task.is_completed():
+            return
+        path = getattr(task, 'filepath', '')
+        if not (isinstance(path, str) and path.lower().endswith('.torrent')
+                and os.path.isfile(path)):
+            return
+        try:
+            bt_id = self._add_bt_task(path, None, task.save_dir, line=None, use_proxy=True)
+            self.start_task(bt_id)
+            logger.info("種子下載完成，自動啟動 BT 任務: %s -> %s", path, bt_id)
+        except Exception as e:
+            logger.warning("自動啟動 BT 任務失敗: %s", e)
+
+    def _add_bt_task(self, source, filename, save_dir, line=None, use_proxy=True,
+                     selected_files=None, seed_hours=None, upload_rate_limit=None):
+        """建立 BT 下載任務（magnet 或 .torrent），支援自選線路（直連或指定 SOCKS5）。"""
+        with self._lock:
+            if source in self.tasks:
+                existing = self.tasks[source]
+                if existing.status in ('initialized', 'downloading', 'seeding', 'paused'):
+                    return existing.task_id
+                self.task_ids.pop(existing.task_id, None)
+
+        save_dir = save_dir or self.save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        with self._lock:
+            self.download_dirs.add(save_dir)
+        self.save_config()
+
+        # 解析指定線路
+        proxy = None
+        if isinstance(line, dict):
+            proxy = line
+        elif line == 'direct':
+            proxy = None
+        elif use_proxy:
+            # 若未指定特定線路，預設採直連（以便 DHT 運作）
+            proxy = None
+
+        actual_seed_hours = self.bt_seed_hours if seed_hours is None else seed_hours
+        actual_upload_rate = self.bt_upload_rate if upload_rate_limit is None else upload_rate_limit
+
+        task = BTTask(source, save_dir, filename=filename, proxy=proxy,
+                      selected_files=selected_files,
+                      seed_hours=actual_seed_hours,
+                      upload_rate_limit=actual_upload_rate)
+        with self._lock:
+            task_id = self.next_id
+            self.next_id += 1
+            task.task_id = task_id
+            self.tasks[source] = task
             self.task_ids[task_id] = task
         return task_id
 
@@ -1224,6 +1613,14 @@ class DownloadManager:
     def get_speed_limit(self):
         return self.speed_limit
 
+    def set_bt_seed_hours(self, hours):
+        """設定 BT 下載完成後預設繼續做種時數（小時），0 表示不做種。"""
+        self.bt_seed_hours = max(0.0, float(hours or 0))
+
+    def set_bt_upload_rate(self, rate_bytes_per_sec):
+        """設定 BT 上傳限速（bytes/sec），0 表示不限速。"""
+        self.bt_upload_rate = max(0, int(rate_bytes_per_sec or 0))
+
     def set_custom_headers(self, headers):
         """設定全域預設自訂表頭（dict）。"""
         self.custom_headers = dict(headers or {})
@@ -1276,6 +1673,7 @@ class DownloadManager:
                     )
                     if not task.load_progress():
                         continue
+                    task.on_complete = self._on_download_completed
                     with self._lock:
                         task_id = self.next_id
                         self.next_id += 1
@@ -1285,5 +1683,47 @@ class DownloadManager:
                     count += 1
                 except Exception as e:
                     logger.warning("掃描未完成任務 %s 失敗: %s", progress_file, e)
+
+        # BT 任務掃描：<save_dir>/.bt_tmp/<infohash>/task.json
+        for directory in list(self.download_dirs):
+            bt_root = os.path.join(directory, '.bt_tmp')
+            if not os.path.isdir(bt_root):
+                continue
+            try:
+                hh_entries = os.listdir(bt_root)
+            except Exception:
+                continue
+            for hh in hh_entries:
+                task_json = os.path.join(bt_root, hh, 'task.json')
+                if not os.path.isfile(task_json):
+                    continue
+                try:
+                    with open(task_json, 'r', encoding='utf-8') as f:
+                        state = json.load(f)
+                    source = state.get('source')
+                    if not source or source in self.tasks:
+                        continue
+                    proxy = state.get('proxy')
+                    if proxy is None and state.get('proxies'):
+                        proxy = state['proxies'][0]
+                    task = BTTask(
+                        source,
+                        state.get('save_dir') or directory,
+                        filename=state.get('filename'),
+                        proxy=proxy,
+                        selected_files=state.get('selected_files'),
+                        seed_hours=state.get('seed_hours', self.bt_seed_hours),
+                        upload_rate_limit=state.get('upload_rate_limit', self.bt_upload_rate),
+                    )
+                    task.status = 'paused'
+                    with self._lock:
+                        task_id = self.next_id
+                        self.next_id += 1
+                        task.task_id = task_id
+                        self.tasks[source] = task
+                        self.task_ids[task_id] = task
+                    count += 1
+                except Exception as e:
+                    logger.warning("掃描未完成 BT 任務 %s 失敗: %s", task_json, e)
         self.save_config()
         return count

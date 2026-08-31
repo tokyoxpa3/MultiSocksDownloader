@@ -8,15 +8,18 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QSpinBox, QFileDialog,
     QFormLayout, QGroupBox, QProgressBar, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QAbstractItemView, QMenu, QTabWidget,
-    QCheckBox, QSizePolicy, QScrollArea, QFrame, QSystemTrayIcon,
-    QDialog, QPlainTextEdit
+    QCheckBox, QComboBox, QTreeWidget, QTreeWidgetItem, QSizePolicy,
+    QScrollArea, QFrame, QSystemTrayIcon,
+    QDialog, QPlainTextEdit, QStyle, QLayout
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QThread, QSize, QEvent, QPointF, QRectF
+from PySide6.QtCore import Qt, QTimer, Signal, QThread, QSize, QEvent, QPointF, QRectF, QPoint, QRect
 from PySide6.QtGui import QFont, QColor, QPainter, QPainterPath, QPen
 from urllib.parse import urlparse, unquote, parse_qs
 
 from downloader import DownloadManager, format_size
 from app_icon import load_app_icon
+import libtorrent as lt
+from bt_downloader import torrent_file_tree, magnet_display_name
 
 # 格式化時間顯示
 def format_time(seconds):
@@ -246,6 +249,117 @@ def extract_filename_from_url(url):
     return ''
 
 
+# 分線 chip 配色（依序套用：直連綠、代理藍紫橙…）
+LINE_COLORS = ["#2ecc71", "#3498db", "#9b59b6", "#e67e22", "#1abc9c", "#e74c3c"]
+
+# 全域樣式（QSS）：統一表格、表頭、進度條與狀態徽章的現代化外觀。
+# 重點：表格儲存格加上內邊距，避免文字貼邊、被縱向網格線截斷。
+APP_QSS = """
+QTableWidget, QTreeWidget {
+    background-color: #ffffff;
+    alternate-background-color: #f7f9fb;
+    border: 1px solid #e3e7eb;
+    border-radius: 6px;
+    gridline-color: #edf0f3;
+    outline: 0;
+}
+QTableWidget::item, QTreeWidget::item {
+    padding: 6px 10px;
+    border: none;
+}
+QHeaderView::section {
+    background-color: #f2f4f7;
+    color: #55606c;
+    padding: 8px 10px;
+    border: none;
+    border-bottom: 1px solid #e3e7eb;
+    font-weight: 600;
+}
+QProgressBar {
+    border: none;
+    background-color: #eef1f4;
+    border-radius: 4px;
+}
+QProgressBar::chunk {
+    background-color: #3b9bff;
+    border-radius: 4px;
+}
+QLabel#statsBadge {
+    background-color: #eef4fc;
+    border: 1px solid #d5e4f3;
+    border-radius: 14px;
+    padding: 6px 14px;
+    color: #3a5a78;
+}
+"""
+
+
+# 簡易 Flow Layout：子元件依序排列，超出寬度自動換行（分線膠囊換行用）
+class FlowLayout(QLayout):
+    def __init__(self, parent=None, margin=0, spacing=4):
+        super().__init__(parent)
+        self._items = []
+        self._margin = margin
+        self._spacing = spacing
+        if parent is not None:
+            self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        size += QSize(2 * self._margin, 2 * self._margin)
+        return size
+
+    def _do_layout(self, rect, test_only):
+        x = rect.x() + self._margin
+        y = rect.y() + self._margin
+        line_height = 0
+        for item in self._items:
+            hint = item.sizeHint()
+            if x + hint.width() > rect.right() - self._margin and line_height > 0:
+                x = rect.x() + self._margin
+                y = y + line_height + self._spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = x + hint.width() + self._spacing
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + self._margin
+
+
 # 新增下載對話框：貼 URL → 自動帶出檔名（可自訂）→ 確認加入佇列
 class AddDownloadDialog(QDialog):
     def __init__(self, parent=None, default_save_dir=""):
@@ -320,6 +434,296 @@ class AddDownloadDialog(QDialog):
         return self.dir_edit.text().strip()
 
 
+# 種子下載對話框：選擇線路、儲存位置，並以檔案樹勾選要下載的檔案（類 uTorrent）。
+class TorrentDialog(QDialog):
+    def __init__(self, source, download_manager, parent=None):
+        super().__init__(parent)
+        self.source = source
+        self.download_manager = download_manager
+
+        self._ti = None
+        self._is_torrent = False
+        if not source.startswith('magnet:'):
+            try:
+                self._ti = lt.torrent_info(source)
+                self._is_torrent = True
+            except Exception as e:
+                QMessageBox.warning(self, "錯誤", f"解析種子失敗:\n{e}")
+
+        self.setWindowTitle("新增種子下載")
+        self.setMinimumSize(600, 520)
+
+        layout = QVBoxLayout(self)
+
+        # 名稱
+        name = self._ti.name() if self._is_torrent else magnet_display_name(source)
+        layout.addWidget(QLabel(f"名稱: {name or '磁力連結下載'}"))
+
+        # 儲存位置
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel("儲存位置:"))
+        self.dir_edit = QLineEdit(download_manager.save_dir or "")
+        browse_btn = QPushButton("瀏覽...")
+        browse_btn.clicked.connect(self._browse_dir)
+        dir_row.addWidget(self.dir_edit)
+        dir_row.addWidget(browse_btn)
+        layout.addLayout(dir_row)
+
+        # 線路選擇：直連或任一 SOCKS5 代理
+        line_row = QHBoxLayout()
+        line_row.addWidget(QLabel("線路:"))
+        self.line_combo = QComboBox()
+        self.line_combo.addItem("直連", None)
+        for p in download_manager.socks_proxies.values():
+            host = p.get('host', '')
+            port = p.get('port', '')
+            pname = (p.get('name') or '').strip()
+            label = f"{pname} ({host}:{port})" if pname else f"{host}:{port}"
+            self.line_combo.addItem(label, {
+                'host': host,
+                'port': int(port),
+                'username': p.get('username') or '',
+                'password': p.get('password') or '',
+            })
+        line_row.addWidget(self.line_combo)
+        line_row.addStretch()
+        layout.addLayout(line_row)
+
+        # 做種時數設定（預設帶出全域設定值）
+        seed_row = QHBoxLayout()
+        seed_row.addWidget(QLabel("做種時數:"))
+        self.seed_spinbox = QSpinBox()
+        self.seed_spinbox.setRange(0, 720)
+        self.seed_spinbox.setValue(int(download_manager.bt_seed_hours))
+        self.seed_spinbox.setSpecialValueText("不做種")
+        self.seed_spinbox.setSuffix(" 小時")
+        seed_row.addWidget(self.seed_spinbox)
+        seed_row.addStretch()
+        layout.addLayout(seed_row)
+
+        # 檔案清單：.torrent 可立即解析；magnet 需連上 peers 後才有資訊
+        layout.addWidget(QLabel("檔案:"))
+        self._file_items = []
+        self._updating_tree = False
+        if self._is_torrent:
+            self.file_tree = QTreeWidget()
+            self.file_tree.setHeaderLabels(["名稱", "大小"])
+            header = self.file_tree.header()
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+            header.resizeSection(1, 90)
+            header.setStretchLastSection(False)
+            self.file_tree.setIndentation(18)
+            self.file_tree.itemChanged.connect(self._on_file_item_changed)
+
+            self.selected_size_label = QLabel("")
+            self.selected_size_label.setStyleSheet("color: #333;")
+
+            self._populate_files()
+            layout.addWidget(self.file_tree)
+            layout.addWidget(self.selected_size_label)
+
+            sel_row = QHBoxLayout()
+            all_btn = QPushButton("全選")
+            none_btn = QPushButton("全不選")
+            all_btn.clicked.connect(lambda: self._set_all(Qt.CheckState.Checked))
+            none_btn.clicked.connect(lambda: self._set_all(Qt.CheckState.Unchecked))
+            sel_row.addStretch()
+            sel_row.addWidget(all_btn)
+            sel_row.addWidget(none_btn)
+            layout.addLayout(sel_row)
+        else:
+            hint = QLabel("磁力連結需連上 peers 取得種子資訊後，才能列出檔案清單；\n目前將下載整包內容。")
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: #999;")
+            layout.addWidget(hint)
+
+        # 按鈕
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("取消")
+        ok_btn = QPushButton("開始下載")
+        ok_btn.setDefault(True)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(ok_btn)
+        layout.addLayout(btn_row)
+
+        cancel_btn.clicked.connect(self.reject)
+        ok_btn.clicked.connect(self._on_confirm)
+
+    def _browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "選擇儲存位置", self.dir_edit.text())
+        if d:
+            self.dir_edit.setText(d)
+
+    def _populate_files(self):
+        self.file_tree.clear()
+        self._file_items = []
+        if self._ti is None:
+            return
+        root = self.file_tree.invisibleRootItem()
+        dir_map = {}
+        folder_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        for i, (rel, size) in enumerate(torrent_file_tree(self._ti)):
+            parts = rel.replace('\\', '/').split('/')
+            parent = root
+            prefix = ()
+            for part in parts[:-1]:
+                prefix = prefix + (part,)
+                if prefix not in dir_map:
+                    d = QTreeWidgetItem([part, ''])
+                    d.setFlags(d.flags() | Qt.ItemFlag.ItemIsUserCheckable
+                               | Qt.ItemFlag.ItemIsAutoTristate)
+                    d.setCheckState(0, Qt.CheckState.Checked)
+                    d.setIcon(0, folder_icon)
+                    d.setData(0, Qt.ItemDataRole.UserRole, None)
+                    d.setData(0, Qt.ItemDataRole.UserRole + 1, 'dir')
+                    parent.addChild(d)
+                    dir_map[prefix] = d
+                parent = dir_map[prefix]
+            item = QTreeWidgetItem([parts[-1], format_size(size)])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.CheckState.Checked)
+            item.setData(0, Qt.ItemDataRole.UserRole, i)
+            item.setData(0, Qt.ItemDataRole.UserRole + 1, 'file')
+            item.setData(1, Qt.ItemDataRole.UserRole + 2, size)
+            parent.addChild(item)
+            self._file_items.append(item)
+        self._aggregate_dir_sizes(root)
+        self.file_tree.expandAll()
+        self._update_selected_total()
+
+    def _aggregate_dir_sizes(self, node):
+        """由下往上累加：資料夾的「大小」欄顯示其內所有檔案的總位元組數。"""
+        total = 0
+        for i in range(node.childCount()):
+            child = node.child(i)
+            kind = child.data(0, Qt.ItemDataRole.UserRole + 1)
+            if kind == 'dir':
+                child_total = self._aggregate_dir_sizes(child)
+                child.setText(1, format_size(child_total))
+                child.setData(1, Qt.ItemDataRole.UserRole + 2, child_total)
+                total += child_total
+            else:
+                total += child.data(1, Qt.ItemDataRole.UserRole + 2) or 0
+        return total
+
+    def _update_selected_total(self):
+        """更新「已勾選總大小」標籤：累加目前勾選檔案（非目錄）的原始位元組數。"""
+        if not self._is_torrent:
+            return
+        selected = 0
+        total = 0
+        count = 0
+        for it in self._file_items:
+            sz = it.data(1, Qt.ItemDataRole.UserRole + 2) or 0
+            total += sz
+            if it.checkState(0) != Qt.CheckState.Unchecked:
+                selected += sz
+                count += 1
+        self.selected_size_label.setText(
+            f"已勾選 {count} 個檔案，共 {format_size(selected)} / 總共 {format_size(total)}")
+
+    def _set_all(self, state):
+        if self._ti is None:
+            return
+        self._updating_tree = True
+        try:
+            for it in self._file_items:
+                it.setCheckState(0, state)
+            self._refresh_dir_recur(self.file_tree.invisibleRootItem())
+        finally:
+            self._updating_tree = False
+        self._update_selected_total()
+
+    def _refresh_dir_recur(self, node):
+        for i in range(node.childCount()):
+            child = node.child(i)
+            if child.data(0, Qt.ItemDataRole.UserRole + 1) == 'dir':
+                self._refresh_dir(child)
+                self._refresh_dir_recur(child)
+
+    def _on_file_item_changed(self, item, column):
+        if self._updating_tree:
+            return
+        self._updating_tree = True
+        try:
+            state = item.checkState(0)
+            self._apply_to_children(item, state)
+            self._refresh_parents(item.parent())
+        finally:
+            self._updating_tree = False
+        self._update_selected_total()
+
+    def _apply_to_children(self, item, state):
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if child.checkState(0) != state:
+                child.setCheckState(0, state)
+            self._apply_to_children(child, state)
+
+    def _refresh_parents(self, parent):
+        while parent is not None:
+            self._refresh_dir(parent)
+            parent = parent.parent()
+
+    @staticmethod
+    def _refresh_dir(item):
+        checked = 0
+        unchecked = 0
+        total = item.childCount()
+        for i in range(total):
+            cs = item.child(i).checkState(0)
+            if cs == Qt.CheckState.Checked:
+                checked += 1
+            elif cs == Qt.CheckState.Unchecked:
+                unchecked += 1
+        if total == 0:
+            return
+        if checked == total:
+            item.setCheckState(0, Qt.CheckState.Checked)
+        elif unchecked == total:
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+        else:
+            item.setCheckState(0, Qt.CheckState.PartiallyChecked)
+
+    def line(self):
+        return self.line_combo.currentData()
+
+    def seed_hours(self):
+        return self.seed_spinbox.value()
+
+    def save_dir(self):
+        return self.dir_edit.text().strip()
+
+    def filename(self):
+        if self._is_torrent and self._ti is not None:
+            return self._ti.name()
+        return None
+
+    def selected_files(self):
+        """回傳勾選的檔案 index 列表；全選時回傳 None（等同整包下載）。"""
+        if not self._is_torrent:
+            return None
+        sel = [it.data(0, Qt.ItemDataRole.UserRole)
+               for it in self._file_items
+               if it.checkState(0) != Qt.CheckState.Unchecked]
+        if len(sel) == len(self._file_items):
+            return None
+        return sel
+
+    def _on_confirm(self):
+        if not self.save_dir():
+            QMessageBox.warning(self, "錯誤", "請選擇儲存位置")
+            return
+        if self._is_torrent:
+            sel = self.selected_files()
+            if sel is not None and not sel:
+                QMessageBox.warning(self, "錯誤", "請至少勾選一個要下載的檔案")
+                return
+        self.accept()
+
+
 # 主窗口
 class MainWindow(QMainWindow):
     def __init__(self, download_manager=None):
@@ -335,6 +739,12 @@ class MainWindow(QMainWindow):
         # 已通知完成的任務 ID，避免重複通知
         self.notified_completed = set()
 
+        # 全域聚合分線速度狀態：(上次時間, 上次聚合位元組快照)
+        self._global_line_state = None
+
+        # 分線 chip 元件快取：line_key -> QLabel
+        self._line_chips = {}
+
         # 系統匣圖示與相關狀態
         self._tray_icon = None
         self._force_quit = False
@@ -349,6 +759,15 @@ class MainWindow(QMainWindow):
         self.speed_limit_spinbox.blockSignals(True)
         self.speed_limit_spinbox.setValue(self.download_manager.speed_limit // 1024)
         self.speed_limit_spinbox.blockSignals(False)
+
+        # 載入已保存的 BT 做種與上傳限速設定
+        self.bt_seed_spinbox.blockSignals(True)
+        self.bt_seed_spinbox.setValue(int(self.download_manager.bt_seed_hours))
+        self.bt_seed_spinbox.blockSignals(False)
+
+        self.bt_upload_limit_spinbox.blockSignals(True)
+        self.bt_upload_limit_spinbox.setValue(self.download_manager.bt_upload_rate // 1024)
+        self.bt_upload_limit_spinbox.blockSignals(False)
 
         self.monitor_thread = MonitorThread(self.download_manager)
         self.monitor_thread.tasks_updated.connect(self.on_tasks_updated)
@@ -381,6 +800,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("多線程下載器")
         self.setWindowIcon(load_app_icon())
         self.setMinimumSize(800, 600)
+        self.setStyleSheet(APP_QSS)
 
         # 主佈局
         main_widget = QWidget()
@@ -398,8 +818,11 @@ class MainWindow(QMainWindow):
         add_button = QPushButton("＋ 新增下載")
         add_button.setMinimumHeight(36)
         add_button.clicked.connect(self.add_download)
-        self.stats_label = QLabel("合計速度: 0 B/s | 進行中任務: 0")
-        self.stats_label.setStyleSheet("font-weight: bold;")
+        self.stats_label = QLabel()
+        self.stats_label.setObjectName("statsBadge")
+        self.stats_label.setText(
+            '<span style="color:#1a9c5c;">↓ 0 B/s</span>&nbsp;&nbsp;'
+            '<span style="color:#3b9bff;">↑ 0 B/s</span>')
         top_layout.addWidget(add_button)
         top_layout.addStretch()
         top_layout.addWidget(self.stats_label)
@@ -422,6 +845,14 @@ class MainWindow(QMainWindow):
         self.task_table.setHorizontalHeaderLabels(["檔案名", "大小", "進度", "狀態", "速度", "剩餘時間"])
         self.task_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.task_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        # 固定欄位給足預設寬度，避免文字被切斷；名稱與進度欄維持自動伸展
+        self.task_table.setColumnWidth(1, 150)   # 大小
+        self.task_table.setColumnWidth(3, 90)    # 狀態
+        self.task_table.setColumnWidth(4, 190)   # 速度（↓/↑ 兩段）
+        self.task_table.setColumnWidth(5, 120)   # 剩餘時間
+        # 關閉硬邊網格，改用隔行底色，消除縱向邊線截斷文字的視覺問題
+        self.task_table.setShowGrid(False)
+        self.task_table.setAlternatingRowColors(True)
         self.task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.task_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.task_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -438,6 +869,23 @@ class MainWindow(QMainWindow):
         # 區塊進度視覺（雷霆式叢集網格，依比例顯示各區塊完成程度）
         self.block_map = SegmentProgressBar()
         self.block_map.setFixedHeight(72)
+
+        # 分線速度面板：卡片式膠囊顯示各線路即時速度
+        self.lines_panel = QFrame()
+        self.lines_panel.setStyleSheet(
+            "QFrame { background-color: #f5f6f8; border: 1px solid #e6e8eb; border-radius: 6px; }")
+        lines_panel_layout = QVBoxLayout(self.lines_panel)
+        lines_panel_layout.setContentsMargins(10, 8, 10, 8)
+        lines_panel_layout.setSpacing(6)
+
+        self.lines_title = QLabel("分線速度")
+        self.lines_title.setStyleSheet("color: #999; font-size: 11px; border: none; background: transparent;")
+        lines_panel_layout.addWidget(self.lines_title)
+
+        self.lines_chips_container = QWidget()
+        self.lines_chips_container.setStyleSheet("background: transparent; border: none;")
+        self.lines_chips_flow = FlowLayout(self.lines_chips_container, margin=4, spacing=8)
+        lines_panel_layout.addWidget(self.lines_chips_container)
 
         # 速度曲線圖，置於分段進度條下方
         self.speed_chart = SpeedChartWidget()
@@ -456,6 +904,7 @@ class MainWindow(QMainWindow):
         viz_layout = QVBoxLayout()
         viz_layout.addLayout(viz_header)
         viz_layout.addWidget(self.block_map)
+        viz_layout.addWidget(self.lines_panel)
         viz_layout.addWidget(self.speed_chart)
         download_layout.addLayout(viz_layout)
 
@@ -608,6 +1057,21 @@ class MainWindow(QMainWindow):
         self.threads_per_proxy_spinbox.setValue(6)
         dl_form.addRow("每代理線程數:", self.threads_per_proxy_spinbox)
 
+        self.bt_seed_spinbox = QSpinBox()
+        self.bt_seed_spinbox.setRange(0, 720)  # 最多 30 天
+        self.bt_seed_spinbox.setValue(0)
+        self.bt_seed_spinbox.setSpecialValueText("不做種")
+        self.bt_seed_spinbox.setSuffix(" 小時")
+        self.bt_seed_spinbox.valueChanged.connect(self.on_bt_seed_hours_changed)
+        dl_form.addRow("BT 做種時數:", self.bt_seed_spinbox)
+
+        self.bt_upload_limit_spinbox = QSpinBox()
+        self.bt_upload_limit_spinbox.setRange(0, 1024 * 1024)
+        self.bt_upload_limit_spinbox.setValue(0)
+        self.bt_upload_limit_spinbox.setSpecialValueText("不限速")
+        self.bt_upload_limit_spinbox.valueChanged.connect(self.on_bt_upload_limit_changed)
+        dl_form.addRow("BT 上傳限速 (KB/s):", self.bt_upload_limit_spinbox)
+
         settings_layout.addWidget(dl_group)
 
         # 其他
@@ -652,7 +1116,9 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _is_valid_url(url):
-        return url.startswith(('http://', 'https://', 'ftp://', 'magnet:'))
+        if url.startswith(('http://', 'https://', 'ftp://', 'magnet:')):
+            return True
+        return url.lower().endswith('.torrent') and os.path.isfile(url)
 
     def add_download(self):
         """開啟「新增下載」對話框，確認後加入任務佇列。"""
@@ -678,9 +1144,6 @@ class MainWindow(QMainWindow):
         if len(urls) > 1:
             filename = None
 
-        # 分離磁力連結（BT 下載暫不支援）
-        magnet_urls = [u for u in urls if u.startswith('magnet:')]
-        http_urls = [u for u in urls if not u.startswith('magnet:')]
         invalid = [u for u in urls if not self._is_valid_url(u)]
 
         if invalid:
@@ -688,15 +1151,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "錯誤", f"無效的URL格式\nURL: {invalid[0]}")
             return False
 
-        if magnet_urls and not silent:
-            QMessageBox.information(self, "磁力連結",
-                                    "偵測到磁力連結，目前僅支援 HTTP/HTTPS/FTP 直連下載。")
-
-        if not http_urls:
-            return False
-
         added = 0
-        for url in http_urls:
+        for url in urls:
             try:
                 # add_task 只做簿記、不碰網路，可在 UI 執行緒安全執行
                 task_id = self.download_manager.add_task(
@@ -726,6 +1182,32 @@ class MainWindow(QMainWindow):
                     QMessageBox.critical(self, "錯誤", f"添加下載任務失敗:\n{e}\n\nURL: {url}")
         return added > 0
 
+    def _add_bt_interactive(self, source):
+        """拖入 / 開啟 .torrent 或 magnet 時，跳出對話框選線路與檔案後加入 BT 任務。"""
+        dialog = TorrentDialog(source, self.download_manager, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        line = dialog.line()
+        selected = dialog.selected_files()
+        save_dir = dialog.save_dir()
+        filename = dialog.filename()
+        seed_hours = dialog.seed_hours()
+
+        try:
+            task_id = self.download_manager.add_task(
+                source, filename, save_dir=save_dir, use_proxy=True,
+                line=line, selected_files=selected, seed_hours=seed_hours)
+        except Exception as e:
+            QMessageBox.critical(self, "錯誤", f"添加種子下載失敗:\n{e}")
+            return
+
+        self.add_task_to_table(task_id, self.download_manager.task_ids[task_id])
+        threading.Thread(
+            target=self._start_task_in_background,
+            args=(task_id, source),
+            daemon=True,
+        ).start()
+
     # --- 拖放支援 ---
     def dragEnterEvent(self, event):
         md = event.mimeData()
@@ -734,31 +1216,45 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, event):
         md = event.mimeData()
-        urls = []
+        bt_sources = []
+        others = []
+
+        def _classify(text):
+            text = text.strip()
+            if not text:
+                return
+            if text.startswith('magnet:'):
+                bt_sources.append(text)
+            else:
+                others.append(text)
 
         if md.hasUrls():
             for u in md.urls():
                 local = u.toLocalFile()
                 if local and os.path.isfile(local):
-                    # 讀取拖入的文字檔內容（每行一個 URL）
-                    try:
-                        with open(local, 'r', encoding='utf-8', errors='ignore') as f:
-                            for line in f.read().splitlines():
-                                line = line.strip()
-                                if line:
-                                    urls.append(line)
-                    except Exception:
-                        pass
+                    if local.lower().endswith('.torrent'):
+                        # .torrent 檔：跳出對話框選線路與檔案
+                        bt_sources.append(local)
+                    else:
+                        # 讀取拖入的文字檔內容（每行一個 URL）
+                        try:
+                            with open(local, 'r', encoding='utf-8', errors='ignore') as f:
+                                for line in f.read().splitlines():
+                                    _classify(line)
+                        except Exception:
+                            pass
                 else:
-                    urls.append(u.toString())
+                    _classify(u.toString())
 
         if md.hasText():
             for line in md.text().splitlines():
-                line = line.strip()
-                if line:
-                    urls.append(line)
+                _classify(line)
 
-        valid = [u for u in urls if self._is_valid_url(u)]
+        # .torrent / magnet 逐一跳出對話框（選線路 + 勾選檔案）
+        for src in bt_sources:
+            self._add_bt_interactive(src)
+
+        valid = [u for u in others if self._is_valid_url(u)]
         if valid:
             self._add_urls(valid, silent=True)
         event.acceptProposedAction()
@@ -778,9 +1274,6 @@ class MainWindow(QMainWindow):
         if first == getattr(self, '_last_clipboard_url', None):
             return
         self._last_clipboard_url = first
-        if first.startswith('magnet:'):
-            self.statusBar().showMessage("偵測到磁力連結，但 BT 下載尚未支援", 4000)
-            return
         if self._add_urls([first], silent=True):
             self.statusBar().showMessage(f"已自動加入下載: {first[:60]}", 4000)
 
@@ -811,8 +1304,19 @@ class MainWindow(QMainWindow):
         # 設置其他列
         self.task_table.setItem(row, 1, QTableWidgetItem("計算中..."))
         self.task_table.setItem(row, 3, QTableWidgetItem(task.status))
-        self.task_table.setItem(row, 4, QTableWidgetItem("0 B/s"))
+        self._set_speed_cell(row, '<span style="color:#98a2ad;">0 B/s</span>')
         self.task_table.setItem(row, 5, QTableWidgetItem("計算中..."))
+
+    def _set_speed_cell(self, row, html):
+        """速度欄位以 QLabel 呈現富文字（下載綠 ↓、上傳藍 ↑）；不存在則建立。"""
+        w = self.task_table.cellWidget(row, 4)
+        if isinstance(w, QLabel):
+            w.setText(html)
+        else:
+            lbl = QLabel(html)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            lbl.setContentsMargins(4, 0, 4, 0)
+            self.task_table.setCellWidget(row, 4, lbl)
 
     def update_task_progress(self, task_data):
         # 確保 task_table 已經初始化
@@ -858,13 +1362,19 @@ class MainWindow(QMainWindow):
                 status = progress['status']
                 self.task_table.setItem(row, 3, QTableWidgetItem(self.get_status_text(status)))
 
-                # 更新速度
+                # 更新速度（下載綠 ↓、上傳藍 ↑）
                 if status in ['paused', 'error', 'completed', 'canceled']:
-                    # 暫停、錯誤或完成狀態下顯示 0 速度
-                    speed_text = "0 B/s"
+                    speed_html = '<span style="color:#98a2ad;">0 B/s</span>'
+                elif status == 'seeding':
+                    ul = progress.get('upload_speed', 0) or 0
+                    speed_html = f'<span style="color:#3b9bff;">↑ {format_size(ul)}/s</span>'
                 else:
-                    speed_text = f"{format_size(progress['speed'])}/s"
-                self.task_table.setItem(row, 4, QTableWidgetItem(speed_text))
+                    dl = progress.get('speed', 0) or 0
+                    ul = progress.get('upload_speed', 0) or 0
+                    dl_part = f'<span style="color:#1a9c5c;">↓ {format_size(dl)}/s</span>'
+                    ul_part = f'<span style="color:#3b9bff;">↑ {format_size(ul)}/s</span>' if ul > 0 else ''
+                    speed_html = dl_part + (f'&nbsp;&nbsp;{ul_part}' if ul_part else '')
+                self._set_speed_cell(row, speed_html)
 
                 # 更新剩餘時間
                 if status in ['paused', 'error', 'completed', 'canceled']:
@@ -877,6 +1387,9 @@ class MainWindow(QMainWindow):
                         time_text = "出錯"
                     else:
                         time_text = "--"
+                elif status == 'seeding':
+                    rem = progress.get('seeding_remaining', 0)
+                    time_text = f"做種中 ({format_time(rem)})" if rem > 0 else "做種中"
                 elif progress['speed'] > 0 and progress['total_size'] > 0:
                     remaining_bytes = progress['total_size'] - progress['downloaded_size']
                     remaining_time = remaining_bytes / progress['speed']
@@ -889,6 +1402,8 @@ class MainWindow(QMainWindow):
                 status_item = self.task_table.item(row, 3)
                 if status == 'completed':
                     status_item.setForeground(QColor(Qt.GlobalColor.green))
+                elif status == 'seeding':
+                    status_item.setForeground(QColor(46, 139, 87))  # 海綠色
                 elif status == 'error':
                     status_item.setForeground(QColor(Qt.GlobalColor.red))
                     # 錯誤任務在狀態格顯示錯誤訊息 tooltip
@@ -897,7 +1412,7 @@ class MainWindow(QMainWindow):
                 elif status == 'paused':
                     status_item.setForeground(QColor(Qt.GlobalColor.blue))
 
-                # 偵測任務轉變為完成：記錄歷史、通知，並從下載管理列表移除
+                # 完成時記錄歷史並通知；做種中的任務仍停留在列表上，等真正完成才移除
                 if status == 'completed':
                     if task_id not in self.notified_completed:
                         self.notified_completed.add(task_id)
@@ -938,6 +1453,7 @@ class MainWindow(QMainWindow):
         status_map = {
             'initialized': '初始化',
             'downloading': '下載中',
+            'seeding': '做種中',
             'paused': '已暫停',
             'completed': '已完成',
             'error': '錯誤',
@@ -960,31 +1476,99 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg, 5000)
 
     def on_tasks_updated(self, tasks):
-        """監控線程單次批次更新：逐列刷新後，全域統計只算一次。"""
+        """監控線程單次批次更新：逐列刷新後，全域統計與分線速度只算一次。"""
         total_speed = 0.0
+        total_upload = 0.0
         active_count = 0
+        agg_bytes = {}
+        agg_labels = {}
         for task_data in tasks:
             self.update_task_progress(task_data)
             prog = task_data['progress']
-            if prog['status'] == 'downloading':
+            if prog['status'] in ('downloading', 'seeding'):
                 total_speed += prog.get('speed') or 0
+                total_upload += prog.get('upload_speed') or 0
                 active_count += 1
-        self._update_global_stats(total_speed, active_count)
+                for key, b in (prog.get('line_bytes') or {}).items():
+                    agg_bytes[key] = agg_bytes.get(key, 0) + b
+                for key, label in (prog.get('line_labels') or {}).items():
+                    agg_labels.setdefault(key, label)
+        line_items = self._compute_global_line_speeds(agg_bytes, agg_labels)
+        self._update_line_chips(line_items)
+        self._update_global_stats(total_speed, active_count, total_upload)
 
-    def _update_global_stats(self, total_speed=None, active_count=None):
-        """更新全域統計：合計下載速度與進行中任務數（可傳入已算好的值避免重複計算）"""
+    def _update_global_stats(self, total_speed=None, active_count=None, total_upload=None):
+        """更新全域統計：合計下載/上傳速度與進行中任務數（可傳入已算好的值避免重複計算）"""
         if total_speed is None or active_count is None:
             total_speed = 0.0
+            total_upload = 0.0
             active_count = 0
             for task in self.download_manager.get_all_tasks():
                 prog = task['progress']
-                if prog['status'] == 'downloading':
+                if prog['status'] in ('downloading', 'seeding'):
                     total_speed += prog.get('speed') or 0
+                    total_upload += prog.get('upload_speed') or 0
                     active_count += 1
+        if total_upload is None:
+            total_upload = 0.0
         self.stats_label.setText(
-            f"合計速度: {format_size(total_speed)}/s | 進行中任務: {active_count}"
+            f'<span style="color:#1a9c5c;font-weight:600;">↓ {format_size(total_speed)}/s</span>'
+            f'&nbsp;&nbsp;<span style="color:#3b9bff;font-weight:600;">↑ {format_size(total_upload)}/s</span>'
+            f'&nbsp;&nbsp;<span style="color:#8a97a3;">· {active_count} 任務</span>'
         )
         self.speed_chart.add_sample(total_speed)
+
+    def _compute_global_line_speeds(self, line_bytes, line_labels):
+        """計算全域各線聚合即時速度，回傳 [(key, speed, 顯示名稱), ...]，依速度排序。"""
+        now = time.time()
+        prev = self._global_line_state
+        self._global_line_state = (now, dict(line_bytes))
+        if prev is None:
+            return []
+        last_t, last_b = prev
+        dt = now - last_t
+        if dt <= 0:
+            return []
+        items = []
+        for key, label in line_labels.items():
+            b = line_bytes.get(key, 0)
+            speed = (b - last_b.get(key, 0)) / dt
+            items.append((key, speed, self._line_display_name(key, label)))
+        items.sort(key=lambda x: -x[1])
+        return items
+
+    def _line_display_name(self, key, fallback):
+        """把線路 key 轉成帶類別前綴的可讀名稱：直連線路 / SOCKS5 代理。"""
+        if key == 'direct':
+            return '直連線路'
+        addr = key[6:]  # 去掉 'proxy:' 前綴，得到 host:port
+        for p in self.download_manager.socks_proxies.values():
+            if f"{p.get('host')}:{p.get('port')}" == addr:
+                return f"SOCKS5 代理 · {p.get('name') or addr}"
+        return f"SOCKS5 代理 · {fallback}"
+
+    def _update_line_chips(self, items):
+        """依 (key, speed, name) 清單建立/更新分線速度膠囊。"""
+        active_keys = {key for key, _, _ in items}
+        # 移除已消失的 chip
+        for key in list(self._line_chips):
+            if key not in active_keys:
+                chip = self._line_chips.pop(key)
+                self.lines_chips_flow.removeWidget(chip)
+                chip.deleteLater()
+        # 建立/更新 chip
+        for i, (key, speed, name) in enumerate(items):
+            chip = self._line_chips.get(key)
+            if chip is None:
+                color = LINE_COLORS[i % len(LINE_COLORS)]
+                chip = QLabel("")
+                chip.setStyleSheet(
+                    f"background-color: {color}; color: #fff; border-radius: 12px; "
+                    f"padding: 5px 12px; font-size: 12px; font-weight: bold;")
+                self._line_chips[key] = chip
+                self.lines_chips_flow.addWidget(chip)
+            chip.setText(f"{name}　{format_size(speed)}/s")
+        self.lines_title.setText("分線速度" if items else "分線速度（下載中顯示）")
 
     def show_context_menu(self, position):
         row = self.task_table.rowAt(position.y())
@@ -1019,7 +1603,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
 
         # 根據任務狀態顯示不同的菜單項
-        if task.status == 'downloading':
+        if task.status in ('downloading', 'seeding'):
             pause_action = menu.addAction("暫停")
             pause_action.triggered.connect(lambda: self.pause_task(task_id))
         elif task.status == 'paused':
@@ -1063,7 +1647,7 @@ class MainWindow(QMainWindow):
         task = self.download_manager.task_ids.get(task_id)
         if not task:
             return
-        if task.status == 'downloading':
+        if task.status in ('downloading', 'seeding'):
             self.pause_task(task_id)
         elif task.status == 'paused':
             self.resume_task(task_id)
@@ -1161,10 +1745,10 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "錯誤詳情", err_msg)
 
     def pause_all_tasks(self):
-        """暫停所有下載中的任務"""
+        """暫停所有下載中與做種中的任務"""
         paused = 0
         for task_id, task in self.download_manager.task_ids.items():
-            if task.status == 'downloading':
+            if task.status in ('downloading', 'seeding'):
                 if self.download_manager.pause_task(task_id):
                     paused += 1
         self.statusBar().showMessage(f"已暫停 {paused} 個任務", 2000)
@@ -1422,6 +2006,25 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"已設定全域限速: {format_size(bytes_per_sec)}/s", 2000)
         else:
             self.statusBar().showMessage("已取消全域限速", 2000)
+
+    def on_bt_seed_hours_changed(self, hours):
+        """BT 預設做種時數變更時套用（0 = 不做種）。"""
+        self.download_manager.set_bt_seed_hours(hours)
+        self.download_manager.save_config()
+        if hours > 0:
+            self.statusBar().showMessage(f"已設定 BT 預設做種時數: {hours} 小時", 2000)
+        else:
+            self.statusBar().showMessage("已設為 BT 下載完成後不做種", 2000)
+
+    def on_bt_upload_limit_changed(self, value_kbs):
+        """BT 上傳限速變更時套用（0 = 不限速）。"""
+        bytes_per_sec = value_kbs * 1024
+        self.download_manager.set_bt_upload_rate(bytes_per_sec)
+        self.download_manager.save_config()
+        if bytes_per_sec > 0:
+            self.statusBar().showMessage(f"已設定 BT 上傳限速: {format_size(bytes_per_sec)}/s", 2000)
+        else:
+            self.statusBar().showMessage("已取消 BT 上傳限速", 2000)
 
     def open_header_dialog(self):
         """開啟自訂 HTTP 表頭對話框（每行一組 Key: Value）。"""

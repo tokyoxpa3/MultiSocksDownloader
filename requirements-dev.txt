@@ -1,2 +1,3 @@
 -r requirements.txt
 nuitka==4.1.3
+pyftpdlib==2.0.1

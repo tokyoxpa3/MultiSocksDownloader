@@ -289,5 +289,25 @@ class TestBlocksStateFormat(unittest.TestCase):
         self.assertEqual(states[5], {'frac': 0.0, 'active': False})
 
 
+class TestLineTracking(unittest.TestCase):
+    def test_line_key(self):
+        t = DownloadTask("http://example.com/f", tempfile.mkdtemp())
+        self.assertEqual(t._line_key(None), "direct")
+        self.assertEqual(
+            t._line_key({"host": "1.2.3.4", "port": 1080}),
+            "proxy:1.2.3.4:1080")
+
+    def test_progress_exposes_line_data(self):
+        t = DownloadTask("http://example.com/f", tempfile.mkdtemp(),
+                         proxies=[{"host": "1.2.3.4", "port": 1080}])
+        t._line_bytes["direct"] = 100
+        t._line_bytes["proxy:1.2.3.4:1080"] = 50
+        p = t.get_progress()
+        self.assertEqual(p["line_bytes"]["direct"], 100)
+        self.assertEqual(p["line_bytes"]["proxy:1.2.3.4:1080"], 50)
+        self.assertEqual(p["line_labels"]["direct"], "直連")
+        self.assertEqual(p["line_labels"]["proxy:1.2.3.4:1080"], "1.2.3.4:1080")
+
+
 if __name__ == "__main__":
     unittest.main()
