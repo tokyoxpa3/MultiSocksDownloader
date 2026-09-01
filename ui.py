@@ -267,6 +267,20 @@ QTableWidget::item, QTreeWidget::item {
     padding: 6px 10px;
     border: none;
 }
+QTreeWidget::indicator {
+    width: 16px;
+    height: 16px;
+}
+QTreeWidget::indicator:unchecked {
+    border: 1px solid #b6bcc4;
+    border-radius: 3px;
+    background: #ffffff;
+}
+QTreeWidget::indicator:checked {
+    border: 1px solid #3b9bff;
+    border-radius: 3px;
+    background: #3b9bff;
+}
 QHeaderView::section {
     background-color: #f2f4f7;
     color: #55606c;
@@ -486,6 +500,9 @@ class TorrentDialog(QDialog):
                 'username': p.get('username') or '',
                 'password': p.get('password') or '',
             })
+        # 有多個可用代理時，預設選「自動（多線聚合）」
+        if download_manager.get_available_proxies():
+            self.line_combo.setCurrentIndex(1)
         line_row.addWidget(self.line_combo)
         line_row.addStretch()
         layout.addLayout(line_row)
@@ -769,6 +786,10 @@ class MainWindow(QMainWindow):
         self.bt_upload_limit_spinbox.blockSignals(True)
         self.bt_upload_limit_spinbox.setValue(self.download_manager.bt_upload_rate // 1024)
         self.bt_upload_limit_spinbox.blockSignals(False)
+
+        self.bt_resume_interval_spinbox.blockSignals(True)
+        self.bt_resume_interval_spinbox.setValue(int(self.download_manager.bt_resume_interval))
+        self.bt_resume_interval_spinbox.blockSignals(False)
 
         self.monitor_thread = MonitorThread(self.download_manager)
         self.monitor_thread.tasks_updated.connect(self.on_tasks_updated)
@@ -1072,6 +1093,13 @@ class MainWindow(QMainWindow):
         self.bt_upload_limit_spinbox.setSpecialValueText("不限速")
         self.bt_upload_limit_spinbox.valueChanged.connect(self.on_bt_upload_limit_changed)
         dl_form.addRow("BT 上傳限速 (KB/s):", self.bt_upload_limit_spinbox)
+
+        self.bt_resume_interval_spinbox = QSpinBox()
+        self.bt_resume_interval_spinbox.setRange(1, 600)
+        self.bt_resume_interval_spinbox.setValue(10)
+        self.bt_resume_interval_spinbox.setSuffix(" 秒")
+        self.bt_resume_interval_spinbox.valueChanged.connect(self.on_bt_resume_interval_changed)
+        dl_form.addRow("BT 續傳保存間隔:", self.bt_resume_interval_spinbox)
 
         settings_layout.addWidget(dl_group)
 
@@ -2016,6 +2044,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"已設定 BT 預設做種時數: {hours} 小時", 2000)
         else:
             self.statusBar().showMessage("已設為 BT 下載完成後不做種", 2000)
+
+    def on_bt_resume_interval_changed(self, seconds):
+        """BT resume 自動保存間隔變更時套用（最小 1 秒）。"""
+        self.download_manager.set_bt_resume_interval(seconds)
+        self.download_manager.save_config()
+        self.statusBar().showMessage(f"已設定 BT 續傳保存間隔: {seconds} 秒", 2000)
 
     def on_bt_upload_limit_changed(self, value_kbs):
         """BT 上傳限速變更時套用（0 = 不限速）。"""

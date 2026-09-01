@@ -1239,6 +1239,7 @@ class DownloadManager:
         # BT / PT 防封號與做種設定
         self.bt_seed_hours = 0.0      # 下載完成後繼續做種時數，0 表示不做種
         self.bt_upload_rate = 0       # BT 上傳限速（bytes/sec），0 表示不限速
+        self.bt_resume_interval = 10  # BT resume 自動保存間隔（秒），最小 1 秒
 
         self.speed_limit = 0  # bytes/sec，0 表示不限速
         self.rate_limiter = RateLimiter()
@@ -1279,6 +1280,8 @@ class DownloadManager:
                 self.bt_seed_hours = max(0.0, float(config['bt_seed_hours']))
             if 'bt_upload_rate' in config:
                 self.bt_upload_rate = max(0, int(config['bt_upload_rate']))
+            if 'bt_resume_interval' in config:
+                self.bt_resume_interval = max(1.0, float(config['bt_resume_interval']))
             if 'custom_headers' in config and isinstance(config['custom_headers'], dict):
                 self.custom_headers = config['custom_headers']
             if 'history' in config and isinstance(config['history'], list):
@@ -1297,6 +1300,7 @@ class DownloadManager:
                 'speed_limit': self.speed_limit,
                 'bt_seed_hours': self.bt_seed_hours,
                 'bt_upload_rate': self.bt_upload_rate,
+                'bt_resume_interval': self.bt_resume_interval,
                 'custom_headers': self.custom_headers,
                 'history': self.history,
                 'next_history_id': self.next_history_id,
@@ -1525,11 +1529,17 @@ class DownloadManager:
             self.download_dirs.add(save_dir)
         self.save_config()
 
-        # 解析指定線路：'auto' 代表多線聚合（直連 + 所有可用 SOCKS5），其餘為單線
+        # 解析指定線路：'auto' 代表多線聚合（直連 + 所有可用 SOCKS5），其餘為單線；
+        # 未指定線路（None）且有多個可用代理時，預設聚合理。
         if line == 'auto' and use_proxy:
             proxies = [None] + self.get_available_proxies()
         elif isinstance(line, dict):
             proxies = [line]
+        elif line == 'direct':
+            proxies = [None]
+        elif use_proxy:
+            available = self.get_available_proxies()
+            proxies = [None] + available if available else [None]
         else:
             proxies = [None]
 
@@ -1539,7 +1549,8 @@ class DownloadManager:
         task = BTTask(source, save_dir, filename=filename, proxies=proxies,
                       selected_files=selected_files,
                       seed_hours=actual_seed_hours,
-                      upload_rate_limit=actual_upload_rate)
+                      upload_rate_limit=actual_upload_rate,
+                      resume_interval=self.bt_resume_interval)
         with self._lock:
             task_id = self.next_id
             self.next_id += 1
@@ -1618,6 +1629,10 @@ class DownloadManager:
     def set_bt_upload_rate(self, rate_bytes_per_sec):
         """設定 BT 上傳限速（bytes/sec），0 表示不限速。"""
         self.bt_upload_rate = max(0, int(rate_bytes_per_sec or 0))
+
+    def set_bt_resume_interval(self, seconds):
+        """設定 BT resume 自動保存間隔（秒），最小 1 秒。"""
+        self.bt_resume_interval = max(1.0, float(seconds or 10))
 
     def set_custom_headers(self, headers):
         """設定全域預設自訂表頭（dict）。"""
@@ -1713,6 +1728,7 @@ class DownloadManager:
                         selected_files=state.get('selected_files'),
                         seed_hours=state.get('seed_hours', self.bt_seed_hours),
                         upload_rate_limit=state.get('upload_rate_limit', self.bt_upload_rate),
+                        resume_interval=self.bt_resume_interval,
                     )
                     task.status = 'paused'
                     with self._lock:

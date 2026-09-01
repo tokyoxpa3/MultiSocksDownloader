@@ -194,7 +194,7 @@ class BTTask:
     """BT 下載任務：一或多個 session 下載同一 torrent，生命週期對齊 DownloadTask。"""
 
     def __init__(self, source, save_dir, filename=None, proxy=None, proxies=None,
-                 selected_files=None, seed_hours=0, upload_rate_limit=0):
+                 selected_files=None, seed_hours=0, upload_rate_limit=0, resume_interval=10.0):
         self.source = source
         self.url = source
         self.kind = source_kind(source)
@@ -263,6 +263,8 @@ class BTTask:
         self._seed_deadline = None
         # resume data 定期保存時間戳（供重啟續傳，僅單線路時使用）。
         self._last_resume_save = 0.0
+        # resume 自動保存間隔（秒），最小 1 秒。
+        self._resume_interval = max(1.0, float(resume_interval or 10.0))
         # magnet 是否已扇出多線路
         self._fanned_out = False
         # piece 所有權：list[line_idx]，index 為 piece、值為負責下載該 piece 的線路。
@@ -780,7 +782,7 @@ class BTTask:
                 # resume data 定期保存：僅單線路（多線路留待後續）
                 if not self._can_multi():
                     now = time.time()
-                    if now - self._last_resume_save >= 10.0:
+                    if now - self._last_resume_save >= self._resume_interval:
                         self._last_resume_save = now
                         h = self._line.handle
                         if h is not None and h.is_valid():
@@ -845,7 +847,7 @@ class BTTask:
                     self._rebalance(merged_done)
 
                 # 多線路續傳：定期保存合併 piece 位元圖
-                if self._can_multi() and merged_done and now - self._last_resume_save >= 10.0:
+                if self._can_multi() and merged_done and now - self._last_resume_save >= self._resume_interval:
                     self._last_resume_save = now
                     self._persist_merged_pieces(merged_done)
 
