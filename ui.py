@@ -664,6 +664,10 @@ class TorrentDialog(QDialog):
         self._update_selected_total()
 
     def _apply_to_children(self, item, state):
+        # 「部分勾選」是目錄的彙總狀態，不能往下套用；否則取消某個檔案時，
+        # 父目錄變成半選再被套到所有子項目，整棵樹會連鎖成「-」。
+        if state == Qt.CheckState.PartiallyChecked:
+            return
         for i in range(item.childCount()):
             child = item.child(i)
             if child.checkState(0) != state:
