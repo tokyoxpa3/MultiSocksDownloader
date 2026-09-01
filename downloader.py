@@ -1525,20 +1525,18 @@ class DownloadManager:
             self.download_dirs.add(save_dir)
         self.save_config()
 
-        # 解析指定線路
-        proxy = None
-        if isinstance(line, dict):
-            proxy = line
-        elif line == 'direct':
-            proxy = None
-        elif use_proxy:
-            # 若未指定特定線路，預設採直連（以便 DHT 運作）
-            proxy = None
+        # 解析指定線路：'auto' 代表多線聚合（直連 + 所有可用 SOCKS5），其餘為單線
+        if line == 'auto' and use_proxy:
+            proxies = [None] + self.get_available_proxies()
+        elif isinstance(line, dict):
+            proxies = [line]
+        else:
+            proxies = [None]
 
         actual_seed_hours = self.bt_seed_hours if seed_hours is None else seed_hours
         actual_upload_rate = self.bt_upload_rate if upload_rate_limit is None else upload_rate_limit
 
-        task = BTTask(source, save_dir, filename=filename, proxy=proxy,
+        task = BTTask(source, save_dir, filename=filename, proxies=proxies,
                       selected_files=selected_files,
                       seed_hours=actual_seed_hours,
                       upload_rate_limit=actual_upload_rate)
@@ -1703,14 +1701,15 @@ class DownloadManager:
                     source = state.get('source')
                     if not source or source in self.tasks:
                         continue
-                    proxy = state.get('proxy')
-                    if proxy is None and state.get('proxies'):
-                        proxy = state['proxies'][0]
+                    proxies = state.get('proxies')
+                    if not proxies:
+                        p = state.get('proxy')
+                        proxies = [p] if p else [None]
                     task = BTTask(
                         source,
                         state.get('save_dir') or directory,
                         filename=state.get('filename'),
-                        proxy=proxy,
+                        proxies=proxies,
                         selected_files=state.get('selected_files'),
                         seed_hours=state.get('seed_hours', self.bt_seed_hours),
                         upload_rate_limit=state.get('upload_rate_limit', self.bt_upload_rate),

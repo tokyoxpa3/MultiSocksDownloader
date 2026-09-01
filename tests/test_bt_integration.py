@@ -95,5 +95,72 @@ class TestSingleSessionBTTask(unittest.TestCase):
             seed.remove_torrent(sh)
 
 
+class TestMultiSessionBTTask(unittest.TestCase):
+    """多線路分片下載：多個 session 共用 save_path、piece 不重疊，驗證合併檔正確。"""
+
+    TIMEOUT = 60
+
+    def test_multi_session_shared_file_download(self):
+        tmp = tempfile.mkdtemp()
+        seed_dir = os.path.join(tmp, 'seed')
+        dl_dir = os.path.join(tmp, 'dl')
+        os.makedirs(seed_dir)
+        os.makedirs(dl_dir)
+
+        name = 'payload.bin'
+        data = os.urandom(256 * 1024)  # 32 KiB piece -> 8 pieces，2 session 各 4 pieces
+        with open(os.path.join(seed_dir, name), 'wb') as f:
+            f.write(data)
+        ti, info = make_ti(32 * 1024, name, data)
+
+        torrent_file_path = os.path.join(tmp, 'sample.torrent')
+        with open(torrent_file_path, 'wb') as f:
+            f.write(lt.bencode({b'info': info}))
+
+        seed_port = 22000 + (os.getpid() % 500)
+        seed = lt.session({'listen_interfaces': f'127.0.0.1:{seed_port}',
+                           'enable_dht': False, 'enable_lsd': False,
+                           'enable_upnp': False, 'enable_natpmp': False})
+        sp = lt.add_torrent_params()
+        sp.ti = ti
+        sp.save_path = seed_dir
+        sp.flags = lt.torrent_flags.seed_mode
+        sh = seed.add_torrent(sp)
+
+        task = None
+        try:
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                seed.post_torrent_updates()
+                if sh.status().is_seeding:
+                    break
+                time.sleep(0.2)
+            self.assertTrue(sh.status().is_seeding, 'seeder 未進入 seeding')
+
+            # 兩條直連線路驗證分片機制（實務為直連 + 不同 SOCKS5；key 碰撞不影響下載正確性）
+            task = BTTask(torrent_file_path, dl_dir, proxies=[None, None])
+            self.assertTrue(task.start())
+            self.assertEqual(len(task._lines), 2)
+
+            task._lines[0].handle.connect_peer(('127.0.0.1', seed_port))
+            task._lines[1].handle.connect_peer(('127.0.0.1', seed_port))
+
+            deadline = time.time() + self.TIMEOUT
+            while time.time() < deadline:
+                if task.is_completed():
+                    break
+                time.sleep(0.3)
+
+            self.assertTrue(task.is_completed(), '多線 BT 未在時限內完成')
+            out_file = os.path.join(dl_dir, name)
+            self.assertTrue(os.path.isfile(out_file))
+            with open(out_file, 'rb') as f:
+                self.assertEqual(f.read(), data)
+        finally:
+            if task is not None:
+                task.cancel()
+            seed.remove_torrent(sh)
+
+
 if __name__ == '__main__':
     unittest.main()

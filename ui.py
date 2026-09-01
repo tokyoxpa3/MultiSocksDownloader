@@ -469,11 +469,12 @@ class TorrentDialog(QDialog):
         dir_row.addWidget(browse_btn)
         layout.addLayout(dir_row)
 
-        # 線路選擇：直連或任一 SOCKS5 代理
+        # 線路選擇：直連、多線聚合，或任一 SOCKS5 代理
         line_row = QHBoxLayout()
         line_row.addWidget(QLabel("線路:"))
         self.line_combo = QComboBox()
         self.line_combo.addItem("直連", None)
+        self.line_combo.addItem("自動（多線聚合）", 'auto')
         for p in download_manager.socks_proxies.values():
             host = p.get('host', '')
             port = p.get('port', '')

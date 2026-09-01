@@ -1,11 +1,20 @@
 """BitTorrent 下載支援：以 libtorrent 為核心引擎，支援 magnet 連結與 .torrent 檔。
 
-架構（單一 Torrent 單一 Session 模型）：
-- 每個 BTTask 擁有獨立的 libtorrent.session，可綁定單一線路（PPPoE 直連或指定的 SOCKS5 代理）。
-- 由 libtorrent 原生 swarm 與 piece picker 進行全域調度、校驗與落盤。
-- 對外偽裝成 qBittorrent 4.6.0（user_agent 與 peer_fingerprint），避免自製客戶端被 Tracker 白名單拒收。
+架構（單一 Torrent 多 Session 模型）：
+- 一個 BTTask 可建立多個 libtorrent.session，每條線路（直連或 SOCKS5 代理）各綁定
+  一個 session。公開種子時把 piece 空間切成不重疊區段，每個 session 只下自己那一段，
+  達成多線路頻寬聚合；private（PT）種子強制單線路。
+- 每個 session 以 `piece_priorities` 只啟用自己的 piece 範圍（其餘 priority=0 不下載），
+  並共用同一個 save_path、`storage_mode_sparse`，各自寫不重疊位元組，最終自然拼成
+  完整檔案。
+- 對外偽裝成 qBittorrent 4.6.0（user_agent 與 peer_fingerprint），避免自製客戶端被
+  Tracker 白名單拒收。
 - 下載完成後可依設定繼續做種一段時間；PT（private）種子由 libtorrent 依 private=1
-  自動關閉 DHT / PEX / LSD，且本架構單一 session 單一線路，天然不拆線分流。
+  自動關閉 DHT / PEX / LSD。
+
+MVP 限制（詳見 docs/bt-multi-line-design.md）：
+- 選擇性下載（selected_files）暫不與多線路併用，設了 selected_files 就退回單線路。
+- 多線路暫不做 resume data 持久化（各 session 的 piece 位元圖合併留待後續）。
 """
 
 import os
@@ -89,7 +98,7 @@ def _downsample_blocks(pieces, max_blocks=1000):
 
 
 def partition_ranges(num_pieces, num_sessions):
-    """區間輔助函式（保留相容性）。"""
+    """把 num_pieces 個 piece 切成 num_sessions 個不重疊連續區段 [(start, end), ...]。"""
     if num_sessions <= 0 or num_pieces <= 0:
         return []
     per = num_pieces // num_sessions
@@ -119,6 +128,14 @@ def torrent_file_tree(ti):
         # 統一以 '/' 分隔（Windows 上 file_path 會回反斜線）
         files.append((path.replace('\\', '/'), fs.file_size(i)))
     return files
+
+
+def _line_key_for(proxy):
+    return 'direct' if proxy is None else f"proxy:{proxy.get('host')}:{proxy.get('port')}"
+
+
+def _line_label_for(proxy):
+    return '直連' if proxy is None else f"{proxy.get('host')}:{proxy.get('port')}"
 
 
 class LineSession:
@@ -153,7 +170,10 @@ class LineSession:
                 settings['proxy_username'] = self.proxy['username']
             if self.proxy.get('password'):
                 settings['proxy_password'] = self.proxy['password']
-            # SOCKS5 通常不轉發 UDP，DHT 僅對直連有效
+            # 強制所有流量（tracker + peer 連線）走代理，SOCKS5 不轉發 UDP、DHT 關閉
+            settings['force_proxy'] = True
+            settings['proxy_peer_connections'] = True
+            settings['proxy_hostnames'] = True
             settings['enable_dht'] = False
         return lt.session(settings)
 
@@ -171,7 +191,7 @@ class LineSession:
 
 
 class BTTask:
-    """BT 下載任務：單一 session 獨立下載，生命週期對齊 DownloadTask。"""
+    """BT 下載任務：一或多個 session 下載同一 torrent，生命週期對齊 DownloadTask。"""
 
     def __init__(self, source, save_dir, filename=None, proxy=None, proxies=None,
                  selected_files=None, seed_hours=0, upload_rate_limit=0):
@@ -182,15 +202,18 @@ class BTTask:
         self.seed_hours = max(0.0, float(seed_hours or 0))
         self.upload_rate_limit = max(0, int(upload_rate_limit or 0))
 
-        # 支援單一 proxy 參數，相容傳入 proxies 列表（取第一筆）
+        # 線路解析：proxies 為「完整線路清單」，其中 None 代表直連。
+        # proxy 單獨給定時視為單一線路（向下相容）。
         if proxy is not None:
-            self.proxy = proxy
-        elif proxies and len(proxies) > 0:
-            self.proxy = proxies[0]
+            self._line_proxies = [proxy]
+        elif proxies:
+            self._line_proxies = list(proxies)
         else:
-            self.proxy = None
+            self._line_proxies = [None]
+        self.proxy = next((p for p in self._line_proxies if p is not None), None)
 
         # 選擇性下載：None 表示下載整包；list 表示只下載指定檔案 index。
+        # 多線路分片只支援整包（selected_files 為 None），否則退回單線路。
         self.selected_files = selected_files
 
         self.filename = filename
@@ -209,9 +232,14 @@ class BTTask:
         self.end_time = None
         self.task_id = None
 
-        line_key = 'direct' if self.proxy is None else f"proxy:{self.proxy.get('host')}:{self.proxy.get('port')}"
-        self._line_key = line_key
-        self._line = LineSession(line_key, self.proxy, upload_rate_limit=self.upload_rate_limit)
+        self._lines = [
+            LineSession(_line_key_for(p), p, upload_rate_limit=self.upload_rate_limit)
+            for p in self._line_proxies
+        ]
+        self._line = self._lines[0]  # 向下相容：指向主要線路
+        self._line_key = self._lines[0].key
+        self._line_labels = {_line_key_for(p): _line_label_for(p) for p in self._line_proxies}
+        self._active_lines = []  # 目前已加入 torrent 的 session（magnet 初始只有 primary）
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -220,8 +248,10 @@ class BTTask:
         self._ti = None
         self._info_hash_hex = None
         self._work_root = None
+        self._num_pieces = 0
         self._total_size = 0
         self._total_done = 0
+        self._line_done = {}
         self._last_speed = 0.0
         self._last_upload = 0.0
         self._pieces = []
@@ -231,12 +261,14 @@ class BTTask:
         # 做種狀態：下載完成時刻與做種截止時刻（不做種時 seed_hours=0）。
         self._download_completed_at = None
         self._seed_deadline = None
-        # resume data 定期保存時間戳（供重啟續傳，跳過重複校驗）。
+        # resume data 定期保存時間戳（供重啟續傳，僅單線路時使用）。
         self._last_resume_save = 0.0
+        # magnet 是否已扇出多線路
+        self._fanned_out = False
 
     @property
     def proxies(self):
-        return [self.proxy] if self.proxy else []
+        return [p for p in self._line_proxies if p is not None]
 
     @property
     def total_size(self):
@@ -245,6 +277,14 @@ class BTTask:
     @property
     def is_private_torrent(self):
         return self.is_private
+
+    @property
+    def _multi_line(self):
+        return len(self._lines) > 1
+
+    def _can_multi(self):
+        """多線路分片的成立條件：公開種子 + 整包下載 + 多條線路。"""
+        return (not self.is_private) and (not self.selected_files) and self._multi_line
 
     # ------------------------------------------------------------------ #
     # 狀態持久化
@@ -265,7 +305,7 @@ class BTTask:
                 'filename': self.filename,
                 'kind': self.kind,
                 'proxy': self.proxy,
-                'proxies': [self.proxy] if self.proxy else [],
+                'proxies': self._line_proxies,
                 'selected_files': self.selected_files,
                 'seed_hours': self.seed_hours,
                 'upload_rate_limit': self.upload_rate_limit,
@@ -293,7 +333,6 @@ class BTTask:
         return os.path.join(self._work_root, 'resume.bin') if self._work_root else None
 
     def _persist_resume_data(self, params):
-        """把 libtorrent resume data（piece 位元圖 + info_dict）寫入磁碟。"""
         if not self._work_root:
             return
         try:
@@ -307,7 +346,6 @@ class BTTask:
             logger.debug('保存 resume data 失敗: %s', e)
 
     def _try_load_resume(self, params):
-        """若存在 resume data，改以 resume 參數加入，跳過重複校驗。"""
         if not self._work_root:
             return params
         path = self._resume_path()
@@ -317,7 +355,6 @@ class BTTask:
             with open(path, 'rb') as f:
                 data = f.read()
             rp = lt.read_resume_data(data)
-            # resume data 含 info_dict 時會自動帶 ti；否則回退到已解析的 ti
             ti = rp.ti if rp.ti is not None else getattr(params, 'ti', None)
             if ti is None:
                 return params
@@ -326,6 +363,7 @@ class BTTask:
             rp.storage_mode = lt.storage_mode_t.storage_mode_sparse
             rp.flags = lt.torrent_flags.auto_managed
             self._ti = ti
+            self._num_pieces = ti.num_pieces()
             self._total_size = self._wanted_size(ti)
             self.filename = ti.name() or self.filename
             self.filepath = os.path.join(self.save_dir, self.filename)
@@ -337,21 +375,21 @@ class BTTask:
             logger.warning('載入 resume data 失敗，改為全新加入: %s', e)
             return params
 
-    def _drain_alerts(self):
-        """處理 libtorrent alerts；目前只處理 resume data 保存結果。"""
+    def _drain_alerts(self, session=None):
+        session = session or self._line.session
         try:
-            for a in self._line.session.pop_alerts():
+            for a in session.pop_alerts():
                 if isinstance(a, lt.save_resume_data_alert):
                     self._persist_resume_data(a.params)
         except Exception:
             pass
 
-    def _wait_resume_alert(self, timeout=3.0):
-        """同步等待並保存 resume data（暫停/關閉前確保續傳資料落盤）。"""
+    def _wait_resume_alert(self, timeout=3.0, session=None):
+        session = session or self._line.session
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                for a in self._line.session.pop_alerts():
+                for a in session.pop_alerts():
                     if isinstance(a, lt.save_resume_data_alert):
                         self._persist_resume_data(a.params)
                         return
@@ -371,8 +409,23 @@ class BTTask:
         total = sum(fs.file_size(i) for i in self.selected_files if 0 <= i < n)
         return total if total > 0 else ti.total_size()
 
+    def _make_params_with_ti(self, ti):
+        p = lt.add_torrent_params()
+        p.ti = ti
+        p.save_path = self.save_dir
+        p.storage_mode = lt.storage_mode_t.storage_mode_sparse
+        p.flags = lt.torrent_flags.auto_managed
+        return p
+
+    def _make_params_magnet(self):
+        p = lt.parse_magnet_uri(self.source)
+        p.save_path = self.save_dir
+        p.storage_mode = lt.storage_mode_t.storage_mode_sparse
+        p.flags = lt.torrent_flags.auto_managed
+        return p
+
     def _apply_file_priorities(self):
-        """依 selected_files 設定 libtorrent 檔案優先權（0 = 不下載）。"""
+        """依 selected_files 設定檔案優先權（0 = 不下載）；僅單線路且有選擇性下載時生效。"""
         if not self.selected_files or self._line.handle is None or self._ti is None:
             return
         fs = self._ti.files()
@@ -386,11 +439,7 @@ class BTTask:
                 logger.warning('設定檔案優先權 %s 失敗: %s', i, e)
 
     def _mark_private(self, ti):
-        """偵測 PT（private）種子並記錄。
-
-        libtorrent 看到 private=1 會自動停用該種子的 DHT / PEX / LSD，此處僅標記供
-        上層與日誌辨識。本架構單一 session 單一線路，天然不拆線分流，符合 PT 規範。
-        """
+        """偵測 PT（private）種子並記錄。"""
         try:
             self.is_private = bool(ti.priv())
             if self.is_private:
@@ -398,6 +447,42 @@ class BTTask:
                             self.filename)
         except Exception:
             self.is_private = False
+
+    def _reset_handles(self):
+        """移除所有 session 現有的 torrent，確保 start() 可重複呼叫。"""
+        for line in self._lines:
+            line.remove()
+        self._active_lines = []
+        self._fanned_out = False
+
+    def _partition_priorities(self, lo, hi):
+        return [1 if lo <= i < hi else 0 for i in range(self._num_pieces)]
+
+    def _fan_out(self):
+        """metadata 已知後，把 piece 空間分片給各 session（主要供 magnet 延遲扇出）。"""
+        if self._fanned_out or not self._can_multi() or self._ti is None:
+            return
+        self._fanned_out = True
+        ranges = partition_ranges(self._num_pieces, len(self._lines))
+        if not ranges:
+            return
+
+        # primary 已在單線路階段加入，動態改其 piece 優先權
+        try:
+            self._line.handle.prioritize_pieces(self._partition_priorities(*ranges[0]))
+        except Exception as e:
+            logger.warning('重設 primary piece 優先權失敗: %s', e)
+
+        # 其餘線路逐一加入同一 torrent（共用 save_path）
+        for i in range(1, len(self._lines)):
+            line = self._lines[i]
+            params = self._make_params_with_ti(self._ti)
+            params.piece_priorities = self._partition_priorities(*ranges[i])
+            try:
+                line.add_torrent(params)
+                self._active_lines.append(line)
+            except Exception as e:
+                logger.warning('啟動 BT 線路 %s 失敗: %s', line.key, e)
 
     def start(self):
         if self.kind is None:
@@ -409,58 +494,77 @@ class BTTask:
         self.error_message = ''
         self.start_time = time.time()
         self._stop.clear()
+        self._download_completed_at = None
+        self._seed_deadline = None
 
         os.makedirs(self.save_dir, exist_ok=True)
-
-        params = lt.add_torrent_params()
-        params.save_path = self.save_dir
-        params.storage_mode = lt.storage_mode_t.storage_mode_sparse
-        params.flags = lt.torrent_flags.auto_managed
+        self._reset_handles()
 
         if self.kind == 'torrent':
             try:
                 ti = lt.torrent_info(self.source)
-                self._ti = ti
-                params.ti = ti
-                self._total_size = self._wanted_size(ti)
-                self.filename = ti.name() or self.filename
-                self.filepath = os.path.join(self.save_dir, self.filename)
-                self._info_hash_hex = _hash_hex(ti.info_hashes())
-                self._mark_private(ti)
             except Exception as e:
                 self.status = 'error'
                 self.error_message = f'解析 .torrent 失敗: {e}'
                 return False
+            self._ti = ti
+            self._num_pieces = ti.num_pieces()
+            self._total_size = self._wanted_size(ti)
+            self.filename = ti.name() or self.filename
+            self.filepath = os.path.join(self.save_dir, self.filename)
+            self._info_hash_hex = _hash_hex(ti.info_hashes())
+            self._mark_private(ti)
+            params = self._make_params_with_ti(ti)
         else:
             try:
-                magnet_p = lt.parse_magnet_uri(self.source)
-                params = magnet_p
-                params.save_path = self.save_dir
-                params.storage_mode = lt.storage_mode_t.storage_mode_sparse
-                params.flags = lt.torrent_flags.auto_managed
-                self._info_hash_hex = _hash_hex(params.info_hashes)
+                params = self._make_params_magnet()
             except Exception as e:
                 self.status = 'error'
                 self.error_message = f'解析 magnet 失敗: {e}'
                 return False
+            self._info_hash_hex = _hash_hex(params.info_hashes)
 
         if self._info_hash_hex:
             self._work_root = os.path.join(self.save_dir, '.bt_tmp', self._info_hash_hex)
 
-        # 優先以 resume data 續傳，跳過重複校驗（重啟後進度不再從 0 開始）
-        params = self._try_load_resume(params)
+        # resume 續傳僅支援單線路（多線路 resume 合併留待後續）
+        if not self._can_multi():
+            params = self._try_load_resume(params)
 
         if self._info_hash_hex:
             self._save_state()
 
-        try:
-            self._line.add_torrent(params)
-        except Exception as e:
-            self.status = 'error'
-            self.error_message = f'啟動 BT 下載失敗: {e}'
-            return False
-
-        self._apply_file_priorities()
+        if self.kind == 'torrent' and self._can_multi():
+            # 公開種子 + 整包：立即分片到全部線路
+            self._fanned_out = True
+            ranges = partition_ranges(self._num_pieces, len(self._lines))
+            try:
+                params.piece_priorities = self._partition_priorities(*ranges[0])
+                self._line.add_torrent(params)
+                self._active_lines = [self._line]
+            except Exception as e:
+                self.status = 'error'
+                self.error_message = f'啟動 BT 下載失敗: {e}'
+                return False
+            for i in range(1, len(self._lines)):
+                line = self._lines[i]
+                p2 = self._make_params_with_ti(self._ti)
+                p2.piece_priorities = self._partition_priorities(*ranges[i])
+                try:
+                    line.add_torrent(p2)
+                    self._active_lines.append(line)
+                except Exception as e:
+                    logger.warning('啟動 BT 線路 %s 失敗: %s', line.key, e)
+        else:
+            # 單線路（或 magnet 先以 primary 取 metadata）
+            try:
+                self._line.add_torrent(params)
+                self._active_lines = [self._line]
+            except Exception as e:
+                self.status = 'error'
+                self.error_message = f'啟動 BT 下載失敗: {e}'
+                return False
+            self._apply_file_priorities()
 
         self._coordinator = threading.Thread(target=self._coordinator_loop, daemon=True)
         self._coordinator.start()
@@ -470,8 +574,10 @@ class BTTask:
         if self.status not in ('downloading', 'seeding'):
             return False
         self.status = 'paused'
-        if self._line.handle is not None:
-            h = self._line.handle
+        for line in self._active_lines:
+            h = line.handle
+            if h is None:
+                continue
             try:
                 h.save_resume_data(
                     lt.save_resume_flags_t.flush_disk_cache | lt.save_resume_flags_t.save_info_dict)
@@ -481,7 +587,7 @@ class BTTask:
                 h.pause()
             except Exception as e:
                 logger.warning('BT pause 失敗: %s', e)
-            # 同步等待 resume data 落盤，確保關閉程式前已保存續傳資料
+        if not self._can_multi():
             self._wait_resume_alert(timeout=3.0)
         self._save_state()
         return True
@@ -489,14 +595,16 @@ class BTTask:
     def resume(self):
         if self.status not in ('paused', 'initialized'):
             return False
-        if self._line.handle is None:
+        if not self._active_lines:
             return self.start()
-        # 曾在做種階段被暫停則恢復為做種，否則回到下載中
         self.status = 'seeding' if self._download_completed_at is not None else 'downloading'
-        try:
-            self._line.handle.resume()
-        except Exception as e:
-            logger.warning('BT resume 失敗: %s', e)
+        for line in self._active_lines:
+            h = line.handle
+            if h is not None:
+                try:
+                    h.resume()
+                except Exception as e:
+                    logger.warning('BT resume 失敗: %s', e)
         return True
 
     def retry(self):
@@ -510,7 +618,9 @@ class BTTask:
         self._stop.set()
         if self._coordinator is not None and self._coordinator is not threading.current_thread():
             self._coordinator.join(timeout=1.0)
-        self._line.remove()
+        for line in self._lines:
+            line.remove()
+        self._active_lines = []
         self._cleanup_work()
         self.status = 'canceled'
         return True
@@ -518,71 +628,117 @@ class BTTask:
     # ------------------------------------------------------------------ #
     # 協調迴圈
     # ------------------------------------------------------------------ #
+    def _on_metadata(self, ti):
+        self._ti = ti
+        self._num_pieces = ti.num_pieces()
+        self._total_size = self._wanted_size(ti)
+        self.filename = ti.name() or self.filename
+        self.filepath = os.path.join(self.save_dir, self.filename)
+        self._mark_private(ti)
+        if not self._info_hash_hex:
+            self._info_hash_hex = _hash_hex(ti.info_hashes())
+            self._work_root = os.path.join(self.save_dir, '.bt_tmp', self._info_hash_hex)
+        self._save_state()
+        self._fan_out()
+
     def _coordinator_loop(self):
-        h = self._line.handle
         while not self._stop.is_set():
             try:
-                self._line.session.post_torrent_updates()
-                if h is None or not h.is_valid():
-                    break
+                for line in self._active_lines:
+                    line.session.post_torrent_updates()
 
-                # 定期保存 resume data（piece 位元圖 + info_dict），供重啟續傳
-                now = time.time()
-                if now - self._last_resume_save >= 10.0:
-                    self._last_resume_save = now
-                    try:
-                        h.save_resume_data(
-                            lt.save_resume_flags_t.flush_disk_cache | lt.save_resume_flags_t.save_info_dict)
-                    except Exception:
-                        pass
-                self._drain_alerts()
+                # resume data 定期保存：僅單線路（多線路留待後續）
+                if not self._can_multi():
+                    now = time.time()
+                    if now - self._last_resume_save >= 10.0:
+                        self._last_resume_save = now
+                        h = self._line.handle
+                        if h is not None and h.is_valid():
+                            try:
+                                h.save_resume_data(
+                                    lt.save_resume_flags_t.flush_disk_cache
+                                    | lt.save_resume_flags_t.save_info_dict)
+                            except Exception:
+                                pass
+                    self._drain_alerts()
 
-                st = h.status()
+                # magnet：primary 取得 metadata 後更新並視情況扇出多線
+                if self.kind == 'magnet' and self._ti is None and self._line.handle is not None:
+                    st0 = self._line.handle.status()
+                    if getattr(st0, 'has_metadata', False):
+                        try:
+                            ti = self._line.handle.torrent_file()
+                            if ti:
+                                self._on_metadata(ti)
+                        except Exception as e:
+                            logger.debug('讀取 metadata 失敗: %s', e)
 
-                # 當 magnet 獲取到 metadata 時，更新檔案資訊
-                if self._ti is None and getattr(st, 'has_metadata', False):
-                    try:
-                        ti = h.torrent_file()
-                        if ti:
-                            self._ti = ti
-                            self._total_size = ti.total_size()
-                            self.filename = ti.name() or self.filename
-                            self.filepath = os.path.join(self.save_dir, self.filename)
-                            self._mark_private(ti)
-                            if not self._info_hash_hex:
-                                self._info_hash_hex = _hash_hex(ti.info_hashes())
-                                self._work_root = os.path.join(self.save_dir, '.bt_tmp', self._info_hash_hex)
-                            self._save_state()
-                    except Exception as e:
-                        logger.debug('讀取 metadata 失敗: %s', e)
+                # 聚合各 active session 狀態
+                total_wanted = 0
+                total_done = 0
+                total_rate = 0
+                total_upload = 0
+                line_done = {}
+                merged_bits = None
+                num_pieces = self._num_pieces
 
-                wanted = st.total_wanted if st.total_wanted > 0 else self._total_size
-                done = st.total_wanted_done
-                rate = st.download_rate
+                for line in self._active_lines:
+                    h = line.handle
+                    if h is None or not h.is_valid():
+                        continue
+                    st = h.status()
+                    wanted = st.total_wanted
+                    done = st.total_wanted_done
+                    total_wanted += wanted
+                    total_done += done
+                    total_rate += st.download_rate
+                    total_upload += getattr(st, 'upload_rate', 0)
+                    line_done[line.key] = line_done.get(line.key, 0) + done
+                    bits = getattr(st, 'pieces', None)
+                    if bits:
+                        if merged_bits is None:
+                            merged_bits = bytearray(bits)
+                        else:
+                            for j in range(len(bits)):
+                                merged_bits[j] |= bits[j]
 
-                bits = getattr(st, 'pieces', None)
-                num_pieces = len(bits) * 8 if bits else (self._ti.num_pieces() if self._ti else 0)
                 pieces_frac = []
-                if bits and num_pieces > 0:
-                    pieces_frac = [1.0 if _bit(bits, i) else 0.0 for i in range(num_pieces)]
+                if merged_bits is not None and num_pieces > 0:
+                    pieces_frac = [1.0 if _bit(merged_bits, i) else 0.0
+                                   for i in range(num_pieces)]
 
                 with self._lock:
-                    if wanted > 0:
-                        self._total_size = wanted
-                    self._total_done = done
-                    self._last_speed = rate
-                    self._last_upload = getattr(st, 'upload_rate', 0)
+                    if total_wanted > 0:
+                        self._total_size = total_wanted
+                    self._total_done = total_done
+                    self._line_done = line_done
+                    self._last_speed = total_rate
+                    self._last_upload = total_upload
                     if pieces_frac:
                         self._pieces = pieces_frac
 
-                # 下載完成偵測（libtorrent 進入 seeding 或 finished 狀態，或 wanted_done 達標）
-                is_seeding = bool(getattr(st, 'is_seeding', False))
-                state_val = getattr(st, 'state', None)
-                is_finished = (state_val == lt.torrent_status.finished or state_val == lt.torrent_status.seeding)
-                download_done = is_seeding or is_finished or (wanted > 0 and done >= wanted)
+                # 完成偵測：
+                # 單線路沿用 libtorrent 的 seeding/finished + done>=wanted 判準；
+                # 多線路以「所有分片 piece 總下載量達整包大小」判定。
+                download_done = False
+                if self._can_multi():
+                    download_done = (self._total_size > 0 and total_done >= self._total_size)
+                else:
+                    for line in self._active_lines:
+                        h = line.handle
+                        if h is None or not h.is_valid():
+                            continue
+                        st = h.status()
+                        state_val = getattr(st, 'state', None)
+                        is_fin = (state_val == lt.torrent_status.finished
+                                  or state_val == lt.torrent_status.seeding)
+                        if (bool(getattr(st, 'is_seeding', False)) or is_fin
+                                or (st.total_wanted > 0 and st.total_wanted_done >= st.total_wanted)):
+                            download_done = True
+                            break
 
                 if download_done:
-                    # 記錄首次完成時刻，依設定決定是否進入做種階段
+                    # 依設定決定是否進入做種；不做種（seed_hours=0）下載完成即停
                     if self._download_completed_at is None:
                         self._download_completed_at = time.time()
                         if self.seed_hours > 0:
@@ -591,20 +747,23 @@ class BTTask:
                             logger.info('BT 下載完成，進入做種 %s 小時: %s',
                                         self.seed_hours, self.filename)
                         else:
-                            # 不做種（seed_hours=0），維持原有「下載完成即停」行為
                             self.end_time = time.time()
                             self.status = 'completed'
-                            self._line.remove()
+                            for line in self._lines:
+                                line.remove()
+                            self._active_lines = []
                             self._cleanup_work()
                             return
 
-                    # 做種階段：到期才結束；期間持續上傳避免被判定為吸血鬼
-                    if self._seed_deadline is not None and time.time() >= self._seed_deadline:
-                        self.end_time = time.time()
-                        self.status = 'completed'
-                        self._line.remove()
-                        self._cleanup_work()
-                        return
+                if self.status == 'seeding' and self._seed_deadline is not None \
+                        and time.time() >= self._seed_deadline:
+                    self.end_time = time.time()
+                    self.status = 'completed'
+                    for line in self._lines:
+                        line.remove()
+                    self._active_lines = []
+                    self._cleanup_work()
+                    return
 
             except Exception as e:
                 if self.status in ('downloading', 'seeding'):
@@ -629,16 +788,16 @@ class BTTask:
             pieces = list(self._pieces)
             speed = self._last_speed
             upload_speed = self._last_upload
+            line_done = dict(self._line_done)
 
         pct = (done / total * 100) if total > 0 else 0.0
         elapsed = 0
         if self.start_time:
             elapsed = (self.end_time or time.time()) - self.start_time
 
-        line_key = self._line_key
-        line_label = '直連' if self.proxy is None else f"{self.proxy.get('host')}:{self.proxy.get('port')}"
-        line_bytes = {line_key: done}
-        line_labels = {line_key: line_label}
+        line_bytes = {}
+        for key, _label in self._line_labels.items():
+            line_bytes[key] = line_done.get(key, 0)
 
         seeding_remaining = 0.0
         if self.status == 'seeding' and self._seed_deadline is not None:
@@ -653,11 +812,11 @@ class BTTask:
             'status': self.status,
             'error_message': self.error_message,
             'elapsed_time': elapsed,
-            'thread_count': 1,
+            'thread_count': max(1, len(self._lines)),
             'block_count': len(pieces),
             'blocks': _downsample_blocks(pieces),
             'line_bytes': line_bytes,
-            'line_labels': line_labels,
+            'line_labels': dict(self._line_labels),
             'is_private': self.is_private,
             'seed_hours': self.seed_hours,
             'seeding_remaining': seeding_remaining,
