@@ -13,7 +13,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from ftp_downloader import SocksFTP, parse_ftp_url
-from bt_downloader import BTTask, source_kind
+from bt_downloader import BTTask, source_kind, bt_info_hash
 
 logger = logging.getLogger('downloader')
 
@@ -1513,15 +1513,32 @@ class DownloadManager:
         except Exception as e:
             logger.warning("自動啟動 BT 任務失敗: %s", e)
 
+    def _find_bt_task_by_hash(self, info_hash):
+        """依 info hash 找既有的 BT 任務（跨來源字串去重用）。"""
+        if not info_hash:
+            return None
+        for t in self.tasks.values():
+            if isinstance(t, BTTask) and getattr(t, 'bt_info_hash', None) == info_hash:
+                return t
+        return None
+
     def _add_bt_task(self, source, filename, save_dir, line=None, use_proxy=True,
                      selected_files=None, seed_hours=None, upload_rate_limit=None):
         """建立 BT 下載任務（magnet 或 .torrent），支援自選線路（直連或指定 SOCKS5）。"""
+        ih = bt_info_hash(source)
         with self._lock:
             if source in self.tasks:
                 existing = self.tasks[source]
                 if existing.status in ('initialized', 'downloading', 'seeding', 'paused'):
                     return existing.task_id
                 self.task_ids.pop(existing.task_id, None)
+            elif ih:
+                # 同一顆種子可能以不同來源字串加入（magnet vs .torrent、不同路徑），
+                # 用 info hash 再查一次，避免建立重複任務。
+                existing = self._find_bt_task_by_hash(ih)
+                if existing is not None and existing.status in (
+                        'initialized', 'downloading', 'seeding', 'paused'):
+                    return existing.task_id
 
         save_dir = save_dir or self.save_dir
         os.makedirs(save_dir, exist_ok=True)
@@ -1715,6 +1732,8 @@ class DownloadManager:
                         state = json.load(f)
                     source = state.get('source')
                     if not source or source in self.tasks:
+                        continue
+                    if self._find_bt_task_by_hash(bt_info_hash(source)) is not None:
                         continue
                     proxies = state.get('proxies')
                     if not proxies:

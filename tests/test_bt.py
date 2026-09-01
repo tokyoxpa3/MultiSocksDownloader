@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import libtorrent as lt
 from bt_downloader import (
     BTTask, is_magnet, source_kind, magnet_display_name, partition_ranges, LineSession,
-    torrent_file_tree,
+    torrent_file_tree, bt_info_hash,
 )
 
 
@@ -340,6 +340,26 @@ class TestMultiLineResume(unittest.TestCase):
         with open(t.filepath, 'wb') as f:
             f.write(b'x')
         self.assertEqual(t._validate_resume([True, False, True]), [True, False, True])
+
+
+class TestBtInfoHash(unittest.TestCase):
+    """跨來源字串去重的 info hash 提取。"""
+
+    def test_magnet(self):
+        ih = 'a' * 40
+        self.assertEqual(bt_info_hash(f'magnet:?xt=urn:btih:{ih}'), ih)
+
+    def test_torrent_file(self):
+        data = b'x' * 100
+        ph = hashlib.sha1(data).digest()
+        info = {b'name': b'a.bin', b'length': 100, b'piece length': 16384, b'pieces': ph}
+        path = os.path.join(tempfile.mkdtemp(), 't.torrent')
+        with open(path, 'wb') as f:
+            f.write(lt.bencode({b'info': info}))
+        self.assertEqual(bt_info_hash(path), str(lt.torrent_info(path).info_hashes().v1))
+
+    def test_non_bt_returns_none(self):
+        self.assertIsNone(bt_info_hash('http://example.com/x.zip'))
 
 
 if __name__ == '__main__':

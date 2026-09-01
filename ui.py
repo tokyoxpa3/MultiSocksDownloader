@@ -263,13 +263,13 @@ QTableWidget, QTreeWidget {
     gridline-color: #edf0f3;
     outline: 0;
 }
-QTableWidget::item, QTreeWidget::item {
+QTableWidget::item {
     padding: 6px 10px;
     border: none;
 }
-QTreeWidget::indicator {
-    width: 16px;
-    height: 16px;
+QTableWidget::item:selected {
+    background-color: #d6e8ff;
+    color: #16181c;
 }
 QHeaderView::section {
     background-color: #f2f4f7;

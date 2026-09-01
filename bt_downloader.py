@@ -48,6 +48,22 @@ def source_kind(source):
     return None
 
 
+def bt_info_hash(source):
+    """從 magnet 或 .torrent 來源提取 info hash hex（v1 優先）；失敗回傳 None。
+
+    供跨「來源字串」去重用：同一顆種子的 magnet 與 .torrent 檔（或不同路徑的
+    .torrent 檔）其 info hash 相同，可據此避免重複建立任務。
+    """
+    try:
+        if is_magnet(source):
+            return _hash_hex(lt.parse_magnet_uri(source).info_hashes)
+        if source_kind(source) == 'torrent':
+            return _hash_hex(lt.torrent_info(source).info_hashes())
+    except Exception:
+        pass
+    return None
+
+
 def magnet_display_name(source):
     """從 magnet URI 的 dn= 參數取顯示名稱（無則回傳空字串）。"""
     try:
@@ -198,6 +214,7 @@ class BTTask:
         self.source = source
         self.url = source
         self.kind = source_kind(source)
+        self.bt_info_hash = bt_info_hash(source)
         self.save_dir = save_dir
         self.seed_hours = max(0.0, float(seed_hours or 0))
         self.upload_rate_limit = max(0, int(upload_rate_limit or 0))
