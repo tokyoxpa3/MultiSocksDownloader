@@ -290,5 +290,46 @@ class TestBTTaskSelectedFiles(unittest.TestCase):
             self.assertEqual(dm2.bt_upload_rate, 204800)
 
 
+class TestMultiLineResume(unittest.TestCase):
+    """多線路 resume 的合併位元圖持久化與剩餘 piece 分派。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def test_merged_pieces_roundtrip(self):
+        t = BTTask('magnet:?xt=urn:btih:xx', self.tmpdir, proxies=[None, None])
+        t._work_root = os.path.join(self.tmpdir, '.bt_tmp', 'abc123')
+        t._persist_merged_pieces([True, False, True])
+        self.assertEqual(t._load_merged_pieces(), [True, False, True])
+
+    def test_assign_remaining_partitions(self):
+        ti, _ = make_torrent_info(32 * 1024, [('x.bin', b'x' * (8 * 32 * 1024))])
+        t = BTTask('magnet:?xt=urn:btih:yy', self.tmpdir, proxies=[None, None])
+        t._ti = ti
+        t._num_pieces = 8
+        merged_have = [True, True, False, False, True, True, False, False]
+        piece_owner, have = t._assign_remaining(merged_have)
+        # 剩餘 piece [2,3,6,7] 分給 2 線：線 0 -> [2,3]、線 1 -> [6,7]
+        self.assertEqual(piece_owner[2], 0)
+        self.assertEqual(piece_owner[3], 0)
+        self.assertEqual(piece_owner[6], 1)
+        self.assertEqual(piece_owner[7], 1)
+        # 已完成 piece 不指派給任何線路
+        self.assertEqual(piece_owner[0], -1)
+        self.assertEqual(piece_owner[1], -1)
+        self.assertEqual(piece_owner[4], -1)
+        self.assertEqual(piece_owner[5], -1)
+        self.assertEqual(have, merged_have)
+
+    def test_priorities_for(self):
+        ti, _ = make_torrent_info(32 * 1024, [('x.bin', b'x' * (4 * 32 * 1024))])
+        t = BTTask('magnet:?xt=urn:btih:zz', self.tmpdir, proxies=[None, None])
+        t._ti = ti
+        t._num_pieces = 4
+        owner = [0, 0, 1, 1]
+        self.assertEqual(t._priorities_for(0, owner), [1, 1, 0, 0])
+        self.assertEqual(t._priorities_for(1, owner), [0, 0, 1, 1])
+
+
 if __name__ == '__main__':
     unittest.main()

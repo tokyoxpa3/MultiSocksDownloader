@@ -8,13 +8,14 @@ import os
 import sys
 import time
 import hashlib
+import json
 import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import libtorrent as lt
-from bt_downloader import BTTask
+from bt_downloader import BTTask, _hash_hex
 
 
 def make_ti(piece_len, name, data):
@@ -160,6 +161,71 @@ class TestMultiSessionBTTask(unittest.TestCase):
             if task is not None:
                 task.cancel()
             seed.remove_torrent(sh)
+
+    def test_resume_completes_without_seeder(self):
+        """完整下載後停止 seeder，以 merged pieces 續傳，驗證不需重新下載即完成。"""
+        tmp = tempfile.mkdtemp()
+        seed_dir = os.path.join(tmp, 'seed')
+        dl_dir = os.path.join(tmp, 'dl')
+        os.makedirs(seed_dir)
+        os.makedirs(dl_dir)
+
+        name = 'payload.bin'
+        data = os.urandom(256 * 1024)
+        with open(os.path.join(seed_dir, name), 'wb') as f:
+            f.write(data)
+        ti, info = make_ti(32 * 1024, name, data)
+        torrent_file_path = os.path.join(tmp, 'sample.torrent')
+        with open(torrent_file_path, 'wb') as f:
+            f.write(lt.bencode({b'info': info}))
+
+        seed_port = 22000 + (os.getpid() % 500)
+        seed = lt.session({'listen_interfaces': f'127.0.0.1:{seed_port}',
+                           'enable_dht': False, 'enable_lsd': False,
+                           'enable_upnp': False, 'enable_natpmp': False})
+        sp = lt.add_torrent_params()
+        sp.ti = ti
+        sp.save_path = seed_dir
+        sp.flags = lt.torrent_flags.seed_mode
+        sh = seed.add_torrent(sp)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            seed.post_torrent_updates()
+            if sh.status().is_seeding:
+                break
+            time.sleep(0.2)
+        self.assertTrue(sh.status().is_seeding)
+
+        # 第一階段：完整下載
+        task = BTTask(torrent_file_path, dl_dir, proxies=[None, None])
+        self.assertTrue(task.start())
+        task._lines[0].handle.connect_peer(('127.0.0.1', seed_port))
+        task._lines[1].handle.connect_peer(('127.0.0.1', seed_port))
+        deadline = time.time() + self.TIMEOUT
+        while time.time() < deadline:
+            if task.is_completed():
+                break
+            time.sleep(0.3)
+        self.assertTrue(task.is_completed())
+
+        # 重建 resume 狀態：全部 piece 已完成（task 完成時 work_root 已被清理）
+        info_hash = _hash_hex(ti.info_hashes())
+        work_root = os.path.join(dl_dir, '.bt_tmp', info_hash)
+        os.makedirs(work_root, exist_ok=True)
+        with open(os.path.join(work_root, 'pieces.json'), 'w', encoding='utf-8') as f:
+            json.dump([True] * ti.num_pieces(), f)
+
+        # 停止 seeder，續傳不應再需要對外連線
+        seed.remove_torrent(sh)
+
+        task2 = BTTask(torrent_file_path, dl_dir, proxies=[None, None])
+        self.assertTrue(task2.start())
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if task2.is_completed():
+                break
+            time.sleep(0.3)
+        self.assertTrue(task2.is_completed(), '續傳未能在無 seeder 下完成')
 
 
 if __name__ == '__main__':

@@ -83,13 +83,14 @@ private=1 多 IP 下載會被 tracker ban。magnet 需等 metadata 才知道是�
 4. 公開種子才多線、private 強制單線。
 5. 進度聚合、`get_progress` 回報每線資料。
 
-### 進階
+### 進階（已實作，2026-09-01）
 
-6. 動態重新派工（解決負載不均）。
-7. resume 合併（單 session `force_recheck`，或 OR 各 session piece bitmap）。
+6. 動態重新派工：每 3 秒檢查，閒置線路接手最忙碌線路的一半剩餘 piece（piece 所有權追蹤 + 工作竊取）。
+7. resume 合併：多線路定期把合併的 piece 完成位元圖存為 `pieces.json`，重啟時以 `have_pieces` / `verified_pieces` 標記已完成 piece、只重派剩餘 piece。（目前僅 `.torrent` 檔；magnet 仍在 metadata 後重新分片。）
 
 ## 未決問題
 
 - [x] R1 的結論（共用檔 vs 各自存檔＋合併）——POC 驗證共用檔可行（2026-09-01）。
-- [ ] 動態重新派工的觸發頻率與搬移上限。
-- [ ] resume 在多 session 下的正確合併策略。
+- [x] 動態重新派工的觸發頻率與搬移上限——每 3 秒、竊取一半剩餘 piece（2026-09-01）。
+- [x] resume 在多 session 下的正確合併策略——合併位元圖 + `have_pieces`（2026-09-01）。
+- [ ] magnet 多線路 resume（metadata 階段如何接續）——尚未實作。

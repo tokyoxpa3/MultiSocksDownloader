@@ -265,6 +265,14 @@ class BTTask:
         self._last_resume_save = 0.0
         # magnet 是否已扇出多線路
         self._fanned_out = False
+        # piece 所有權：list[line_idx]，index 為 piece、值為負責下載該 piece 的線路。
+        self._piece_owner = []
+        # 動態重新派工節流時間戳
+        self._last_rebalance = 0.0
+        # 最近一次聚合的合併 piece 完成位元圖（供多線路 resume 保存）
+        self._last_merged_have = []
+        # 續傳時已擁有的 piece 位元組數（多線路 resume 用，新任務為 0）
+        self._resume_have_bytes = 0
 
     @property
     def proxies(self):
@@ -331,6 +339,37 @@ class BTTask:
     # ------------------------------------------------------------------ #
     def _resume_path(self):
         return os.path.join(self._work_root, 'resume.bin') if self._work_root else None
+
+    def _merged_pieces_path(self):
+        return os.path.join(self._work_root, 'pieces.json') if self._work_root else None
+
+    def _persist_merged_pieces(self, merged_have):
+        """保存多線路的合併 piece 完成位元圖（list[bool]），供重啟續傳。"""
+        if not self._work_root:
+            return
+        try:
+            os.makedirs(self._work_root, exist_ok=True)
+            path = self._merged_pieces_path()
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump([bool(x) for x in merged_have], f)
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.debug('保存 merged pieces 失敗: %s', e)
+
+    def _load_merged_pieces(self):
+        """讀取多線路續傳的合併位元圖；無則回傳 None。"""
+        if not self._work_root:
+            return None
+        path = self._merged_pieces_path()
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning('載入 merged pieces 失敗: %s', e)
+            return None
 
     def _persist_resume_data(self, params):
         if not self._work_root:
@@ -458,6 +497,79 @@ class BTTask:
     def _partition_priorities(self, lo, hi):
         return [1 if lo <= i < hi else 0 for i in range(self._num_pieces)]
 
+    def _build_owner(self, ranges):
+        """依 partition_ranges 建立 piece 所有權表（piece index -> 線路 index）。"""
+        self._piece_owner = []
+        for i, (lo, hi) in enumerate(ranges):
+            self._piece_owner.extend([i] * (hi - lo))
+
+    def _assign_remaining(self, merged_have):
+        """依已完成 piece（merged_have，None=從頭）把未完成 piece 分給各 session。
+
+        回傳 (piece_owner, have)；have 為每 piece 已完成與否的 list[bool]。
+        """
+        num = self._num_pieces
+        have = [bool(x) for x in merged_have] if merged_have else [False] * num
+        remaining = [i for i in range(num) if not have[i]]
+        piece_owner = [-1] * num
+        ranges = partition_ranges(len(remaining), len(self._lines))
+        for li, (lo, hi) in enumerate(ranges):
+            for idx in remaining[lo:hi]:
+                piece_owner[idx] = li
+        return piece_owner, have
+
+    def _priorities_for(self, line_idx, owner):
+        return [1 if owner[i] == line_idx else 0 for i in range(self._num_pieces)]
+
+    def _apply_owner_priorities(self, line_idx):
+        """依所有權表重設某條線路的 piece 優先權。"""
+        line = self._lines[line_idx]
+        if line.handle is None or not line.handle.is_valid():
+            return
+        priorities = [
+            1 if (i < len(self._piece_owner) and self._piece_owner[i] == line_idx) else 0
+            for i in range(self._num_pieces)
+        ]
+        try:
+            line.handle.prioritize_pieces(priorities)
+        except Exception as e:
+            logger.warning('套用 piece 優先權失敗: %s', e)
+
+    def _rebalance(self, merged_done):
+        """動態重新派工：閒置線路接手最忙碌線路的一半剩餘 piece，解決靜態分片負載不均。"""
+        if not self._can_multi() or self._num_pieces <= 0:
+            return
+        if len(self._piece_owner) != self._num_pieces or all(merged_done):
+            return
+        active_idx = [
+            i for i, line in enumerate(self._lines)
+            if line in self._active_lines
+            and line.handle is not None and line.handle.is_valid()
+        ]
+        if len(active_idx) < 2:
+            return
+        remaining = {
+            i: [p for p in range(self._num_pieces)
+                if self._piece_owner[p] == i and not merged_done[p]]
+            for i in active_idx
+        }
+        idle = [i for i in active_idx if not remaining.get(i)]
+        donors = [(i, ps) for i, ps in remaining.items() if len(ps) > 1]
+        if not idle or not donors:
+            return
+        donor_idx, donor_pieces = max(donors, key=lambda t: len(t[1]))
+        thief_idx = idle[0]
+        split = len(donor_pieces) // 2
+        if split < 1:
+            return
+        stolen = donor_pieces[split:]
+        for p in stolen:
+            self._piece_owner[p] = thief_idx
+        self._apply_owner_priorities(donor_idx)
+        self._apply_owner_priorities(thief_idx)
+        logger.debug('BT 重新派工：線路 %d -> %d 搬移 %d piece',
+                     donor_idx, thief_idx, len(stolen))
+
     def _fan_out(self):
         """metadata 已知後，把 piece 空間分片給各 session（主要供 magnet 延遲扇出）。"""
         if self._fanned_out or not self._can_multi() or self._ti is None:
@@ -466,6 +578,7 @@ class BTTask:
         ranges = partition_ranges(self._num_pieces, len(self._lines))
         if not ranges:
             return
+        self._build_owner(ranges)
 
         # primary 已在單線路階段加入，動態改其 piece 優先權
         try:
@@ -496,6 +609,7 @@ class BTTask:
         self._stop.clear()
         self._download_completed_at = None
         self._seed_deadline = None
+        self._resume_have_bytes = 0
 
         os.makedirs(self.save_dir, exist_ok=True)
         self._reset_handles()
@@ -527,7 +641,7 @@ class BTTask:
         if self._info_hash_hex:
             self._work_root = os.path.join(self.save_dir, '.bt_tmp', self._info_hash_hex)
 
-        # resume 續傳僅支援單線路（多線路 resume 合併留待後續）
+        # resume data 續傳僅支援單線路；多線路用合併位元圖（下方 torrent 分支載入）
         if not self._can_multi():
             params = self._try_load_resume(params)
 
@@ -535,25 +649,29 @@ class BTTask:
             self._save_state()
 
         if self.kind == 'torrent' and self._can_multi():
-            # 公開種子 + 整包：立即分片到全部線路
+            # 公開種子 + 整包：立即分片到全部線路；有 merged pieces 則接續未完成部分
+            merged_have = self._load_merged_pieces()
+            piece_owner, have = self._assign_remaining(merged_have)
+            self._piece_owner = piece_owner
             self._fanned_out = True
-            ranges = partition_ranges(self._num_pieces, len(self._lines))
-            try:
-                params.piece_priorities = self._partition_priorities(*ranges[0])
-                self._line.add_torrent(params)
-                self._active_lines = [self._line]
-            except Exception as e:
-                self.status = 'error'
-                self.error_message = f'啟動 BT 下載失敗: {e}'
-                return False
-            for i in range(1, len(self._lines)):
-                line = self._lines[i]
-                p2 = self._make_params_with_ti(self._ti)
-                p2.piece_priorities = self._partition_priorities(*ranges[i])
+            self._resume_have_bytes = sum(
+                self._ti.piece_size(i) for i in range(self._num_pieces) if have[i]
+            )
+            has_resume = any(have)
+            for i, line in enumerate(self._lines):
+                p = self._make_params_with_ti(self._ti)
+                if has_resume:
+                    p.have_pieces = list(have)
+                    p.verified_pieces = list(have)
+                p.piece_priorities = self._priorities_for(i, piece_owner)
                 try:
-                    line.add_torrent(p2)
+                    line.add_torrent(p)
                     self._active_lines.append(line)
                 except Exception as e:
+                    if i == 0:
+                        self.status = 'error'
+                        self.error_message = f'啟動 BT 下載失敗: {e}'
+                        return False
                     logger.warning('啟動 BT 線路 %s 失敗: %s', line.key, e)
         else:
             # 單線路（或 magnet 先以 primary 取 metadata）
@@ -578,16 +696,21 @@ class BTTask:
             h = line.handle
             if h is None:
                 continue
-            try:
-                h.save_resume_data(
-                    lt.save_resume_flags_t.flush_disk_cache | lt.save_resume_flags_t.save_info_dict)
-            except Exception:
-                pass
+            if not self._can_multi():
+                try:
+                    h.save_resume_data(
+                        lt.save_resume_flags_t.flush_disk_cache | lt.save_resume_flags_t.save_info_dict)
+                except Exception:
+                    pass
             try:
                 h.pause()
             except Exception as e:
                 logger.warning('BT pause 失敗: %s', e)
-        if not self._can_multi():
+        if self._can_multi():
+            # 多線路：保存合併 piece 位元圖以供續傳
+            if self._last_merged_have:
+                self._persist_merged_pieces(self._last_merged_have)
+        else:
             self._wait_resume_alert(timeout=3.0)
         self._save_state()
         return True
@@ -703,26 +826,44 @@ class BTTask:
                                 merged_bits[j] |= bits[j]
 
                 pieces_frac = []
+                merged_done = []
                 if merged_bits is not None and num_pieces > 0:
-                    pieces_frac = [1.0 if _bit(merged_bits, i) else 0.0
-                                   for i in range(num_pieces)]
+                    merged_done = [_bit(merged_bits, i) for i in range(num_pieces)]
+                    pieces_frac = [1.0 if d else 0.0 for d in merged_done]
+
+                # 動態重新派工：閒置線路接手忙碌線路的剩餘 piece（僅多線路）
+                now = time.time()
+                if self._can_multi() and num_pieces > 0 and now - self._last_rebalance >= 3.0:
+                    self._last_rebalance = now
+                    self._rebalance(merged_done)
+
+                # 多線路續傳：定期保存合併 piece 位元圖
+                if self._can_multi() and merged_done and now - self._last_resume_save >= 10.0:
+                    self._last_resume_save = now
+                    self._persist_merged_pieces(merged_done)
 
                 with self._lock:
-                    if total_wanted > 0:
+                    if not self._can_multi() and total_wanted > 0:
                         self._total_size = total_wanted
-                    self._total_done = total_done
+                    if self._can_multi():
+                        self._total_done = total_done + self._resume_have_bytes
+                    else:
+                        self._total_done = total_done
                     self._line_done = line_done
                     self._last_speed = total_rate
                     self._last_upload = total_upload
                     if pieces_frac:
                         self._pieces = pieces_frac
+                    self._last_merged_have = merged_done
 
                 # 完成偵測：
                 # 單線路沿用 libtorrent 的 seeding/finished + done>=wanted 判準；
                 # 多線路以「所有分片 piece 總下載量達整包大小」判定。
                 download_done = False
                 if self._can_multi():
-                    download_done = (self._total_size > 0 and total_done >= self._total_size)
+                    # 多線路：本次下載量 + 續傳已擁有量達整包大小即完成
+                    download_done = (self._total_size > 0
+                                     and total_done + self._resume_have_bytes >= self._total_size)
                 else:
                     for line in self._active_lines:
                         h = line.handle
