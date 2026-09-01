@@ -255,7 +255,7 @@ LINE_COLORS = ["#2ecc71", "#3498db", "#9b59b6", "#e67e22", "#1abc9c", "#e74c3c"]
 # 全域樣式（QSS）：統一表格、表頭、進度條與狀態徽章的現代化外觀。
 # 重點：表格儲存格加上內邊距，避免文字貼邊、被縱向網格線截斷。
 APP_QSS = """
-QTableWidget, QTreeWidget {
+QTableWidget {
     background-color: #ffffff;
     alternate-background-color: #f7f9fb;
     border: 1px solid #e3e7eb;
