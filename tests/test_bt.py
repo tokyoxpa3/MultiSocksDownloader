@@ -330,6 +330,17 @@ class TestMultiLineResume(unittest.TestCase):
         self.assertEqual(t._priorities_for(0, owner), [1, 1, 0, 0])
         self.assertEqual(t._priorities_for(1, owner), [0, 0, 1, 1])
 
+    def test_validate_resume(self):
+        t = BTTask('magnet:?xt=urn:btih:ww', self.tmpdir, proxies=[None, None])
+        t.filename = 'gone.bin'
+        t.filepath = os.path.join(self.tmpdir, 'gone.bin')
+        # 檔案不存在 -> 放棄續傳，改從頭下載
+        self.assertIsNone(t._validate_resume([True, False, True]))
+        # 檔案存在 -> 保留位元圖
+        with open(t.filepath, 'wb') as f:
+            f.write(b'x')
+        self.assertEqual(t._validate_resume([True, False, True]), [True, False, True])
+
 
 if __name__ == '__main__':
     unittest.main()

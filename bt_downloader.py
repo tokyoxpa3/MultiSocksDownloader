@@ -371,6 +371,13 @@ class BTTask:
             logger.warning('載入 merged pieces 失敗: %s', e)
             return None
 
+    def _validate_resume(self, merged_have):
+        """若磁碟上的檔案/目錄已不存在，放棄續傳（回傳 None），改從頭下載。"""
+        if merged_have and not os.path.exists(self.filepath):
+            logger.info('BT 續傳檔案不存在，改從頭下載: %s', self.filename)
+            return None
+        return merged_have
+
     def _persist_resume_data(self, params):
         if not self._work_root:
             return
@@ -650,7 +657,7 @@ class BTTask:
 
         if self.kind == 'torrent' and self._can_multi():
             # 公開種子 + 整包：立即分片到全部線路；有 merged pieces 則接續未完成部分
-            merged_have = self._load_merged_pieces()
+            merged_have = self._validate_resume(self._load_merged_pieces())
             piece_owner, have = self._assign_remaining(merged_have)
             self._piece_owner = piece_owner
             self._fanned_out = True
