@@ -1,14 +1,14 @@
 # BT 多線路聚合下載 — 設計文件
 
-> 狀態：研究階段（尚未實作）
-> 對應現況：`bt_downloader.py` 目前為單一 session 單一線路，尚未聚合多線路頻寬。
+> 狀態：已實作（2026-09-01）
+> 對應現況：`bt_downloader.py` 已支援多 session 多線路聚合（公開種子分片下載、動態重新派工、多線 resume 合併）。
 
 ## 目標
 
 讓單一 BT 任務（公開種子）能同時透過「直連 + 多個 SOCKS5 代理」下載，把不同
 piece 分散到不同線路，達成多線路頻寬聚合。
 
-## 現況
+## 實作前現況（歷史紀錄）
 
 - `BTTask` 持有單一 `LineSession`（`bt_downloader.py:214`），一個 `lt.session` 綁定一條線路。
 - `proxies` 列表只取第一筆（`bt_downloader.py:186-191`）。

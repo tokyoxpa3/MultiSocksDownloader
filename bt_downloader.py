@@ -12,9 +12,11 @@
 - 下載完成後可依設定繼續做種一段時間；PT（private）種子由 libtorrent 依 private=1
   自動關閉 DHT / PEX / LSD。
 
-MVP 限制（詳見 docs/bt-multi-line-design.md）：
-- 選擇性下載（selected_files）暫不與多線路併用，設了 selected_files 就退回單線路。
-- 多線路暫不做 resume data 持久化（各 session 的 piece 位元圖合併留待後續）。
+限制（詳見 docs/bt-multi-line-design.md）：
+- 選擇性下載（selected_files）不與多線路併用，設了 selected_files 就退回單線路。
+- magnet 的多線路 resume 尚未實作（metadata 階段如何接續留待後續）；.torrent 檔已支援：
+  定期把合併的 piece 完成位元圖存為 pieces.json，重啟時以 have_pieces / verified_pieces
+  標記已完成 piece，只重派剩餘 piece。
 """
 
 import os
