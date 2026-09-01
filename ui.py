@@ -271,16 +271,6 @@ QTreeWidget::indicator {
     width: 16px;
     height: 16px;
 }
-QTreeWidget::indicator:unchecked {
-    border: 1px solid #b6bcc4;
-    border-radius: 3px;
-    background: #ffffff;
-}
-QTreeWidget::indicator:checked {
-    border: 1px solid #3b9bff;
-    border-radius: 3px;
-    background: #3b9bff;
-}
 QHeaderView::section {
     background-color: #f2f4f7;
     color: #55606c;
