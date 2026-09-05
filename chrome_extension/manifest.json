@@ -1,18 +1,19 @@
 {
   "manifest_version": 3,
   "name": "多代理下載器",
-  "version": "1.1",
+  "version": "1.2",
   "description": "將下載請求發送到多代理下載器應用程式",
   "permissions": [
     "contextMenus",
     "storage",
     "downloads",
-    "tabs",
-    "notifications"
+    "notifications",
+    "cookies"
   ],
   "host_permissions": [
     "http://localhost:8765/*",
-    "http://127.0.0.1:8765/*"
+    "http://127.0.0.1:8765/*",
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background.js"

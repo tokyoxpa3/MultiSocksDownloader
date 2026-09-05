@@ -20,6 +20,9 @@ from downloader import DownloadManager, format_size
 from app_icon import load_app_icon
 import libtorrent as lt
 from bt_downloader import torrent_file_tree, magnet_display_name
+import file_association
+import version
+import updater
 
 # 格式化時間顯示
 def format_time(seconds):
@@ -100,12 +103,20 @@ class SegmentProgressBar(QWidget):
         total = len(self.blocks)
         w = rect.width()
         h = rect.height()
+
+        # 動態調整間距：當區塊數量很多時，縮小間距避免畫面被空白網格線佔滿而顯得碎裂
         gap = 2.0
+        if total > 200:
+            gap = 1.0
+        if total > 1000:
+            gap = 0.0
+
         # 依長寬比例決定欄數，讓方格近似正方形並填滿整塊區域
         aspect = w / max(1.0, h)
         cols = max(1, round((total * aspect) ** 0.5))
         cols = min(cols, total)
         rows = (total + cols - 1) // cols
+
         cell_w = max(1.0, (w - gap * (cols - 1)) / cols)
         cell_h = max(1.0, (h - gap * (rows - 1)) / rows)
 
@@ -116,17 +127,37 @@ class SegmentProgressBar(QWidget):
             y = row * (cell_h + gap)
             frac = min(1.0, max(0.0, float(b.get('frac', 0.0))))
             active = bool(b.get('active', False))
+
             # 未下載底色
             painter.fillRect(QRectF(x, y, cell_w, cell_h), QColor(224, 224, 224))
-            if frac > 0:
-                if frac >= 0.999:
-                    color = QColor(46, 204, 113)   # 完成 綠
-                elif active:
-                    color = QColor(52, 152, 219)   # 下載中 藍
+
+            if frac <= 0 and not active:
+                continue
+
+            # 統一顏色：下載中藍、已下載綠。不另外區分「完成」與「部分完成」的
+            # 深淺綠——BT 降採樣會把 frac 平均成 0.x，幾乎不會出現 >= 0.999，
+            # 若設定一道深綠門檻，完成格永遠不會被畫成深綠，整個進度條會變成一片淡綠。
+            if active:
+                color = QColor(52, 152, 219)   # 下載中 藍色
+            else:
+                color = QColor(39, 174, 96)    # 已下載 綠色
+
+            # 解決 BT 碎片化在密集 2D 網格中變成「條碼破圖」：
+            # 密集網格用透明度表示進度（frac 越高顏色越實/越深），寬格用由左至右填充。
+            if cell_w < 12:
+                if active:
+                    # active 格子保留較高下限，讓「正在下載哪幾塊」可辨識
+                    alpha = int(255 * (0.3 + 0.7 * frac))
                 else:
-                    color = QColor(126, 191, 126)  # 已下載閒置 淡綠
-                # 完成則整格填滿，進行中由左往右部分填充
-                fill_w = cell_w if frac >= 0.999 else cell_w * frac
+                    alpha = int(255 * frac)
+                    if 0 < alpha < 12:
+                        alpha = 12  # 極低進度仍略可見，但不至於誤導
+                color.setAlpha(alpha)
+                painter.fillRect(QRectF(x, y, cell_w, cell_h), color)
+            else:
+                fill_w = cell_w * frac
+                if active and fill_w < 2.0:
+                    fill_w = 2.0
                 painter.fillRect(QRectF(x, y, fill_w, cell_h), color)
         painter.end()
 
@@ -366,7 +397,7 @@ class FlowLayout(QLayout):
 
 # 新增下載對話框：貼 URL → 自動帶出檔名（可自訂）→ 確認加入佇列
 class AddDownloadDialog(QDialog):
-    def __init__(self, parent=None, default_save_dir=""):
+    def __init__(self, parent=None, default_save_dir="", url=None, filename=None):
         super().__init__(parent)
         self.setWindowTitle("新增下載")
         self.setMinimumWidth(520)
@@ -404,6 +435,17 @@ class AddDownloadDialog(QDialog):
 
         cancel_btn.clicked.connect(self.reject)
         ok_btn.clicked.connect(self._on_confirm)
+
+        # 攔截下載模式：URL 已固定，鎖住編輯框；檔名可預填但仍可修改。
+        if url:
+            self.url_edit.setPlainText(url)
+            self.url_edit.setReadOnly(True)
+            if filename:
+                self.name_edit.setText(filename)
+            else:
+                # 擴充程式未提供檔名時，仍從 URL 自動帶出，與手動新增下載一致
+                self._on_url_changed()
+
         self.url_edit.textChanged.connect(self._on_url_changed)
 
     def _on_url_changed(self):
@@ -436,7 +478,6 @@ class AddDownloadDialog(QDialog):
 
     def save_dir(self):
         return self.dir_edit.text().strip()
-
 
 # 種子下載對話框：選擇線路、儲存位置，並以檔案樹勾選要下載的檔案（類 uTorrent）。
 class TorrentDialog(QDialog):
@@ -738,6 +779,14 @@ class TorrentDialog(QDialog):
 
 # 主窗口
 class MainWindow(QMainWindow):
+    # 攔截下載請求信號：由 HTTP 伺服器 worker 執行緒發射，跨執行緒排入 UI
+    # 執行緒，觸發「選擇儲存位置」對話框。參數為 request dict。
+    download_requested = Signal(dict)
+
+    # 自動更新結果信號：由背景執行緒發射，跨執行緒排入 UI 執行緒
+    update_check_done = Signal(object)       # ("error", msg) 或 ("ok", info|None)
+    update_stage_done = Signal(bool, str)    # (success, error_message)
+
     def __init__(self, download_manager=None):
         super().__init__()
 
@@ -785,9 +834,45 @@ class MainWindow(QMainWindow):
         self.bt_resume_interval_spinbox.setValue(int(self.download_manager.bt_resume_interval))
         self.bt_resume_interval_spinbox.blockSignals(False)
 
+        self.bt_max_connections_spinbox.blockSignals(True)
+        self.bt_max_connections_spinbox.setValue(int(self.download_manager.bt_max_connections))
+        self.bt_max_connections_spinbox.blockSignals(False)
+
+        self.bt_proxy_max_connections_spinbox.blockSignals(True)
+        self.bt_proxy_max_connections_spinbox.setValue(int(self.download_manager.bt_proxy_max_connections))
+        self.bt_proxy_max_connections_spinbox.blockSignals(False)
+
+        self.bt_force_tcp_checkbox.blockSignals(True)
+        self.bt_force_tcp_checkbox.setChecked(bool(self.download_manager.bt_force_tcp))
+        self.bt_force_tcp_checkbox.blockSignals(False)
+
+        self.bt_listen_port_spinbox.blockSignals(True)
+        self.bt_listen_port_spinbox.setValue(int(self.download_manager.bt_listen_port))
+        self.bt_listen_port_spinbox.blockSignals(False)
+
+        # 載入目前的 .torrent 檔案關聯狀態（blockSignals 避免啟動時觸發寫入）
+        self.assoc_checkbox.blockSignals(True)
+        self.assoc_checkbox.setChecked(file_association.is_registered())
+        self.assoc_checkbox.blockSignals(False)
+
+        # 載入「啟動時自動檢查更新」狀態
+        self.auto_check_update_checkbox.blockSignals(True)
+        self.auto_check_update_checkbox.setChecked(bool(self.download_manager.auto_check_update))
+        self.auto_check_update_checkbox.blockSignals(False)
+
         self.monitor_thread = MonitorThread(self.download_manager)
         self.monitor_thread.tasks_updated.connect(self.on_tasks_updated)
         self.monitor_thread.start()
+
+        # 攔截下載請求 → 彈出「選擇儲存位置」對話框（跨執行緒排入 UI 執行緒）
+        self.download_requested.connect(self._on_remote_download_request)
+
+        # 自動更新：背景執行緒結果排入 UI 執行緒
+        self.update_check_done.connect(self._on_update_check_done)
+        self.update_stage_done.connect(self._on_update_stage_done)
+
+        # 啟動時自動檢查更新（若使用者已啟用）
+        self.maybe_auto_check_update()
 
         # 剪貼簿自動偵測計時器（每秒檢查一次）
         self._last_clipboard_url = None
@@ -1095,6 +1180,43 @@ class MainWindow(QMainWindow):
         self.bt_resume_interval_spinbox.valueChanged.connect(self.on_bt_resume_interval_changed)
         dl_form.addRow("BT 續傳保存間隔:", self.bt_resume_interval_spinbox)
 
+        self.bt_max_connections_spinbox = QSpinBox()
+        self.bt_max_connections_spinbox.setRange(0, 1000)
+        self.bt_max_connections_spinbox.setValue(200)
+        self.bt_max_connections_spinbox.setSpecialValueText("不限")
+        self.bt_max_connections_spinbox.setToolTip(
+            "BT 直連線路的最大連線數。直連有公網 IP、可雙向連線，"
+            "可設較高（如 200-500）以拉高下載速度。0 = 用 libtorrent 預設。")
+        self.bt_max_connections_spinbox.valueChanged.connect(self.on_bt_max_connections_changed)
+        dl_form.addRow("BT 連線數上限（直連）:", self.bt_max_connections_spinbox)
+
+        self.bt_proxy_max_connections_spinbox = QSpinBox()
+        self.bt_proxy_max_connections_spinbox.setRange(0, 500)
+        self.bt_proxy_max_connections_spinbox.setValue(30)
+        self.bt_proxy_max_connections_spinbox.setSpecialValueText("不限")
+        self.bt_proxy_max_connections_spinbox.setToolTip(
+            "BT SOCKS5 代理線路的最大連線數。代理多在 CGNAT 後可達 peer 少，"
+            "連線設太高只會製造死連線 churn、拖慢整體下載（建議 20-40）。")
+        self.bt_proxy_max_connections_spinbox.valueChanged.connect(self.on_bt_proxy_max_connections_changed)
+        dl_form.addRow("BT 連線數上限（SOCKS5）:", self.bt_proxy_max_connections_spinbox)
+
+        self.bt_force_tcp_checkbox = QCheckBox("BT 僅用 TCP 連線（停用 uTP/UDP）")
+        self.bt_force_tcp_checkbox.setToolTip(
+            "適用於 UDP 被封的環境（如 5G 行動網路 + SOCKS5 轉接）。"
+            "停用 uTP 後所有 peer 資料傳輸走 TCP，避免無效的 UDP 連線嘗試佔用資源、拖慢下載。")
+        self.bt_force_tcp_checkbox.toggled.connect(self.on_bt_force_tcp_changed)
+        dl_form.addRow(self.bt_force_tcp_checkbox)
+
+        self.bt_listen_port_spinbox = QSpinBox()
+        self.bt_listen_port_spinbox.setRange(0, 65535)
+        self.bt_listen_port_spinbox.setValue(6881)
+        self.bt_listen_port_spinbox.setSpecialValueText("動態埠")
+        self.bt_listen_port_spinbox.setToolTip(
+            "BT 直連線路的監聽埠。固定埠＋UPnP/NAT-PMP 可讓外部 peer 主動連入、"
+            "提升可連 peer 數；0 = 動態埠。僅直連線路生效，代理線路不受影響。")
+        self.bt_listen_port_spinbox.valueChanged.connect(self.on_bt_listen_port_changed)
+        dl_form.addRow("BT 監聽埠（直連）:", self.bt_listen_port_spinbox)
+
         settings_layout.addWidget(dl_group)
 
         # 其他
@@ -1113,6 +1235,26 @@ class MainWindow(QMainWindow):
         self.tray_checkbox.setToolTip("開啟後，點最小化鈕會縮到系統匣繼續下載")
         self.tray_checkbox.setChecked(True)
         misc_layout.addWidget(self.tray_checkbox)
+
+        self.assoc_checkbox = QCheckBox("關聯 .torrent 檔案（設為預設開啟程式）")
+        self.assoc_checkbox.setToolTip(
+            "勾選後，雙擊 .torrent 檔會由本程式開啟。"
+            "若 Windows 已指定其他預設程式，可能需要經「開啟檔案」對話框確認。")
+        self.assoc_checkbox.toggled.connect(self.on_torrent_assoc_changed)
+        misc_layout.addWidget(self.assoc_checkbox)
+
+        self.auto_check_update_checkbox = QCheckBox("啟動時自動檢查更新")
+        self.auto_check_update_checkbox.setToolTip("開啟後，每次啟動會於背景檢查是否有新版本")
+        self.auto_check_update_checkbox.toggled.connect(self.on_auto_check_update_changed)
+        misc_layout.addWidget(self.auto_check_update_checkbox)
+
+        self.update_check_button = QPushButton("立即檢查更新")
+        self.update_check_button.clicked.connect(self.on_check_update_clicked)
+        misc_layout.addWidget(self.update_check_button)
+
+        self.update_status_label = QLabel("")
+        self.update_status_label.setWordWrap(True)
+        misc_layout.addWidget(self.update_status_label)
 
         settings_layout.addWidget(misc_group)
         settings_layout.addStretch()
@@ -1153,6 +1295,50 @@ class MainWindow(QMainWindow):
             filename=dialog.filename(),
             save_dir=dialog.save_dir(),
         )
+
+    def _on_remote_download_request(self, request):
+        """攔截下載請求：跳出「新增下載」對話框（URL 鎖住），讓使用者改檔名與儲存位置。
+
+        由 download_requested 信號觸發（已排入 UI 執行緒）。儲存路徑預設為全域
+        儲存目錄，使用者可改到任意位置、也可改存檔名稱；取消則不建立任何任務。
+        """
+        url = request.get('url', '')
+        if not url:
+            return
+        filename = request.get('filename')
+        headers = request.get('headers')
+        chunks_per_part = request.get('chunks_per_part', 0)
+        threads_per_proxy = request.get('threads_per_proxy', 6)
+        default_dir = request.get('save_dir') or self.download_manager.save_dir
+
+        # URL 已固定（鎖住不可編輯），檔名與儲存位置留給使用者設定。
+        dialog = AddDownloadDialog(self, default_dir, url=url, filename=filename)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        save_dir = dialog.save_dir()
+        filename = dialog.filename()
+
+        try:
+            task_id = self.download_manager.add_task(
+                url,
+                filename,
+                save_dir=save_dir,
+                use_proxy=True,
+                chunks_per_part=chunks_per_part,
+                threads_per_proxy=threads_per_proxy,
+                headers=headers,
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "錯誤", f"添加下載任務失敗:\n{e}")
+            return
+
+        self.add_task_to_table(task_id, self.download_manager.task_ids[task_id])
+        threading.Thread(
+            target=self._start_task_in_background,
+            args=(task_id, url),
+            daemon=True,
+        ).start()
+        self.statusBar().showMessage(f"已加入下載: {url[:60]}", 4000)
 
     def _add_urls(self, urls, filename=None, silent=False, save_dir=None):
         """新增一批 URL 下載任務。回傳是否至少新增了一個任務。"""
@@ -1311,6 +1497,12 @@ class MainWindow(QMainWindow):
             print(f"任務 {task_id} 執行失敗: {e}")
 
     def add_task_to_table(self, task_id, task):
+        # 去重：同一個 task_id 只應在表格中出現一次。相同磁力/URL 加入時，
+        # download_manager 會去重返還同一個 id，若不檢查便會產生重複列。
+        for row in range(self.task_table.rowCount()):
+            item = self.task_table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == task_id:
+                return
         row = self.task_table.rowCount()
         self.task_table.insertRow(row)
 
@@ -1374,12 +1566,20 @@ class MainWindow(QMainWindow):
                 if progress['total_size'] > 0:
                     size_text = f"{format_size(progress['downloaded_size'])}/{format_size(progress['total_size'])}"
                 else:
-                    size_text = format_size(progress['downloaded_size'])
+                    size_text = f"{format_size(progress['downloaded_size'])} / 未知"
                 self.task_table.setItem(row, 1, QTableWidgetItem(size_text))
 
-                # 更新進度條
+                # 更新進度條：總量未知（chunked 回應無 Content-Length）時改用忙碌
+                # 樣式，否則顯示 0~100 的實際百分比。
                 progress_bar = self.task_table.cellWidget(row, 2)
-                progress_bar.setValue(int(progress['percentage']))
+                if progress['total_size'] > 0:
+                    progress_bar.setRange(0, 100)
+                    progress_bar.setValue(int(progress['percentage']))
+                elif progress['status'] == 'downloading':
+                    progress_bar.setRange(0, 0)  # 忙碌指示（總量未知仍在下載）
+                else:
+                    progress_bar.setRange(0, 100)
+                    progress_bar.setValue(0)
 
                 # 更新狀態
                 status = progress['status']
@@ -1413,7 +1613,12 @@ class MainWindow(QMainWindow):
                 elif status == 'seeding':
                     rem = progress.get('seeding_remaining', 0)
                     time_text = f"做種中 ({format_time(rem)})" if rem > 0 else "做種中"
-                elif progress['speed'] > 0 and progress['total_size'] > 0:
+                elif progress.get('waiting_metadata'):
+                    time_text = "等待種子資訊…"
+                elif progress['total_size'] <= 0:
+                    # 總量未知（如 chunked 回應無 Content-Length），無法估算剩餘時間
+                    time_text = "未知"
+                elif progress['speed'] > 0:
                     remaining_bytes = progress['total_size'] - progress['downloaded_size']
                     remaining_time = remaining_bytes / progress['speed']
                     time_text = format_time(remaining_time)
@@ -1534,10 +1739,12 @@ class MainWindow(QMainWindow):
                     active_count += 1
         if total_upload is None:
             total_upload = 0.0
+        dht_nodes = self.download_manager.get_dht_node_count()
         self.stats_label.setText(
             f'<span style="color:#1a9c5c;font-weight:600;">↓ {format_size(total_speed)}/s</span>'
             f'&nbsp;&nbsp;<span style="color:#3b9bff;font-weight:600;">↑ {format_size(total_upload)}/s</span>'
             f'&nbsp;&nbsp;<span style="color:#8a97a3;">· {active_count} 任務</span>'
+            f'&nbsp;&nbsp;<span style="color:#8a97a3;">· DHT {dht_nodes} 節點</span>'
         )
         self.speed_chart.add_sample(total_speed)
 
@@ -1698,20 +1905,33 @@ class MainWindow(QMainWindow):
         return ids
 
     def delete_selected_task(self):
-        """刪除所有選取的任務，先列出檔名並確認。"""
+        """刪除所有選取的任務；做種中（已完成下載）的任務直接移除，其餘先確認。"""
         ids = self._selected_task_ids()
         if not ids:
             return
-        filenames = []
-        valid_ids = []
+        seeding_ids = []
+        pending_ids = []
+        pending_names = []
         for tid in ids:
             task = self.download_manager.task_ids.get(tid)
+            if not task:
+                continue
+            if task.status == 'seeding':
+                # 做種中的任務已完成下載，取消只會停做種、保留檔案，沒有可反悔的
+                # 破壞性動作，直接移除、不彈確認視窗。
+                seeding_ids.append(tid)
+            else:
+                pending_ids.append(tid)
+                pending_names.append(task.filename)
+        for tid in seeding_ids:
+            task = self.download_manager.task_ids.get(tid)
             if task:
-                filenames.append(task.filename)
-                valid_ids.append(tid)
-        if not valid_ids:
-            return
-        self._confirm_delete_tasks(valid_ids, filenames)
+                # 成品已完整下載，先記一筆歷史再移除；cancel 後 task 會從管理器移除，
+                # 無法再取用，故需在移除前完成記錄。
+                self._record_history(task)
+            self._remove_task(tid)
+        if pending_ids:
+            self._confirm_delete_tasks(pending_ids, pending_names)
 
     def _confirm_delete_tasks(self, task_ids, filenames):
         """列出檔名並詢問是否確認刪除，確認後逐一刪除。"""
@@ -1739,11 +1959,14 @@ class MainWindow(QMainWindow):
         """取消任務並從表格移除該列；回傳是否成功。"""
         if not self.download_manager.cancel_task(task_id):
             return False
-        for row in range(self.task_table.rowCount()):
-            item = self.task_table.item(row, 0)
-            if item and item.data(Qt.ItemDataRole.UserRole) == task_id:
-                self.task_table.removeRow(row)
-                break
+        # 移除所有指向該 task_id 的列（含舊版遺留的重複列），避免孤兒列殘留
+        rows = [
+            row for row in range(self.task_table.rowCount())
+            if self.task_table.item(row, 0) is not None
+            and self.task_table.item(row, 0).data(Qt.ItemDataRole.UserRole) == task_id
+        ]
+        for row in reversed(rows):
+            self.task_table.removeRow(row)
         return True
 
     def cancel_task(self, task_id):
@@ -2045,6 +2268,33 @@ class MainWindow(QMainWindow):
         self.download_manager.save_config()
         self.statusBar().showMessage(f"已設定 BT 續傳保存間隔: {seconds} 秒", 2000)
 
+    def on_bt_max_connections_changed(self, value):
+        """BT 直連線最大連線數變更時套用（0 = 不限）。"""
+        self.download_manager.set_bt_max_connections(value)
+        self.download_manager.save_config()
+        if value > 0:
+            self.statusBar().showMessage(f"已設定 BT 直連連線數上限: {value}", 2000)
+        else:
+            self.statusBar().showMessage("BT 直連連線數上限已改為不限（libtorrent 預設）", 2000)
+
+    def on_bt_proxy_max_connections_changed(self, value):
+        """BT SOCKS5 代理線最大連線數變更時套用（0 = 不限）。"""
+        self.download_manager.set_bt_proxy_max_connections(value)
+        self.download_manager.save_config()
+        if value > 0:
+            self.statusBar().showMessage(f"已設定 BT SOCKS5 線連線數上限: {value}", 2000)
+        else:
+            self.statusBar().showMessage("BT SOCKS5 線連線數上限已改為不限（libtorrent 預設）", 2000)
+
+    def on_bt_force_tcp_changed(self, checked):
+        """BT 僅用 TCP（停用 uTP）變更時套用。"""
+        self.download_manager.set_bt_force_tcp(checked)
+        self.download_manager.save_config()
+        if checked:
+            self.statusBar().showMessage("已啟用 BT 僅用 TCP（停用 uTP/UDP）", 2000)
+        else:
+            self.statusBar().showMessage("已恢復 BT 同時使用 TCP 與 uTP", 2000)
+
     def on_bt_upload_limit_changed(self, value_kbs):
         """BT 上傳限速變更時套用（0 = 不限速）。"""
         bytes_per_sec = value_kbs * 1024
@@ -2054,6 +2304,117 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"已設定 BT 上傳限速: {format_size(bytes_per_sec)}/s", 2000)
         else:
             self.statusBar().showMessage("已取消 BT 上傳限速", 2000)
+
+    def on_bt_listen_port_changed(self, port):
+        """BT 直連監聽埠變更時套用（0 = 動態埠）。"""
+        self.download_manager.set_bt_listen_port(port)
+        self.download_manager.save_config()
+        if port > 0:
+            self.statusBar().showMessage(f"已設定 BT 監聽埠: {port}", 2000)
+        else:
+            self.statusBar().showMessage("BT 監聽埠已改為動態（自動）", 2000)
+
+    def on_torrent_assoc_changed(self, checked):
+        """勾選/取消 .torrent 檔案關聯，並處理 Win10/11 的預設程式確認。"""
+        if checked:
+            if not file_association.register():
+                QMessageBox.warning(
+                    self, "錯誤", "無法設定 .torrent 檔案關聯，請稍後再試。")
+                self.assoc_checkbox.blockSignals(True)
+                self.assoc_checkbox.setChecked(False)
+                self.assoc_checkbox.blockSignals(False)
+                return
+
+            if file_association.is_registered():
+                self.statusBar().showMessage("已設定 .torrent 檔案關聯", 3000)
+                return
+
+            # Win10/11：UserChoice 尚未指向本程式，需使用者經系統對話框確認一次
+            QMessageBox.information(
+                self, "設定預設程式",
+                "Windows 需要你確認一次預設程式。\n"
+                "請在接下來的「你要如何開啟此檔案」畫面中，\n"
+                "點選「多線程下載器」並勾選「永遠使用此應用程式」。")
+            if not file_association.trigger_system_dialog():
+                QMessageBox.warning(
+                    self, "提示",
+                    "無法自動開啟系統設定畫面。\n"
+                    "請手動對任意 .torrent 檔按右鍵 → 開啟方式 → 選擇其他應用程式。")
+        else:
+            file_association.unregister()
+            self.statusBar().showMessage("已移除 .torrent 檔案關聯", 3000)
+
+    def maybe_auto_check_update(self):
+        """啟動時若使用者啟用「自動檢查更新」，於背景檢查一次。"""
+        if not self.download_manager.auto_check_update:
+            return
+        if not updater.is_frozen():
+            return  # 原始碼執行時沒有 .dist 可替換，略過
+        threading.Thread(target=self._do_check_update, daemon=True).start()
+
+    def on_auto_check_update_changed(self, checked):
+        """切換「啟動時自動檢查更新」並儲存。"""
+        self.download_manager.auto_check_update = checked
+        self.download_manager.save_config()
+
+    def on_check_update_clicked(self):
+        """使用者手動觸發「立即檢查更新」。"""
+        if not updater.is_frozen():
+            self.update_status_label.setText("開發模式下不支援自動更新")
+            return
+        self.update_check_button.setEnabled(False)
+        self.update_status_label.setText("檢查中...")
+        threading.Thread(target=self._do_check_update, daemon=True).start()
+
+    def _do_check_update(self):
+        try:
+            info = updater.check_update(version.APP_VERSION)
+        except Exception as e:
+            self.update_check_done.emit(("error", str(e)))
+            return
+        self.update_check_done.emit(("ok", info))
+
+    def _on_update_check_done(self, result):
+        self.update_check_button.setEnabled(True)
+        kind, payload = result
+        if kind == "error":
+            self.update_status_label.setText("檢查失敗：" + payload)
+            return
+        if payload is None:
+            self.update_status_label.setText("已是最新版本 " + version.APP_VERSION)
+            return
+        self.update_status_label.setText("發現新版本 " + payload["version"])
+        reply = QMessageBox.question(
+            self, "發現新版本",
+            "發現新版本 {}，是否下載更新？\n\n"
+            "下載會在背景進行，完成後再詢問是否重啟。".format(payload["version"]))
+        if reply == QMessageBox.Yes:
+            self._start_stage_update(payload)
+
+    def _start_stage_update(self, info):
+        self.update_status_label.setText("下載更新中...")
+        threading.Thread(target=self._stage_worker, args=(info,), daemon=True).start()
+
+    def _stage_worker(self, info):
+        try:
+            paths = updater.pending_paths()
+            updater.stage_update(info, paths["new"])
+        except Exception as e:
+            self.update_stage_done.emit(False, str(e))
+            return
+        self.update_stage_done.emit(True, "")
+
+    def _on_update_stage_done(self, success, err):
+        if not success:
+            self.update_status_label.setText("更新失敗：" + err)
+            QMessageBox.warning(self, "更新失敗", err)
+            return
+        reply = QMessageBox.question(
+            self, "更新已就緒",
+            "更新已下載完成。關閉並重新啟動以完成更新？")
+        if reply == QMessageBox.Yes:
+            updater.spawn_apply_script()
+            QApplication.quit()
 
     def open_header_dialog(self):
         """開啟自訂 HTTP 表頭對話框（每行一組 Key: Value）。"""

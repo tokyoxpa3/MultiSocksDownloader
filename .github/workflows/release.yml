@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Inject tag version into version.py
+        shell: pwsh
+        run: |
+          $v = $env:GITHUB_REF_NAME -replace '^v',''
+          $raw = (Get-Content version.py -Raw) -replace 'APP_VERSION\s*=\s*"[^"]*"',
+                ('APP_VERSION = "' + $v + '"')
+          Set-Content version.py -Value $raw -NoNewline -Encoding utf8
+
+      - name: Build standalone exe (Nuitka)
+        shell: cmd
+        run: |
+          nuitka --standalone --windows-console-mode=disable --windows-icon-from-ico=app_icon.ico --enable-plugin=pyside6 --include-package=libtorrent MultiSocksDownloader.py
+
+      - name: Package zip (dist contents, no outer folder)
+        shell: pwsh
+        run: |
+          $v = $env:GITHUB_REF_NAME -replace '^v',''
+          $zip = "MultiSocksDownloader-v$v-windows-x64.zip"
+          Compress-Archive -Path MultiSocksDownloader.dist\* -DestinationPath $zip
+          echo "zip=$zip" >> $env:GITHUB_ENV
+
+      - name: Generate SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $zip = $env:zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Set-Content SHA256SUMS.txt -Encoding ascii
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME $env:zip SHA256SUMS.txt --generate-notes

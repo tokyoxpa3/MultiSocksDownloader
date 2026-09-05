@@ -13,7 +13,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from ftp_downloader import SocksFTP, parse_ftp_url
-from bt_downloader import BTTask, source_kind, bt_info_hash
+from bt_downloader import BTTask, DHTService, DHTGovernor, source_kind, bt_info_hash
 
 logger = logging.getLogger('downloader')
 
@@ -21,6 +21,11 @@ logger = logging.getLogger('downloader')
 TARGET_BLOCK_SIZE = 4 * 1024 * 1024   # 目標每片 4 MiB
 MIN_BLOCKS = 1
 MAX_BLOCKS = 4096
+
+# 前沿串流：每個 HTTP Range 請求一次涵蓋的連續位元組目標量。
+# 區塊仍是進度/續傳的最小單位，但一次請求會抓一大段（約 64 MiB），
+# 把網站每次簽章/跳轉的固定延遲攤平，避免每塊 4 MiB 都重新請求（HuggingFace 尤甚）。
+TARGET_RUN_BYTES = 64 * 1024 * 1024
 
 
 def format_size(size_bytes):
@@ -144,6 +149,9 @@ class DownloadTask:
         self._pool_lock = threading.Lock()
         self._block_retries = {}
         self._active_blocks = set()
+        # 前沿串流認領位圖：位元 = 1 表示該區塊已被某 worker 佔用（下載中）。
+        # 與 bitmap（已完成）分開，讓 _pop_run 能一次認領一段連續區塊。
+        self._claimed = bytearray()
 
         self._workers = []
         self._completion_thread = None
@@ -477,14 +485,23 @@ class DownloadTask:
         lock = threading.Lock()
 
         def _attempt(proxy):
+            if done.is_set():
+                return  # 已有線路探測成功，不再發起無謂請求
             try:
                 s = self._make_session(proxy)
+                if done.is_set():
+                    s.close()
+                    return
                 r = s.get(self.url, headers=headers, stream=True,
                           timeout=(5, 8), allow_redirects=True)
+                ok = r.status_code in (200, 206)
                 info = _build_info(r)
                 r.close()
                 s.close()
-                if info['total_size'] > 0:
+                # 只要拿到 200/206 就算探測成功，不能要求 total_size > 0：
+                # 有些伺服器（如 GitHub 的 codeload）回應 chunked、不帶
+                # Content-Length，此時 total_size=0 但仍可正常下載（單線串流到 EOF）。
+                if ok:
                     with lock:
                         if 'info' not in result:
                             result['info'] = info
@@ -521,6 +538,8 @@ class DownloadTask:
         deadline = time.time() + 15
 
         def _attempt(line):
+            if done.is_set():
+                return  # 已有線路探測成功，不再發起無謂請求
             ftp = None
             try:
                 ftp = SocksFTP(line)
@@ -644,22 +663,67 @@ class DownloadTask:
         with self._pool_lock:
             self._pool.append(idx)
 
+    def _is_block_claimed(self, idx):
+        if not self._claimed:
+            return False
+        return bool(self._claimed[idx >> 3] & (1 << (idx & 7)))
+
+    def _set_block_claimed(self, idx):
+        if len(self._claimed) == 0:
+            self._claimed = bytearray((self.block_count + 7) // 8)
+        self._claimed[idx >> 3] |= (1 << (idx & 7))
+
+    def _clear_block_claimed(self, idx):
+        if not self._claimed:
+            return
+        self._claimed[idx >> 3] &= ~(1 << (idx & 7))
+
+    def _reset_claims(self):
+        """新世代開始前清空所有認領位（進行中區塊一律視為未佔用）。"""
+        with self._lock:
+            self._claimed = bytearray((self.block_count + 7) // 8)
+
+    def _pop_run(self):
+        """認領一段連續、尚未完成且未被佔用的區塊，回傳 (start, end) 或 None。
+
+        與逐塊 _pop_block 的差異：一次抓一大段連續區塊（約 TARGET_RUN_BYTES），
+        讓 worker 用單一 Range 請求串流整段，避免每塊都付一次簽章/跳轉延遲。
+        """
+        max_blocks = max(1, TARGET_RUN_BYTES // self.block_size) if self.block_size else 1
+        with self._lock:
+            n = self.block_count
+            start = 0
+            while start < n and (self._is_block_done(start) or self._is_block_claimed(start)):
+                start += 1
+            if start >= n:
+                return None
+            end = start
+            while end + 1 < n and (end - start + 1) < max_blocks:
+                nxt = end + 1
+                if self._is_block_done(nxt) or self._is_block_claimed(nxt):
+                    break
+                end = nxt
+            for b in range(start, end + 1):
+                self._set_block_claimed(b)
+            return (start, end)
+
     def _worker(self, proxy, stop):
         session = self._make_session(proxy)
         try:
             while not stop.is_set():
-                idx = self._pop_block()
-                if idx is None:
+                run = self._pop_run()
+                if run is None:
                     break
-                if self._is_block_done(idx):
-                    continue
+                start_idx, end_idx = run
                 with self._lock:
-                    self._active_blocks.add(idx)
+                    for b in range(start_idx, end_idx + 1):
+                        self._active_blocks.add(b)
                 try:
-                    result = self._download_block(idx, session, stop, proxy)
+                    result = self._download_run(start_idx, end_idx, session, stop, proxy)
                 finally:
                     with self._lock:
-                        self._active_blocks.discard(idx)
+                        for b in range(start_idx, end_idx + 1):
+                            self._active_blocks.discard(b)
                 if result == 'ok':
                     if self._all_blocks_done():
                         break
@@ -672,20 +736,23 @@ class DownloadTask:
             except Exception:
                 pass
 
-    def _download_block(self, idx, session, stop, proxy=None):
-        start, end = self._block_bounds(idx)
-        end -= 1  # inclusive
+    def _download_run(self, start_idx, end_idx, session, stop, proxy=None):
+        start, _ = self._block_bounds(start_idx)
+        _, end_excl = self._block_bounds(end_idx)
+        end = end_excl - 1  # inclusive
         if start >= self.total_size:
             return 'ok'
 
-        # 續傳：從區塊內已寫入的偏移繼續，重啟/重試不再整塊重抓
+        # 續傳：run 的第一個區塊從區塊內已寫入的偏移繼續，其餘區塊均為全新。
         with self._lock:
-            off = self._partial.get(idx, 0)
+            off = self._partial.get(start_idx, 0)
         req_start = start + off
         if req_start > end:
             with self._lock:
-                self._set_block_done(idx)
-                self._partial.pop(idx, None)
+                for b in range(start_idx, end_idx + 1):
+                    if not self._is_block_done(b):
+                        self._set_block_done(b)
+                        self._partial.pop(b, None)
             return 'ok'
 
         headers = self._request_headers()
@@ -695,29 +762,31 @@ class DownloadTask:
             r = session.get(self.url, headers=headers, stream=True,
                             timeout=(15, 60), allow_redirects=True)
         except Exception as e:
-            return self._handle_block_failure(idx, f"連接失敗: {e}", stop)
+            return self._handle_run_failure(
+                start_idx, end_idx, start_idx, f"連接失敗: {e}", stop)
 
         if r.status_code == 206:
-            return self._write_block(idx, req_start, end, r, stop, proxy)
+            return self._write_run(start_idx, end_idx, req_start, end, r, stop, proxy)
         elif r.status_code == 200:
             r.close()
-            return 'fallback'
+            return self._handle_run_fallback(start_idx, end_idx)
         elif r.status_code == 416:
             r.close()
-            return self._handle_block_failure(idx, "HTTP 416：範圍請求被拒絕", stop)
+            return self._handle_run_failure(
+                start_idx, end_idx, start_idx, "HTTP 416：範圍請求被拒絕", stop)
         else:
             r.close()
-            return self._handle_block_failure(idx, f"HTTP {r.status_code}", stop)
+            return self._handle_run_failure(
+                start_idx, end_idx, start_idx, f"HTTP {r.status_code}", stop)
 
-    def _write_block(self, idx, start, end, r, stop, proxy=None):
-        need = end - start + 1
-        with self._lock:
-            self._partial[idx] = 0
+    def _write_run(self, start_idx, end_idx, req_start, end, r, stop, proxy=None):
+        need = end - req_start + 1
         key = self._line_key(proxy)
+        pos = req_start
+        cur_idx = start_idx
         try:
             with open(self.temp_filepath, 'r+b') as f:
-                f.seek(start)
-                pos = start
+                f.seek(req_start)
                 for chunk in r.iter_content(self.chunk_size):
                     if stop.is_set():
                         break
@@ -732,32 +801,65 @@ class DownloadTask:
                     f.write(data)
                     pos += len(data)
                     with self._lock:
-                        self._partial[idx] = pos - start
                         self._line_bytes[key] = self._line_bytes.get(key, 0) + len(data)
+                        # 邊跨過區塊邊界就標記該區塊完成，直到停在目前這個未完區塊
+                        while cur_idx <= end_idx:
+                            bstart, bend = self._block_bounds(cur_idx)
+                            if pos >= bend:
+                                if not self._is_block_done(cur_idx):
+                                    self._set_block_done(cur_idx)
+                                    self._partial.pop(cur_idx, None)
+                                cur_idx += 1
+                            else:
+                                self._partial[cur_idx] = pos - bstart
+                                break
                 r.close()
                 f.flush()
-                os.fsync(f.fileno())
+            # 不再逐片 fsync：落盤統一由 save_progress()（每 5 秒）與
+            # complete_download() 負責，避免大頻寬下磁碟 I/O 成為瓶頸。
             if stop.is_set():
-                with self._lock:
-                    self._partial.pop(idx, None)
+                # 保留 _partial 讓續傳能從區塊內斷點繼續，不重抓整段。
                 return 'fail'
-            if pos - start >= need:
-                with self._lock:
-                    self._set_block_done(idx)
-                    self._partial.pop(idx, None)
+            if pos - req_start >= need:
                 return 'ok'
-            with self._lock:
-                self._partial.pop(idx, None)
-            return self._handle_block_failure(
-                idx, f"區塊下載不完整: {pos - start}/{need}", stop)
+            return self._handle_run_failure(
+                start_idx, end_idx, cur_idx,
+                f"區段下載不完整: {pos - req_start}/{need}", stop)
         except Exception as e:
             try:
                 r.close()
             except Exception:
                 pass
-            with self._lock:
-                self._partial.pop(idx, None)
-            return self._handle_block_failure(idx, f"寫入失敗: {e}", stop)
+            return self._handle_run_failure(
+                start_idx, end_idx, cur_idx, f"寫入失敗: {e}", stop)
+
+    def _handle_run_fallback(self, start_idx, end_idx):
+        """伺服器忽略 Range（回 200）：釋放本段認領，交由呼叫端切換單線模式。"""
+        with self._lock:
+            for b in range(start_idx, end_idx + 1):
+                if not self._is_block_done(b):
+                    self._clear_block_claimed(b)
+        return 'fallback'
+
+    def _handle_run_failure(self, start_idx, end_idx, failed_idx, reason, stop):
+        """段下載失敗：釋放尚未完成區塊的認領，並對失敗所在區塊計一次重試。"""
+        with self._lock:
+            for b in range(start_idx, end_idx + 1):
+                if not self._is_block_done(b):
+                    self._clear_block_claimed(b)
+        if stop.is_set():
+            return 'fail'
+        retries = self._block_retries.get(failed_idx, 0) + 1
+        self._block_retries[failed_idx] = retries
+        logger.warning("區段 %s-%s 失敗於區塊 %s: %s (重試 %s/%s)",
+                       start_idx, end_idx, failed_idx, reason, retries, self.MAX_RETRIES)
+        if retries >= self.MAX_RETRIES:
+            self.error_message = f"區塊 {failed_idx} 下載失敗: {reason}"
+            self._fatal = True
+            self.status = 'error'
+            stop.set()
+            return 'fail'
+        return 'fail'
 
     def _handle_block_failure(self, idx, reason, stop):
         if stop.is_set():
@@ -893,6 +995,8 @@ class DownloadTask:
             fp = conn.makefile('rb')
             pos = req_start
             key = self._line_key(line)
+            # 累計本區塊已寫入但尚未回報全域狀態的位元組，降低多執行緒下的鎖搶佔。
+            acc_bytes = 0
             try:
                 with open(self.temp_filepath, 'r+b') as f:
                     f.seek(req_start)
@@ -906,9 +1010,16 @@ class DownloadTask:
                         f.write(chunk)
                         pos += len(chunk)
                         remaining -= len(chunk)
-                        with self._lock:
-                            self._partial[idx] = pos - start  # 累計偏移
-                            self._line_bytes[key] = self._line_bytes.get(key, 0) + len(chunk)
+                        acc_bytes += len(chunk)
+                        if acc_bytes >= 1024 * 1024:
+                            with self._lock:
+                                self._partial[idx] = pos - start  # 累計偏移
+                                self._line_bytes[key] = self._line_bytes.get(key, 0) + acc_bytes
+                            acc_bytes = 0
+                if acc_bytes > 0:
+                    with self._lock:
+                        self._partial[idx] = pos - start
+                        self._line_bytes[key] = self._line_bytes.get(key, 0) + acc_bytes
             finally:
                 fp.close()
                 conn.close()
@@ -1035,7 +1146,7 @@ class DownloadTask:
             t.start()
             return True
 
-        self._rebuild_pool()
+        self._reset_claims()
         self._workers = []
         self.threads = []
         lines = self._build_lines()
@@ -1151,6 +1262,9 @@ class DownloadTask:
             self.end_time = time.time()
             self.status = 'completed'
             try:
+                # 落盤最後一批資料：移除逐片 fsync 後，完成時必須確保 temp 檔內容
+                # 已寫入磁碟，否則 os.replace 只改檔名、資料可能仍留在 OS 快取。
+                self._flush_temp_file()
                 if os.path.exists(self.temp_filepath):
                     if os.path.exists(self.filepath):
                         os.remove(self.filepath)
@@ -1240,10 +1354,15 @@ class DownloadManager:
         self.bt_seed_hours = 0.0      # 下載完成後繼續做種時數，0 表示不做種
         self.bt_upload_rate = 0       # BT 上傳限速（bytes/sec），0 表示不限速
         self.bt_resume_interval = 10  # BT resume 自動保存間隔（秒），最小 1 秒
+        self.bt_max_connections = 200  # BT 直連線最大連線數，0 表示用 libtorrent 預設
+        self.bt_proxy_max_connections = 30  # BT SOCKS5 代理線最大連線數（CGNAT 下可達 peer 少，壓低避免死連線 churn）
+        self.bt_force_tcp = False     # 僅用 TCP（停用 uTP/UDP），UDP 被封的環境適用
+        self.bt_listen_port = 6881    # BT 直連監聽埠，0 = 動態埠（配合 UPnP/NAT-PMP）
 
         self.speed_limit = 0  # bytes/sec，0 表示不限速
         self.rate_limiter = RateLimiter()
         self.custom_headers = {}
+        self.auto_check_update = False  # 啟動時是否自動檢查更新
 
         self.history = []          # 歷史下載紀錄：list of dict
         self.next_history_id = 1
@@ -1252,7 +1371,57 @@ class DownloadManager:
         self.config_file = os.path.join(self.config_dir, "config.json")
         os.makedirs(self.config_dir, exist_ok=True)
 
+        # 常駐 DHT 服務：改為「按需」——由 DHTGovernor 依下載需求動態開/關/限速，
+        # 避免無 BT 任務時 24/7 消耗上行小封包拖慢其他下載。
+        self.bt_dht_autotune = True
+        self.dht_service = DHTService()
+
         self.load_config()
+
+        if self.bt_dht_autotune:
+            self.dht_governor = DHTGovernor(self._dht_demand, self._apply_dht_policy)
+            self.dht_governor.start()
+        else:
+            # 關閉自適應時退回舊行為：應用啟動即常駐 DHT 全速累積節點。
+            self.dht_governor = None
+            self.dht_service.start()
+
+    def get_dht_node_count(self):
+        """回傳常駐 DHT 的節點數（供 UI 顯示，無任務時也持續更新）。"""
+        return self.dht_service.node_count()
+
+    def _dht_demand(self):
+        """彙整當前 DHT 需求快照（供 DHTGovernor 決策）。"""
+        with self._lock:
+            bt_tasks = [t for t in self.tasks.values() if isinstance(t, BTTask)]
+        bt_active = False
+        magnet_waiting = False
+        total_rate = 0.0
+        for t in bt_tasks:
+            if not t.is_running():
+                continue
+            bt_active = True
+            prog = t.get_progress()
+            if prog.get('waiting_metadata'):
+                magnet_waiting = True
+            total_rate += prog.get('speed', 0.0)
+        return {
+            'bt_active': bt_active,
+            'magnet_waiting': magnet_waiting,
+            'total_download_rate': total_rate,
+            'saturated': total_rate >= 1024 * 1024,
+            'node_count': self.dht_service.node_count(),
+        }
+
+    def _apply_dht_policy(self, mode):
+        """把 governor 算出的 policy 套到常駐 DHT session。"""
+        self.dht_service.apply_policy(mode)
+
+    def shutdown_dht(self):
+        """停止 DHT governor 並釋放常駐 DHT session（應用退出時呼叫）。"""
+        if self.dht_governor is not None:
+            self.dht_governor.stop()
+        self.dht_service.shutdown()
 
     # ------------------------------------------------------------------ #
     # config
@@ -1282,8 +1451,20 @@ class DownloadManager:
                 self.bt_upload_rate = max(0, int(config['bt_upload_rate']))
             if 'bt_resume_interval' in config:
                 self.bt_resume_interval = max(1.0, float(config['bt_resume_interval']))
+            if 'bt_max_connections' in config:
+                self.bt_max_connections = max(0, int(config['bt_max_connections']))
+            if 'bt_proxy_max_connections' in config:
+                self.bt_proxy_max_connections = max(0, int(config['bt_proxy_max_connections']))
+            if 'bt_force_tcp' in config:
+                self.bt_force_tcp = bool(config['bt_force_tcp'])
+            if 'bt_listen_port' in config:
+                self.bt_listen_port = max(0, int(config['bt_listen_port']))
+            if 'bt_dht_autotune' in config:
+                self.bt_dht_autotune = bool(config['bt_dht_autotune'])
             if 'custom_headers' in config and isinstance(config['custom_headers'], dict):
                 self.custom_headers = config['custom_headers']
+            if 'auto_check_update' in config:
+                self.auto_check_update = bool(config['auto_check_update'])
             if 'history' in config and isinstance(config['history'], list):
                 self.history = config['history']
             if 'next_history_id' in config:
@@ -1301,7 +1482,13 @@ class DownloadManager:
                 'bt_seed_hours': self.bt_seed_hours,
                 'bt_upload_rate': self.bt_upload_rate,
                 'bt_resume_interval': self.bt_resume_interval,
+                'bt_max_connections': self.bt_max_connections,
+                'bt_proxy_max_connections': self.bt_proxy_max_connections,
+                'bt_force_tcp': self.bt_force_tcp,
+                'bt_listen_port': self.bt_listen_port,
+                'bt_dht_autotune': self.bt_dht_autotune,
                 'custom_headers': self.custom_headers,
+                'auto_check_update': self.auto_check_update,
                 'history': self.history,
                 'next_history_id': self.next_history_id,
             }
@@ -1567,7 +1754,11 @@ class DownloadManager:
                       selected_files=selected_files,
                       seed_hours=actual_seed_hours,
                       upload_rate_limit=actual_upload_rate,
-                      resume_interval=self.bt_resume_interval)
+                      resume_interval=self.bt_resume_interval,
+                      max_connections=self.bt_max_connections,
+                      proxy_max_connections=self.bt_proxy_max_connections,
+                      force_tcp=self.bt_force_tcp,
+                      listen_port=self.bt_listen_port)
         with self._lock:
             task_id = self.next_id
             self.next_id += 1
@@ -1580,6 +1771,10 @@ class DownloadManager:
         task = self.task_ids.get(task_id)
         if not task:
             return False
+        # 已在執行中的任務不再重啟：重複拖入同種子/URL 時 add_task 會去重返還同一個
+        # task_id，若此處再呼叫 start() 會把進行中的校驗/下載中斷並從頭重來。
+        if getattr(task, 'status', None) in ('downloading', 'seeding'):
+            return True
         return task.start()
 
     def pause_task(self, task_id):
@@ -1650,6 +1845,22 @@ class DownloadManager:
     def set_bt_resume_interval(self, seconds):
         """設定 BT resume 自動保存間隔（秒），最小 1 秒。"""
         self.bt_resume_interval = max(1.0, float(seconds or 10))
+
+    def set_bt_max_connections(self, value):
+        """設定 BT 直連線最大連線數，0 表示用 libtorrent 預設（不限）。"""
+        self.bt_max_connections = max(0, int(value or 0))
+
+    def set_bt_proxy_max_connections(self, value):
+        """設定 BT SOCKS5 代理線最大連線數，0 表示用 libtorrent 預設（不限）。"""
+        self.bt_proxy_max_connections = max(0, int(value or 0))
+
+    def set_bt_force_tcp(self, enabled):
+        """設定是否僅用 TCP（停用 uTP/UDP），UDP 被封的環境建議啟用。"""
+        self.bt_force_tcp = bool(enabled)
+
+    def set_bt_listen_port(self, port):
+        """設定 BT 直連監聽埠，0 表示動態埠。"""
+        self.bt_listen_port = max(0, int(port or 0))
 
     def set_custom_headers(self, headers):
         """設定全域預設自訂表頭（dict）。"""
@@ -1748,7 +1959,14 @@ class DownloadManager:
                         seed_hours=state.get('seed_hours', self.bt_seed_hours),
                         upload_rate_limit=state.get('upload_rate_limit', self.bt_upload_rate),
                         resume_interval=self.bt_resume_interval,
+                        max_connections=self.bt_max_connections,
+                        proxy_max_connections=self.bt_proxy_max_connections,
+                        force_tcp=self.bt_force_tcp,
+                        listen_port=self.bt_listen_port,
                     )
+                    # 記錄實際掃描到的 .bt_tmp 目錄，刪除時才能精準清掉；目錄名可能是
+                    # 舊版留下的哨兵值（如 'nohash'），無法靠 source 的 info hash 推導。
+                    task._work_root = os.path.dirname(task_json)
                     task.status = 'paused'
                     with self._lock:
                         task_id = self.next_id

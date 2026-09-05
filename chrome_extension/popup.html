@@ -136,6 +136,28 @@
     button:hover {
       background-color: #0b7dda;
     }
+    .blacklist-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 5px 8px;
+      margin-bottom: 4px;
+      border-radius: 4px;
+      background-color: #fff;
+      border: 1px solid #e8e8e8;
+    }
+    .blacklist-host {
+      word-break: break-all;
+      font-size: 13px;
+    }
+    .blacklist-remove {
+      background-color: #dc3545;
+      padding: 3px 8px;
+      font-size: 12px;
+    }
+    .blacklist-remove:hover {
+      background-color: #b02a37;
+    }
   </style>
 </head>
 <body>
@@ -172,6 +194,11 @@
 
     <div class="tasks-list" id="tasksList">
       沒有進行中的任務
+    </div>
+
+    <div class="form-group">
+      <label>下載黑名單（改用瀏覽器原生下載的網站）：</label>
+      <div class="blacklist" id="blacklistList">載入中...</div>
     </div>
 
     <div class="buttons">

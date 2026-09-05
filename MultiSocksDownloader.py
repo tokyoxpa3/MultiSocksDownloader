@@ -43,24 +43,32 @@ def _ensure_single_instance():
     return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
 
 
-def _torrent_paths(args):
-    """從命令列參數中取出實際存在的 .torrent 檔案路徑。"""
-    return [
-        p for p in args
-        if isinstance(p, str) and p.lower().endswith('.torrent') and os.path.isfile(p)
-    ]
+def _parse_input_sources(args):
+    """從命令列參數取出可下載來源：.torrent 檔案路徑、magnet 連結或 HTTP/HTTPS/FTP 網址。"""
+    sources = []
+    for p in args:
+        if not isinstance(p, str):
+            continue
+        s = p.strip()
+        if not s:
+            continue
+        if s.lower().startswith(('magnet:', 'http://', 'https://', 'ftp://')):
+            sources.append(s)
+        elif s.lower().endswith('.torrent') and os.path.isfile(s):
+            sources.append(s)
+    return sources
 
 
 def _forward_to_primary(args):
-    """次要實例：把命令列中的 .torrent 檔路徑透過本地 socket 轉送給主要實例。"""
-    paths = _torrent_paths(args)
-    if not paths:
+    """次要實例：把命令列中的下載來源（.torrent / magnet / URL）透過本地 socket 轉送給主要實例。"""
+    sources = _parse_input_sources(args)
+    if not sources:
         return
     socket = QLocalSocket()
     socket.connectToServer(_IPC_SERVER_NAME)
     if not socket.waitForConnected(2000):
         return  # 主要實例尚未就緒，放棄本次轉送
-    payload = "\n".join(paths).encode("utf-8")
+    payload = "\n".join(sources).encode("utf-8")
     socket.write(payload)
     socket.flush()
     socket.waitForBytesWritten(2000)
@@ -132,26 +140,30 @@ if __name__ == "__main__":
 
         # 註冊回調函數，讓 HTTP 伺服器可以通知 UI 有新任務添加
         http_server.add_task_added_callback(window.on_task_added)
+        # 攔截下載請求：轉交 UI 彈出「選擇儲存位置」對話框後再建立任務
+        http_server.add_download_request_callback(window.download_requested.emit)
     else:
         window.update_server_status(None, False)
 
     def flush_pending():
-        """把累積的待處理路徑中屬於 .torrent 的檔案加入 BT 任務。"""
+        """把累積的待處理來源加入對應任務：.torrent/magnet 走種子流程，URL 走一般下載。"""
         if not pending_paths:
             return
         paths = pending_paths[:]
         del pending_paths[:]
-        torrents = _torrent_paths(paths)
-        if torrents:
-            for p in torrents:
-                window._add_bt_interactive(p)
+        for s in _parse_input_sources(paths):
+            if s.lower().startswith('magnet:') or s.lower().endswith('.torrent'):
+                window._add_bt_interactive(s)
+            else:
+                window._add_urls([s], silent=True)
 
     # 處理啟動時直接雙擊 .torrent 檔傳入的路徑（以及啟動期間已轉送進來的路徑）
     flush_pending()
 
     window.show()
 
-    # 應用結束時關閉 HTTP 伺服器
+    # 應用結束時關閉 HTTP 伺服器，並釋放常駐 DHT session
     app.aboutToQuit.connect(http_server.stop)
+    app.aboutToQuit.connect(download_manager.shutdown_dht)
 
     sys.exit(app.exec())

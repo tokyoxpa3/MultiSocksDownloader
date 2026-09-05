@@ -13,32 +13,97 @@ chrome.runtime.onInstalled.addListener(() => {
     }
   });
 
-  // 創建右鍵選單
-  chrome.contextMenus.create({
-    id: 'download-with-multisocks',
-    title: '使用多代理下載器下載',
-    contexts: ['link']
-  });
 });
 
-// 追蹤已處理的下載，避免重複處理
-const processedDownloads = new Set();
-const pendingDownloads = new Map(); // 用於追蹤等待確定文件名的下載
-const processedUrls = new Set(); // 追蹤已處理的URL，避免重複發送
-const pendingRedirects = new Set(); // 追蹤正在獲取重定向的URL
+// 建立右鍵選單（冪等建立，reload 不會重複）。
+ensureContextMenus();
+
+// 追蹤已處理的 URL，避免短時間內重複發送同一請求
+const processedUrls = new Set();
+
+// 由網址取出主機名稱（小寫、去掉 leading www.）；無法解析時回傳 null。
+function extractHost(urlString) {
+  if (!urlString) {
+    return null;
+  }
+  try {
+    return new URL(urlString).hostname.toLowerCase().replace(/^www\./, '');
+  } catch (e) {
+    return null;
+  }
+}
+
+// 判斷網址或其來源頁是否命中黑名單。
+function isBlacklisted(urlString, referrer) {
+  const hosts = [extractHost(urlString), extractHost(referrer)].filter(Boolean);
+  return hosts.some((h) => blacklist.includes(h));
+}
+
+// 切換某主機名稱的黑名單狀態，並提示結果。
+function toggleBlacklist(host) {
+  chrome.storage.local.get(['blacklist'], (result) => {
+    const list = Array.isArray(result.blacklist) ? result.blacklist.slice() : [];
+    const idx = list.indexOf(host);
+    let added = false;
+    if (idx >= 0) {
+      list.splice(idx, 1);
+    } else {
+      list.push(host);
+      added = true;
+    }
+    chrome.storage.local.set({ blacklist: list }, () => {
+      blacklist = list;
+      chrome.notifications.create({
+        type: 'basic',
+        iconUrl: 'images/icon128.png',
+        title: '多代理下載器',
+        message: added
+          ? `已將 ${host} 加入黑名單，此網站改用瀏覽器原生下載`
+          : `已將 ${host} 移出黑名單，恢復攔截`,
+        priority: 2
+      });
+    });
+  });
+}
+
+// 建立（冪等）右鍵選單：id 已存在時忽略 duplicate 錯誤，reload 不會重複建立。
+function ensureContextMenus() {
+  const menus = [
+    {
+      id: 'download-with-multisocks',
+      title: '使用多代理下載器下載',
+      contexts: ['link']
+    },
+    {
+      id: 'toggle-site-blacklist',
+      title: '將此網站加入下載黑名單（改用瀏覽器原生下載）',
+      contexts: ['page']
+    }
+  ];
+  for (const m of menus) {
+    chrome.contextMenus.create(m, () => {
+      // 已存在時會回傳 duplicate id 錯誤，忽略即可。
+      void chrome.runtime.lastError;
+    });
+  }
+}
 
 // 快取「取消原始下載」與「啟用攔截」設定。onDeterminingFilename 必須同步呼叫
 // suggest()，onCreated 也需同步判斷是否攔截，不能在此做非同步 storage 查詢，
 // 否則存檔視窗會先彈出（見 onCreated / onDeterminingFilename）。
 let cancelOriginalDownload = true;
 let enabled = true;
+let blacklist = [];
 
-chrome.storage.local.get(['cancelOriginalDownload', 'enabled'], (result) => {
+chrome.storage.local.get(['cancelOriginalDownload', 'enabled', 'blacklist'], (result) => {
   if (result.cancelOriginalDownload !== undefined) {
     cancelOriginalDownload = result.cancelOriginalDownload;
   }
   if (result.enabled !== undefined) {
     enabled = result.enabled;
+  }
+  if (Array.isArray(result.blacklist)) {
+    blacklist = result.blacklist;
   }
 });
 
@@ -50,51 +115,19 @@ chrome.storage.onChanged.addListener((changes, area) => {
     if (changes.enabled) {
       enabled = changes.enabled.newValue;
     }
+    if (changes.blacklist) {
+      blacklist = Array.isArray(changes.blacklist.newValue)
+        ? changes.blacklist.newValue
+        : [];
+    }
   }
 });
 
 // 處理右鍵選單點擊事件
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === 'download-with-multisocks') {
-    console.log("右鍵選單點擊，獲取到的連結:", info.linkUrl);
-
-    // 確保連結有效
     if (info.linkUrl) {
-      chrome.notifications.create({
-        type: 'basic',
-        iconUrl: 'images/icon128.png',
-        title: '多代理下載器',
-        message: '正在獲取最終下載連結...',
-        priority: 2
-      });
-
-      // 標記此URL正在處理中，防止重複請求
-      pendingRedirects.add(info.linkUrl);
-
-      // 先獲取重定向後的URL，再添加下載任務
-      getRedirectedUrl(info.linkUrl).then(finalUrl => {
-        console.log("獲取到最終下載連結:", finalUrl);
-
-        // 只發送重定向後的最終URL
-        sendDownloadRequest(finalUrl);
-
-        // 移除待處理標記
-        pendingRedirects.delete(info.linkUrl);
-      }).catch(error => {
-        console.error("獲取最終URL失敗:", error);
-
-        // 出錯時移除待處理標記
-        pendingRedirects.delete(info.linkUrl);
-
-        // 顯示錯誤通知
-        chrome.notifications.create({
-          type: 'basic',
-          iconUrl: 'images/icon128.png',
-          title: '多代理下載器',
-          message: '獲取最終連結失敗，請重試',
-          priority: 2
-        });
-      });
+      sendDownloadRequest(info.linkUrl);
     } else {
       console.error("未獲取到連結URL");
       chrome.notifications.create({
@@ -105,80 +138,21 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
         priority: 2
       });
     }
+  } else if (info.menuItemId === 'toggle-site-blacklist') {
+    const host = extractHost(info.pageUrl);
+    if (!host) {
+      chrome.notifications.create({
+        type: 'basic',
+        iconUrl: 'images/icon128.png',
+        title: '多代理下載器',
+        message: '無法取得此網站的主機名稱',
+        priority: 2
+      });
+      return;
+    }
+    toggleBlacklist(host);
   }
 });
-
-// 獲取重定向後的URL (返回Promise)
-function getRedirectedUrl(initialUrl) {
-  console.log("獲取重定向URL:", initialUrl);
-
-  return new Promise((resolve, reject) => {
-    // 嘗試使用fetch獲取重定向URL
-    fetch(initialUrl, {
-      method: 'HEAD',
-      redirect: 'follow',
-      cache: 'no-store'
-    })
-    .then(response => {
-      if (response.url && response.url !== initialUrl) {
-        console.log("使用fetch獲取到重定向URL:", response.url);
-        resolve(response.url);
-      } else {
-        // 沒有檢測到重定向，嘗試使用標籤頁方法
-        console.log("未檢測到重定向，使用標籤頁方法");
-        fetchWithTab(initialUrl).then(resolve).catch(reject);
-      }
-    })
-    .catch(error => {
-      console.error("使用fetch獲取重定向URL失敗:", error);
-      // 嘗試使用標籤頁方法作為備用
-      fetchWithTab(initialUrl).then(resolve).catch(reject);
-    });
-  });
-}
-
-// 使用chrome標籤頁獲取最終URL (返回Promise)
-function fetchWithTab(initialUrl) {
-  console.log("使用標籤頁方法獲取最終URL");
-
-  return new Promise((resolve, reject) => {
-    // 創建一個隱藏的標籤頁
-    chrome.tabs.create({ url: initialUrl, active: false }, (tab) => {
-      console.log("已創建臨時標籤頁，ID:", tab.id);
-
-      // 設置一個超時，避免無限等待
-      const timeoutId = setTimeout(() => {
-        console.log("標籤頁加載超時");
-        chrome.tabs.remove(tab.id);
-        reject(new Error("獲取最終URL超時"));
-      }, 15000); // 15秒超時
-
-      // 等待標籤頁加載完成
-      chrome.tabs.onUpdated.addListener(function listener(tabId, changeInfo, updatedTab) {
-        if (tabId === tab.id && changeInfo.status === 'complete') {
-          // 移除監聽器，避免重複處理
-          chrome.tabs.onUpdated.removeListener(listener);
-          // 取消超時計時器
-          clearTimeout(timeoutId);
-
-          // 獲取當前標籤的URL（這是重定向後的最終URL）
-          console.log("標籤頁加載完成，最終URL:", updatedTab.url);
-          const finalUrl = updatedTab.url;
-
-          // 關閉臨時標籤頁
-          chrome.tabs.remove(tab.id, () => {
-            console.log("已關閉臨時標籤頁");
-            if (finalUrl && finalUrl !== "chrome://newtab/") {
-              resolve(finalUrl);
-            } else {
-              reject(new Error("無法獲取有效的最終URL"));
-            }
-          });
-        }
-      });
-    });
-  });
-}
 
 // 監聽下載開始事件
 chrome.downloads.onCreated.addListener(function(downloadItem) {
@@ -187,6 +161,12 @@ chrome.downloads.onCreated.addListener(function(downloadItem) {
   // 同步檢查攔截是否被禁用。
   if (!enabled) {
     console.log("下載攔截已禁用，跳過:", downloadItem.url);
+    return;
+  }
+
+  // 站點在黑名單內：跳過攔截，讓瀏覽器用原生下載（帶自己的 cookie / JS 會話）。
+  if (isBlacklisted(downloadItem.url, downloadItem.referrer)) {
+    console.log("站點在黑名單內，改用瀏覽器原生下載:", downloadItem.url);
     return;
   }
 
@@ -200,49 +180,11 @@ chrome.downloads.onCreated.addListener(function(downloadItem) {
     chrome.downloads.cancel(downloadItem.id);
   }
 
-  // 自己解析重定向，取得最終 URL 與檔名後再送給下載器。
-  resolveDownloadUrl(downloadItem.url).then(info => {
-    sendDownloadRequest(info.url, null, info.filename);
-  }).catch(error => {
-    console.error("解析最終 URL 失敗，改用原始 URL:", error);
-    sendDownloadRequest(downloadItem.url, null, downloadItem.filename);
-  });
+  // 直接送原始 URL 給本機應用。重導向、Content-Disposition 檔名、Range 支援偵測
+  // 與 Cookie 重放，統一交由應用端的 DownloadTask 用 requests 處理；擴充端不對目標
+  // 網址發 fetch/HEAD，以免破壞重導向鏈或拿到不正確的最終連結。
+  sendDownloadRequest(downloadItem.url, null, downloadItem.filename, downloadItem.referrer);
 });
-
-// 透過 HEAD 解析重定向後的最終 URL，並嘗試從 Content-Disposition 取得檔名。
-function resolveDownloadUrl(initialUrl) {
-  console.log("解析最終下載 URL（HEAD）:", initialUrl);
-
-  return fetch(initialUrl, {
-    method: 'HEAD',
-    redirect: 'follow',
-    cache: 'no-store'
-  }).then(response => {
-    const finalUrl = response.url || initialUrl;
-    const filename = extractFilename(response.headers.get('content-disposition'), finalUrl);
-    console.log("解析到最終 URL:", finalUrl, "檔名:", filename);
-    return { url: finalUrl, filename: filename };
-  });
-}
-
-// 從 Content-Disposition 或 URL 解析檔名
-function extractFilename(contentDisposition, url) {
-  if (contentDisposition) {
-    const starMatch = contentDisposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
-    if (starMatch) {
-      return decodeURIComponent(starMatch[1].replace(/^"|"$/g, '').trim());
-    }
-    const plainMatch = contentDisposition.match(/filename\s*=\s*"?([^";]+)"?/i);
-    if (plainMatch) {
-      return plainMatch[1].trim();
-    }
-  }
-  try {
-    const base = new URL(url).pathname.split('/').filter(Boolean).pop();
-    if (base && base.includes('.')) return decodeURIComponent(base);
-  } catch (e) {}
-  return null;
-}
 
 // 監聽下載狀態變化
 chrome.downloads.onChanged.addListener(function(downloadDelta) {
@@ -261,8 +203,33 @@ chrome.downloads.onChanged.addListener(function(downloadDelta) {
   }
 });
 
+// 轉送時使用的瀏覽器 UA，覆蓋下載器預設的 bot UA，避免被以 UA 特徵攔下。
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+// 讀取指定網址在瀏覽器 cookie jar 中的 cookie，序列化成 Cookie 表頭字串。
+// 回傳 Promise<string>；無 cookie 或讀取失敗時回傳空字串。
+function getCookieHeader(url) {
+  return new Promise((resolve) => {
+    if (!chrome.cookies) {
+      resolve('');
+      return;
+    }
+    try {
+      chrome.cookies.getAll({ url: url }, (cookies) => {
+        if (chrome.runtime.lastError || !cookies || cookies.length === 0) {
+          resolve('');
+          return;
+        }
+        resolve(cookies.map((c) => `${c.name}=${c.value}`).join('; '));
+      });
+    } catch (e) {
+      resolve('');
+    }
+  });
+}
+
 // 發送下載請求到本地應用
-function sendDownloadRequest(url, downloadId = null, filename = null) {
+function sendDownloadRequest(url, downloadId = null, filename = null, referrer = '') {
   // 確保URL有效
   if (!url) {
     console.error("嘗試下載無效URL");
@@ -297,8 +264,19 @@ function sendDownloadRequest(url, downloadId = null, filename = null) {
   });
 
   // 檢查是否需要取消原始下載
-  chrome.storage.local.get(['cancelOriginalDownload', 'serverUrl'], (result) => {
+  chrome.storage.local.get(['cancelOriginalDownload', 'serverUrl'], async (result) => {
     const serverUrl = result.serverUrl || 'http://localhost:8765';
+
+    // 讀取瀏覽器 cookie，連同 Referer / 真實 UA 一併轉送，讓本機應用能以
+    // 「已通過驗證」的身份重抓檔案（部分檔案站綁 cookie，缺了就回驗證頁）。
+    const cookieHeader = await getCookieHeader(normalizedUrl);
+    const headers = { 'User-Agent': BROWSER_UA };
+    if (cookieHeader) {
+      headers['Cookie'] = cookieHeader;
+    }
+    if (referrer) {
+      headers['Referer'] = referrer;
+    }
 
     // 先檢查伺服器連接
     fetch(`${serverUrl}/ping`, {
@@ -327,7 +305,8 @@ function sendDownloadRequest(url, downloadId = null, filename = null) {
           url: normalizedUrl, // 使用規範化URL
           downloadId: downloadId,
           filename: filename,
-          timestamp: Date.now() // 添加時間戳避免重複
+          timestamp: Date.now(), // 添加時間戳避免重複
+          headers: headers // 瀏覽器 Cookie / Referer / UA，供本機應用重抓檔案
         })
       });
     })
@@ -368,4 +347,4 @@ function sendDownloadRequest(url, downloadId = null, filename = null) {
       });
     });
   });
-} 
+}

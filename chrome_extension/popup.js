@@ -19,6 +19,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // 開始輪詢下載任務
     startTasksPolling();
+
+    // 載入並渲染黑名單
+    loadBlacklist();
+  });
+
+  // 黑名單變更時即時重繪（例如在頁面右鍵加入／移出）。
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.blacklist) {
+      renderBlacklist(Array.isArray(changes.blacklist.newValue) ? changes.blacklist.newValue : []);
+    }
   });
 
   // 切換啟用/禁用狀態
@@ -194,5 +204,48 @@ document.addEventListener('DOMContentLoaded', () => {
     if (s >= 1024 * 1024) return (s / (1024 * 1024)).toFixed(1) + ' MB/s';
     if (s >= 1024) return (s / 1024).toFixed(1) + ' KB/s';
     return s.toFixed(1) + ' B/s';
+  }
+
+  // 載入並渲染黑名單
+  function loadBlacklist() {
+    chrome.storage.local.get(['blacklist'], (result) => {
+      renderBlacklist(Array.isArray(result.blacklist) ? result.blacklist : []);
+    });
+  }
+
+  // 渲染黑名單：每個站點一個「移除」按鈕
+  function renderBlacklist(list) {
+    const el = document.getElementById('blacklistList');
+    if (!el) return;
+    el.innerHTML = '';
+    if (list.length === 0) {
+      el.textContent = '（空）';
+      return;
+    }
+    list.forEach((host) => {
+      const row = document.createElement('div');
+      row.className = 'blacklist-item';
+
+      const name = document.createElement('span');
+      name.className = 'blacklist-host';
+      name.textContent = host;
+
+      const btn = document.createElement('button');
+      btn.className = 'blacklist-remove';
+      btn.textContent = '移除';
+      btn.addEventListener('click', () => {
+        chrome.storage.local.get(['blacklist'], (r) => {
+          const updated = (Array.isArray(r.blacklist) ? r.blacklist : [])
+            .filter((h) => h !== host);
+          chrome.storage.local.set({ blacklist: updated }, () => {
+            renderBlacklist(updated);
+          });
+        });
+      });
+
+      row.appendChild(name);
+      row.appendChild(btn);
+      el.appendChild(row);
+    });
   }
 }); 

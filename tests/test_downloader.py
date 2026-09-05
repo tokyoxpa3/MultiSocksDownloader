@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -307,6 +308,164 @@ class TestLineTracking(unittest.TestCase):
         self.assertEqual(p["line_bytes"]["proxy:1.2.3.4:1080"], 50)
         self.assertEqual(p["line_labels"]["direct"], "直連")
         self.assertEqual(p["line_labels"]["proxy:1.2.3.4:1080"], "1.2.3.4:1080")
+
+
+class _FakeResp:
+    """可控制的假 HTTP 串流回應，供 _write_run 單元測試使用。"""
+
+    def __init__(self, data, chunk_size, stop=None):
+        self._data = data
+        self._cs = chunk_size
+        self._stop = stop
+        self.closed = False
+
+    def iter_content(self, chunk_size):
+        d = self._data
+        i = 0
+        while i < len(d):
+            yield d[i:i + chunk_size]
+            i += chunk_size
+            if self._stop is not None:
+                # 第一次 yield 後立刻觸發 stop，讓迴圈在下一輪頂部 break，
+                # 模擬「下載到一半被暫停」的場景。
+                self._stop.set()
+                break
+
+    def close(self):
+        self.closed = True
+
+
+class _StopFlag:
+    def __init__(self):
+        self._set = False
+
+    def set(self):
+        self._set = True
+
+    def is_set(self):
+        return self._set
+
+
+class TestPopRun(unittest.TestCase):
+    """前沿串流：_pop_run 應認領一段連續區塊並標記 claimed。"""
+
+    def _make(self, block_size=100, block_count=10):
+        t = DownloadTask("http://example.com/f.bin", tempfile.mkdtemp(), filename="f.bin")
+        t.total_size = block_size * block_count
+        t.block_size = block_size
+        t.block_count = block_count
+        t.bitmap = bytearray((block_count + 7) // 8)
+        t._claimed = bytearray((block_count + 7) // 8)
+        t._single_mode = False
+        return t
+
+    def test_claims_contiguous_span(self):
+        t = self._make()
+        run = t._pop_run()
+        self.assertEqual(run, (0, 9))
+        for i in range(10):
+            self.assertTrue(t._is_block_claimed(i))
+
+    def test_stops_at_done_block(self):
+        t = self._make()
+        t._set_block_done(3)
+        run = t._pop_run()
+        self.assertEqual(run, (0, 2))
+        self.assertTrue(t._is_block_claimed(0))
+        self.assertFalse(t._is_block_claimed(3))
+
+    def test_caps_run_size(self):
+        # block_size 32 MiB → TARGET_RUN_BYTES//block_size == 2，一次最多認領 2 塊
+        t = self._make(block_size=32 * 1024 * 1024, block_count=10)
+        run = t._pop_run()
+        self.assertEqual(run, (0, 1))
+
+    def test_none_when_all_done(self):
+        t = self._make(block_count=3)
+        for i in range(3):
+            t._set_block_done(i)
+        self.assertIsNone(t._pop_run())
+
+
+class TestWriteRun(unittest.TestCase):
+    """_write_run 應跨區塊標記 done，並在暫停時保留 partial 供續傳。"""
+
+    def _make(self):
+        t = DownloadTask("http://example.com/f.bin", tempfile.mkdtemp(), filename="f.bin")
+        t.total_size = 500
+        t.block_size = 100
+        t.block_count = 5
+        t.bitmap = bytearray((5 + 7) // 8)
+        t._claimed = bytearray((5 + 7) // 8)
+        t._single_mode = False
+        t.chunk_size = 150  # 每批 150 bytes，跨過 block 邊界
+        with open(t.temp_filepath, 'wb') as f:
+            f.truncate(t.total_size)
+        return t
+
+    def test_complete_run_marks_all_done(self):
+        t = self._make()
+        data = bytes(range(256)) * 2  # 512 bytes，但 run 只吃前 500
+        r = _FakeResp(data, chunk_size=150)
+        stop = _StopFlag()
+        result = t._write_run(0, 4, 0, 499, r, stop, None)
+        self.assertEqual(result, 'ok')
+        for i in range(5):
+            self.assertTrue(t._is_block_done(i))
+        self.assertEqual(t._popcount(), 5)
+        self.assertEqual(t._completed_bytes_locked(), 500)
+        # 完成後不該殘留 partial
+        self.assertEqual(t._partial, {})
+
+    def test_stop_preserves_partial(self):
+        t = self._make()
+        data = bytes(range(256)) * 2  # 500 有效位元組
+        r = _FakeResp(data, chunk_size=150)
+        stop = _StopFlag()
+        # 第一次 yield 150 bytes 後觸發 stop
+        r = _FakeResp(data, chunk_size=150, stop=stop)
+        result = t._write_run(0, 4, 0, 499, r, stop, None)
+        self.assertEqual(result, 'fail')
+        # block 0 (0-100) 已完成，block 1 (100-200) 已寫 50 bytes
+        self.assertTrue(t._is_block_done(0))
+        self.assertFalse(t._is_block_done(1))
+        self.assertEqual(t._partial.get(1), 50)
+
+
+class TestHandleRunFailure(unittest.TestCase):
+    def _make(self):
+        t = DownloadTask("http://example.com/f.bin", tempfile.mkdtemp(), filename="f.bin")
+        t.total_size = 500
+        t.block_size = 100
+        t.block_count = 5
+        t.bitmap = bytearray((5 + 7) // 8)
+        t._claimed = bytearray((5 + 7) // 8)
+        t._single_mode = False
+        return t
+
+    def test_releases_claims_and_counts_retry(self):
+        t = self._make()
+        for i in range(3):
+            t._set_block_claimed(i)
+        t._set_block_done(0)  # block 0 已完成，不應被釋放 claim 影響 done 狀態
+        stop = _StopFlag()
+        result = t._handle_run_failure(0, 2, 2, "boom", stop)
+        self.assertEqual(result, 'fail')
+        # 未完成的 block 1、2 應釋放 claim
+        self.assertFalse(t._is_block_claimed(1))
+        self.assertFalse(t._is_block_claimed(2))
+        self.assertEqual(t._block_retries.get(2), 1)
+        self.assertFalse(t._fatal)
+
+    def test_reaches_max_retries_sets_error(self):
+        t = self._make()
+        stop = _StopFlag()
+        for _ in range(t.MAX_RETRIES):
+            t._handle_run_failure(0, 1, 1, "boom", stop)
+            t._set_block_claimed(1)
+        self.assertTrue(t._fatal)
+        self.assertEqual(t.status, 'error')
+        self.assertTrue(stop.is_set())
 
 
 if __name__ == "__main__":

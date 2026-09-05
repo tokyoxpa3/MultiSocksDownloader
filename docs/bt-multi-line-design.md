@@ -93,4 +93,4 @@ private=1 多 IP 下載會被 tracker ban。magnet 需等 metadata 才知道是�
 - [x] R1 的結論（共用檔 vs 各自存檔＋合併）——POC 驗證共用檔可行（2026-09-01）。
 - [x] 動態重新派工的觸發頻率與搬移上限——每 3 秒、竊取一半剩餘 piece（2026-09-01）。
 - [x] resume 在多 session 下的正確合併策略——合併位元圖 + `have_pieces`（2026-09-01）。
-- [ ] magnet 多線路 resume（metadata 階段如何接續）——尚未實作。
+- [x] magnet 多線路 resume（metadata 到達後依 pieces.json 續傳，重加 session 帶 have_pieces/verified_pieces）——已實作（2026-09-01）。

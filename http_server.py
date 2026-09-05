@@ -17,9 +17,10 @@ logger = logging.getLogger('http_server')
 
 
 class DownloadRequestHandler(BaseHTTPRequestHandler):
-    def __init__(self, download_manager, callbacks, *args, **kwargs):
+    def __init__(self, download_manager, callbacks, request_callbacks, *args, **kwargs):
         self.download_manager = download_manager
         self.callbacks = callbacks
+        self.request_callbacks = request_callbacks
         super().__init__(*args, **kwargs)
 
     def _set_response(self, status_code=200, content_type='application/json'):
@@ -114,48 +115,72 @@ class DownloadRequestHandler(BaseHTTPRequestHandler):
 
                 logger.info(f"從HTTP請求獲取下載參數: URL={url}, 檔案名={filename}, 分片數={chunks_per_part}, 每代理線程數={threads_per_proxy}")
 
-                # 添加下載任務 - 使用當前下載管理器的保存目錄
-                task_id = self.download_manager.add_task(
-                    url,
-                    filename,
-                    save_dir=self.download_manager.save_dir,
-                    use_proxy=True,
-                    chunks_per_part=chunks_per_part,
-                    threads_per_proxy=threads_per_proxy,
-                    headers=headers,
-                )
-                logger.info(f"HTTP 請求添加了任務 ID: {task_id}, URL: {url}")
-
-                if task_id is None:
-                    self._set_response(500)
-                    response = {'status': 'error', 'message': 'Failed to add download task'}
-                else:
-                    # 在背景執行緒啟動任務。啟動過程會對目標網址發送探測請求
-                    # (直連 + 各代理輪流嘗試)，可能耗時數十秒，不能阻塞 HTTP 回應。
-                    threading.Thread(
-                        target=self.download_manager.start_task,
-                        args=(task_id,),
-                        daemon=True
-                    ).start()
-
-                    # 通知 UI 有新任務加入
-                    if task_id in self.download_manager.task_ids:
-                        task = self.download_manager.task_ids[task_id]
-                        logger.info(f"任務已成功添加到下載管理器，檔案名: {task.filename}")
-
-                        # 調用任務添加回調函數
-                        for callback in self.callbacks:
-                            try:
-                                callback(task_id, task)
-                            except Exception as e:
-                                logger.error(f"調用任務添加回調函數時出錯: {str(e)}")
-
+                # 若已註冊「下載請求」回呼（通常是主程式 UI），把請求轉交 UI 顯示
+                # 「選擇儲存位置」對話框，由使用者確認後再建立任務。每個攔截下載都可能
+                # 想存到不同路徑，不能直接套用全域預設目錄。無回呼時（headless/測試）則
+                # 沿用直接以預設目錄建立任務的舊行為。
+                if self.request_callbacks:
+                    request = {
+                        'url': url,
+                        'filename': filename,
+                        'headers': headers,
+                        'chunks_per_part': chunks_per_part,
+                        'threads_per_proxy': threads_per_proxy,
+                        'save_dir': self.download_manager.save_dir,
+                    }
+                    for callback in self.request_callbacks:
+                        try:
+                            callback(request)
+                        except Exception as e:
+                            logger.error(f"調用下載請求回呼時出錯: {str(e)}")
                     self._set_response()
                     response = {
-                        'status': 'success',
-                        'message': 'Download task added',
-                        'task_id': task_id
+                        'status': 'received',
+                        'message': 'Download request forwarded to UI',
                     }
+                else:
+                    # 添加下載任務 - 使用當前下載管理器的保存目錄
+                    task_id = self.download_manager.add_task(
+                        url,
+                        filename,
+                        save_dir=self.download_manager.save_dir,
+                        use_proxy=True,
+                        chunks_per_part=chunks_per_part,
+                        threads_per_proxy=threads_per_proxy,
+                        headers=headers,
+                    )
+                    logger.info(f"HTTP 請求添加了任務 ID: {task_id}, URL: {url}")
+
+                    if task_id is None:
+                        self._set_response(500)
+                        response = {'status': 'error', 'message': 'Failed to add download task'}
+                    else:
+                        # 在背景執行緒啟動任務。啟動過程會對目標網址發送探測請求
+                        # (直連 + 各代理輪流嘗試)，可能耗時數十秒，不能阻塞 HTTP 回應。
+                        threading.Thread(
+                            target=self.download_manager.start_task,
+                            args=(task_id,),
+                            daemon=True
+                        ).start()
+
+                        # 通知 UI 有新任務加入
+                        if task_id in self.download_manager.task_ids:
+                            task = self.download_manager.task_ids[task_id]
+                            logger.info(f"任務已成功添加到下載管理器，檔案名: {task.filename}")
+
+                            # 調用任務添加回調函數
+                            for callback in self.callbacks:
+                                try:
+                                    callback(task_id, task)
+                                except Exception as e:
+                                    logger.error(f"調用任務添加回調函數時出錯: {str(e)}")
+
+                        self._set_response()
+                        response = {
+                            'status': 'success',
+                            'message': 'Download task added',
+                            'task_id': task_id
+                        }
             except json.JSONDecodeError as e:
                 logger.error(f"JSON解析錯誤: {e}")
                 self._set_response(400)
@@ -172,10 +197,10 @@ class DownloadRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(response).encode())
 
 
-def create_handler_class(download_manager, callbacks):
+def create_handler_class(download_manager, callbacks, request_callbacks):
     """創建一個包含下載管理器引用與回呼清單的處理程序類"""
     def handler(self, *args, **kwargs):
-        DownloadRequestHandler.__init__(self, download_manager, callbacks, *args, **kwargs)
+        DownloadRequestHandler.__init__(self, download_manager, callbacks, request_callbacks, *args, **kwargs)
     return type('CustomHandler', (DownloadRequestHandler,), {'__init__': handler})
 
 
@@ -188,6 +213,7 @@ class HttpServer:
         self.thread = None
         self.is_running = False
         self.task_added_callbacks = []
+        self.download_request_callbacks = []
 
     def add_task_added_callback(self, callback):
         """添加任務添加回調函數"""
@@ -201,6 +227,19 @@ class HttpServer:
             self.task_added_callbacks.remove(callback)
             logger.info(f"已移除任務添加回調函數")
 
+    def add_download_request_callback(self, callback):
+        """添加「攔截下載請求」回呼：收到攔截下載時，交由回呼（通常是 UI）顯示
+        選擇儲存位置對話框，確認後才建立任務。"""
+        if callback not in self.download_request_callbacks:
+            self.download_request_callbacks.append(callback)
+            logger.info("已添加下載請求回呼函數")
+
+    def remove_download_request_callback(self, callback):
+        """移除「攔截下載請求」回呼"""
+        if callback in self.download_request_callbacks:
+            self.download_request_callbacks.remove(callback)
+            logger.info("已移除下載請求回呼函數")
+
     def start(self):
         """啟動 HTTP 伺服器"""
         if self.is_running:
@@ -210,7 +249,7 @@ class HttpServer:
         try:
             # 創建伺服器（ThreadingHTTPServer 讓每個請求在獨立執行緒處理，
             # 避免單一慢速請求（如下載探測）阻塞後續的 ping / POST）
-            handler_class = create_handler_class(self.download_manager, self.task_added_callbacks)
+            handler_class = create_handler_class(self.download_manager, self.task_added_callbacks, self.download_request_callbacks)
             self.server = ThreadingHTTPServer((self.host, self.port), handler_class)
             self.server.daemon_threads = True
 
