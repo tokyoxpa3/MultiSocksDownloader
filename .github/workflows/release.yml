@@ -34,7 +34,7 @@ jobs:
       - name: Build standalone exe (Nuitka)
         shell: cmd
         run: |
-          nuitka --standalone --windows-console-mode=disable --windows-icon-from-ico=app_icon.ico --enable-plugin=pyside6 --include-package=libtorrent MultiSocksDownloader.py
+          nuitka --standalone --windows-console-mode=disable --windows-icon-from-ico=app_icon.ico --enable-plugin=pyside6 --include-package=libtorrent --assume-yes-for-downloads MultiSocksDownloader.py
 
       - name: Package zip (dist contents, no outer folder)
         shell: pwsh
