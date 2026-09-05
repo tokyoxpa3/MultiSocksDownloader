@@ -5,7 +5,7 @@
 
 - ``is_frozen()``          → 坑 1（Nuitka 不設 sys.frozen）
 - ``frozen_exe_path()``    → 坑 2（Nuitka 的 sys.executable 指向內建 python.exe）
-- ``generate_apply_script()``  → 坑 3/4/5/6/8（PS 5.1 的 Start-Process、編碼、
+- ``apply_script_content()``  → 坑 3/4/5/6/8（PS 5.1 的 Start-Process、編碼、
                               日誌路徑、Start-Job、正確程序名）
 - ``_extract_zip()``       → zip-slip 防護
 """
@@ -41,7 +41,7 @@ def frozen_exe_path():
     """取得真正執行中的 exe 路徑。
 
     Nuitka standalone 會把 ``sys.executable`` 設成 dist 內建的 python.exe，
-    而不是真正的 IntegratedApp.exe；用 ``sys.argv[0]`` 才能拿到對的路徑。
+    而不是真正的程式 exe；用 ``sys.argv[0]`` 才能拿到對的路徑。
     """
     argv0 = sys.argv[0] if sys.argv else ""
     p = os.path.abspath(argv0) if argv0 else ""
@@ -50,27 +50,9 @@ def frozen_exe_path():
     return os.path.abspath(sys.executable)
 
 
-def exe_name():
-    """回傳執行檔名（不含 .exe），供替換腳本 Get-Process -Name 使用。"""
-    base = os.path.basename(frozen_exe_path())
-    if base.lower().endswith(".exe"):
-        return base[:-4]
-    return base
-
-
 def current_dist_dir():
     """回傳執行檔所在的資料夾（打包後即 .dist 目錄）。"""
     return os.path.dirname(frozen_exe_path())
-
-
-def app_data_dir():
-    """回傳跨版本穩定的應用資料夾（設定、日誌、替換腳本都放這裡）。
-
-    此目錄在 .dist 之外，因此交換資料夾時不會被刪掉。
-    """
-    d = os.path.join(os.path.expanduser("~"), ".multi_socks_downloader")
-    os.makedirs(d, exist_ok=True)
-    return d
 
 
 # ---------------------------------------------------------------------- #
@@ -217,145 +199,117 @@ def stage_update(info, new_dir):
 # ---------------------------------------------------------------------- #
 # 背景替換腳本（apply_update.ps1）
 # ---------------------------------------------------------------------- #
-def _ps_quote(s):
-    """把值包成單引號 PowerShell 字串，內部單引號加倍。"""
-    return "'" + str(s).replace("'", "''") + "'"
+def apply_script_content():
+    """產生背景替換腳本（PowerShell，純 ASCII，參數由命令列傳入）。
 
+    內容對照 NetRedirector 實測成功的版本：以 param 接收路徑、逐步行寫 log、
+    等主程式退出 → 清理舊目錄 → 原子交換 → 重啟 → 清理。
+    """
+    return r'''param(
+    [string]$Dist,
+    [string]$NewDir,
+    [string]$OldDir,
+    [string]$Exe,
+    [string]$ExeName,
+    [string]$Log
+)
+$ErrorActionPreference = 'SilentlyContinue'
+function L([string]$m) { Add-Content -Path $Log -Value ((Get-Date -Format o) + "  " + $m) -ErrorAction SilentlyContinue }
 
-_APPLY_SCRIPT_TEMPLATE = r'''$ErrorActionPreference = "Stop"
+L ("apply start  Dist=[" + $Dist + "] NewDir=[" + $NewDir + "] OldDir=[" + $OldDir + "] Exe=[" + $Exe + "] ExeName=[" + $ExeName + "]")
 
-$ExePath   = {exe_path}
-$DistDir   = {dist_dir}
-$NewDir    = {new_dir}
-$OldDir    = {old_dir}
-$LogPath   = {log_path}
-$ExeName   = {exe_name}
+# 1. wait for the app to fully exit (process name without .exe)
+while (Get-Process -Name $ExeName -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 1 }
+L "app exited"
 
-function Write-Log {{
-    $line = ("{{0}} {{1}}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $args[0])
-    Add-Content -Path $LogPath -Value $line
-}}
+# 2. remove leftover old version
+if (Test-Path $OldDir) { Remove-Item $OldDir -Recurse -Force -ErrorAction SilentlyContinue }
+L "old cleared"
 
-try {{
-    Write-Log "start exe=$ExePath dist=$DistDir new=$NewDir"
+# 3. atomic swap: Dist -> OldDir, NewDir -> Dist (retry for file unlock)
+$ok = $false
+for ($i = 0; $i -lt 15 -and -not $ok; $i++) {
+    if ((Test-Path $Dist) -and (Test-Path $NewDir)) { Rename-Item $Dist $OldDir -Force -ErrorAction SilentlyContinue }
+    if ((Test-Path $NewDir) -and -not (Test-Path $Dist)) { Rename-Item $NewDir $Dist -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $Exe) { $ok = $true } else { Start-Sleep -Seconds 1 }
+}
+L ("swap ok=" + $ok)
 
-    # 1. wait for the running app process to actually exit
-    $exited = $false
-    for ($i = 0; $i -lt 60 -and -not $exited; $i++) {{
-        $p = Get-Process -Name $ExeName -ErrorAction SilentlyContinue
-        if (-not $p) {{ $exited = $true }} else {{ Start-Sleep -Seconds 1 }}
-    }}
-    if (-not $exited) {{ Write-Log "timeout waiting for process exit"; exit 1 }}
-    Write-Log "app exited"
+# 4. relaunch the app
+if ($ok) {
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $Exe
+        $psi.WorkingDirectory = $Dist
+        $psi.UseShellExecute = $false
+        [System.Diagnostics.Process]::Start($psi) | Out-Null
+        L "restart OK"
+    } catch {
+        L ("restart FAIL: " + $_)
+    }
+} else {
+    L "restart skipped (swap failed)"
+}
 
-    # 2. drop any leftover old dir from a previous failed attempt
-    if (Test-Path $OldDir) {{
-        Remove-Item $OldDir -Recurse -Force -ErrorAction SilentlyContinue
-    }}
-
-    # 3. swap: dist -> old, new -> dist (retry for file-unlock delay)
-    $swapped = $false
-    for ($i = 0; $i -lt 10 -and -not $swapped; $i++) {{
-        try {{
-            if (Test-Path $OldDir) {{
-                Remove-Item $OldDir -Recurse -Force -ErrorAction SilentlyContinue
-            }}
-            if (Test-Path $DistDir) {{ Rename-Item $DistDir $OldDir }}
-            Rename-Item $NewDir $DistDir
-            $swapped = $true
-        }} catch {{
-            Write-Log ("swap attempt {{0}} failed: {{1}}" -f $i, $_.Exception.Message)
-            Start-Sleep -Seconds 1
-        }}
-    }}
-    if (-not $swapped) {{ Write-Log "swap failed after retries"; exit 1 }}
-    Write-Log "swap ok"
-
-    # 4. restart via CreateProcess (PS 5.1 has no Start-Process -UseShellExecute)
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $ExePath
-    $psi.WorkingDirectory = $DistDir
-    $psi.UseShellExecute = $false
-    [System.Diagnostics.Process]::Start($psi) | Out-Null
-    Write-Log "restarted"
-
-    # 5. cleanup old dir (synchronous retry, no background job)
+# 5. cleanup old version (sync retry; the new app is already relaunching)
+if (Test-Path $OldDir) {
     $cleaned = $false
-    for ($i = 0; $i -lt 10 -and -not $cleaned; $i++) {{
+    for ($i = 0; $i -lt 10 -and -not $cleaned; $i++) {
         Remove-Item $OldDir -Recurse -Force -ErrorAction SilentlyContinue
-        if (-not (Test-Path $OldDir)) {{ $cleaned = $true }} else {{ Start-Sleep -Seconds 1 }}
-    }}
-    Write-Log "cleanup done=$cleaned"
-    exit 0
-}} catch {{
-    Write-Log ("fatal: " + $_.Exception.Message)
-    exit 1
-}}
+        if (-not (Test-Path $OldDir)) { $cleaned = $true } else { Start-Sleep -Seconds 1 }
+    }
+    L ("cleanup done=" + $cleaned)
+}
+
+L "apply done"
 '''
-
-
-def generate_apply_script(exe_path, dist_dir, new_dir, old_dir, log_path):
-    """產生背景替換腳本內容（全 ASCII，避免 PS 5.1 無 BOM UTF-8 亂碼）。"""
-    name = os.path.basename(exe_path)
-    if name.lower().endswith(".exe"):
-        name = name[:-4]
-    return _APPLY_SCRIPT_TEMPLATE.format(
-        exe_path=_ps_quote(exe_path),
-        dist_dir=_ps_quote(dist_dir),
-        new_dir=_ps_quote(new_dir),
-        old_dir=_ps_quote(old_dir),
-        log_path=_ps_quote(log_path),
-        exe_name=_ps_quote(name),
-    )
 
 
 def pending_paths():
     """回傳本次更新的路徑資訊（dist / new / old / exe / 腳本 / 日誌）。"""
     dist = current_dist_dir()
+    install_dir = os.path.dirname(dist)
     return {
         "dist": dist,
         "new": dist + ".new",
         "old": dist + ".old",
         "exe": frozen_exe_path(),
-        "script": os.path.join(app_data_dir(), "apply_update.ps1"),
-        "log": os.path.join(app_data_dir(), "update.log"),
+        "install_dir": install_dir,
+        "script": os.path.join(install_dir, "apply_update.ps1"),
+        "log": os.path.join(install_dir, "update_apply.log"),
+        "err": os.path.join(install_dir, "update_apply_err.log"),
     }
 
 
 def spawn_apply_script(paths=None):
-    """寫出並分離啟動背景替換腳本；回傳 True 表示已啟動（呼叫端應接著退出）。
+    """寫出並啟動背景替換腳本；回傳 True 表示已啟動（呼叫端應接著退出）。
 
-    用 ``DETACHED_PROCESS`` 確保主程式退出後腳本仍能獨立存活。
+    用 ``CREATE_NO_WINDOW`` 啟動 PowerShell（不能用 DETACHED_PROCESS，
+    否則子程序可能未執行就消失）。參數走命令列，腳本以 utf-8-sig（BOM）寫入。
     """
     paths = paths or pending_paths()
-    script = generate_apply_script(
-        exe_path=paths["exe"],
-        dist_dir=paths["dist"],
-        new_dir=paths["new"],
-        old_dir=paths["old"],
-        log_path=paths["log"],
-    )
-    with open(paths["script"], "w", encoding="ascii", newline="\r\n") as f:
-        f.write(script)
+    exe_base = os.path.basename(paths["exe"])
+    exe_name = os.path.splitext(exe_base)[0]
 
-    cmd = [
-        "powershell.exe",
-        "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
-        "-File", paths["script"],
-    ]
+    with open(paths["script"], "w", encoding="utf-8-sig") as f:
+        f.write(apply_script_content())
 
-    stderr_log = os.path.splitext(paths["log"])[0] + ".stderr.log"
-    kwargs = {
-        "stdin": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    if sys.platform == "win32":
-        kwargs["creationflags"] = (
-            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    with open(paths["err"], "ab") as err_fd:
+        subprocess.Popen(
+            [
+                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", paths["script"],
+                "-Dist", paths["dist"],
+                "-NewDir", paths["new"],
+                "-OldDir", paths["old"],
+                "-Exe", paths["exe"],
+                "-ExeName", exe_name,
+                "-Log", paths["log"],
+            ],
+            cwd=paths["install_dir"],
+            creationflags=creationflags,
+            stdout=subprocess.DEVNULL,
+            stderr=err_fd,
         )
-    with open(stderr_log, "ab") as err_fh:
-        kwargs["stdout"] = err_fh
-        kwargs["stderr"] = subprocess.STDOUT
-        subprocess.Popen(cmd, **kwargs)
     return True

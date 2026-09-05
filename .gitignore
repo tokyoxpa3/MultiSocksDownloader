@@ -19,8 +19,11 @@ dist/
 *.spec
 *.build/
 *.dist/
+*.dist.new/
+*.dist.old/
 *.log
 *.zip
+apply_update.ps1
 
 # IDE / 編輯器
 .idea/

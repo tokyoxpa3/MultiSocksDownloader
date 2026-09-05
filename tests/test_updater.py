@@ -102,15 +102,9 @@ class TestFrozenExePath(unittest.TestCase):
             self.assertTrue(updater.frozen_exe_path().endswith("python.exe"))
 
 
-class TestGenerateApplyScript(unittest.TestCase):
+class TestApplyScriptContent(unittest.TestCase):
     def test_ascii_only_and_contains_gotcha_fixes(self):
-        script = updater.generate_apply_script(
-            "C:\\app\\MultiSocksDownloader.exe",
-            "C:\\app\\dist",
-            "C:\\app\\dist.new",
-            "C:\\app\\dist.old",
-            "C:\\log\\update.log",
-        )
+        script = updater.apply_script_content()
         # 全 ASCII：避免 PS 5.1 讀無 BOM UTF-8 亂碼
         script.encode("ascii")
         # 坑 3：用 .NET ProcessStartInfo + UseShellExecute=$false
@@ -118,9 +112,9 @@ class TestGenerateApplyScript(unittest.TestCase):
         self.assertIn("System.Diagnostics.ProcessStartInfo", script)
         # 坑 6：不得使用 Start-Job（會卡住管道）
         self.assertNotIn("Start-Job", script)
-        # 坑 8：等正確程序名退出
+        # 坑 8：等正確程序名退出（參數走 param，腳本內以 $ExeName 取代）
         self.assertIn("Get-Process -Name", script)
-        self.assertIn("'MultiSocksDownloader'", script)
+        self.assertIn("param(", script)
 
 
 if __name__ == "__main__":
