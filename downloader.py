@@ -1362,7 +1362,7 @@ class DownloadManager:
         self.speed_limit = 0  # bytes/sec，0 表示不限速
         self.rate_limiter = RateLimiter()
         self.custom_headers = {}
-        self.auto_check_update = False  # 啟動時是否自動檢查更新
+        self.auto_check_update = True  # 啟動時是否自動檢查更新
 
         self.history = []          # 歷史下載紀錄：list of dict
         self.next_history_id = 1

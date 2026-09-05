@@ -2413,6 +2413,8 @@ class MainWindow(QMainWindow):
             self, "更新已就緒",
             "更新已下載完成。關閉並重新啟動以完成更新？")
         if reply == QMessageBox.Yes:
+            # 繞過系統匣的關閉攔截，確保真正退出，讓背景替換腳本得以交換目錄並重啟
+            self._force_quit = True
             updater.spawn_apply_script()
             QApplication.quit()
 
