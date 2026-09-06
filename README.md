@@ -2,6 +2,14 @@
 
 使用多個 SOCKS5 代理、多線程並行下載，支援斷點續傳的桌面下載工具。
 
+> ## ⚠️ 搭配 NetRedirector（PPPoE 本地網路）必讀
+>
+> 若你使用 [**NetRedirector**](https://github.com/tokyoxpa3/NetRedirector) 做流量轉送、並以 **PPPoE 本地網路**運作，
+> **務必把 `MultiSocksDownloader.exe` 加入 NetRedirector 的直連清單（Direct / Bypass）**。
+>
+> 否則本程式通往 SOCKS5 代理的連線會被 NetRedirector 再次轉送，
+> 導致**多代理聚合失效、速度變慢，甚至完全無法連線**。
+
 ## 功能特點
 
 - **多代理並行下載**：單一檔案可同時透過多個 SOCKS5 代理分段下載，提升速度與穩定性。
