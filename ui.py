@@ -1210,7 +1210,7 @@ class MainWindow(QMainWindow):
         self.bt_max_tasks_per_line_spinbox.setSpecialValueText("不提醒")
         self.bt_max_tasks_per_line_spinbox.setToolTip(
             "每條 SOCKS5 線路同時進行的 BT 任務數上限。"
-            "5G-Proxy-Pro 的 SOCKS5 握手執行緒有限（64 條、阻塞式），"
+            "5G-Proxy-Pro 的 SOCKS5 握手是阻塞式（執行緒池 192 條、握手逾時 3 秒），"
             "同一條 5G 線路開太多 BT 任務會互相拖慢甚至丟連線（建議 2）。0 = 不提醒。")
         self.bt_max_tasks_per_line_spinbox.valueChanged.connect(self.on_bt_max_tasks_per_line_changed)
         dl_form.addRow("每線同時 BT 任務上限:", self.bt_max_tasks_per_line_spinbox)
