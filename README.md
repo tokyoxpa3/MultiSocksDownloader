@@ -10,6 +10,34 @@
 > 否則本程式通往 SOCKS5 代理的連線會被 NetRedirector 再次轉送，
 > 導致**多代理聚合失效、速度變慢，甚至完全無法連線**。
 
+> ## ⚠️ 搭配 5G-Proxy-Pro（手機 5G SOCKS5）注意事項
+>
+> 使用 [5G-Proxy-Pro](https://github.com/tokyoxpa3/5G-Proxy-Pro) 這類「手機 5G 架 SOCKS5」的線路時，
+> **同一條線路不要同時開太多 BT 任務**。
+> 5G-Proxy-Pro 的 SOCKS5 握手是阻塞式、握手執行緒池固定 64 條，
+> 每個 BT 任務在代理線路最多開 30 條連線；單線同時 2 個 BT 任務（約 60 條握手）已接近瓶頸，
+> 3 個以上就會互相拖慢、甚至丟連線。
+>
+> 程式預設「每線同時 BT 任務上限 = 2」（設定 → 每線同時 BT 任務上限，可調整，0 = 不提醒）。
+> 超過上限仍會繼續新增，但會跳出提醒。
+
+## 為什麼 5G 行動網路也能下載 BT？
+
+一般 5G 行動網路想下載 BT / 磁力其實非常困難，主因有二：
+
+- **電信級 NAT（CGNAT）**：手機沒有公網 IPv4，外部 peer 無法主動連進來，只能靠「主動向外連線」找 peer。
+- **UDP / DHT 被封**：5G 與 SOCKS5 轉接環境下，DHT、UDP tracker、uTP 這些 BT 找 peer 的主要管道常被封或不轉發。
+
+本程式用以下方法繞過這些限制，讓 5G 也能跑 BT：
+
+- **SOCKS5 主動對外連線**：BT 流量經 SOCKS5 代理（如 5G-Proxy-Pro 的手機 5G）主動連向 peer，繞開 CGNAT「無法被連入」的困境。
+- **僅用 TCP**：SOCKS5 不轉發 UDP，代理線路強制走 TCP、停用 uTP/UDP，避免無效連線浪費資源。
+- **HTTP tracker 後備**：DHT/UDP tracker 被封時，改走 TCP 的 HTTP/HTTPS tracker 取得 metadata 與 peer。
+- **偽裝 qBittorrent 4.6.0**：避免自製客戶端被 tracker 白名單拒收。
+- **多線路聚合**：單一檔案切成不重疊分段，同時經多條直連/SOCKS5 線路分段下載。
+
+也正因如此，本程式**必須自己掌控這些 SOCKS5 連線**。若搭配 NetRedirector 做流量轉送，務必把 `MultiSocksDownloader.exe` 加入直連清單——否則它通往各代理的連線會被 NetRedirector 再轉一次，上面這整套「繞過 5G 限制」的機制就會失效（見開頭提醒）。
+
 ## 功能特點
 
 - **多代理並行下載**：單一檔案可同時透過多個 SOCKS5 代理分段下載，提升速度與穩定性。

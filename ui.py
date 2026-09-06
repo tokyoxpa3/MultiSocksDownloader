@@ -842,6 +842,10 @@ class MainWindow(QMainWindow):
         self.bt_proxy_max_connections_spinbox.setValue(int(self.download_manager.bt_proxy_max_connections))
         self.bt_proxy_max_connections_spinbox.blockSignals(False)
 
+        self.bt_max_tasks_per_line_spinbox.blockSignals(True)
+        self.bt_max_tasks_per_line_spinbox.setValue(int(self.download_manager.bt_max_tasks_per_line))
+        self.bt_max_tasks_per_line_spinbox.blockSignals(False)
+
         self.bt_force_tcp_checkbox.blockSignals(True)
         self.bt_force_tcp_checkbox.setChecked(bool(self.download_manager.bt_force_tcp))
         self.bt_force_tcp_checkbox.blockSignals(False)
@@ -1200,6 +1204,17 @@ class MainWindow(QMainWindow):
         self.bt_proxy_max_connections_spinbox.valueChanged.connect(self.on_bt_proxy_max_connections_changed)
         dl_form.addRow("BT 連線數上限（SOCKS5）:", self.bt_proxy_max_connections_spinbox)
 
+        self.bt_max_tasks_per_line_spinbox = QSpinBox()
+        self.bt_max_tasks_per_line_spinbox.setRange(0, 20)
+        self.bt_max_tasks_per_line_spinbox.setValue(2)
+        self.bt_max_tasks_per_line_spinbox.setSpecialValueText("不提醒")
+        self.bt_max_tasks_per_line_spinbox.setToolTip(
+            "每條 SOCKS5 線路同時進行的 BT 任務數上限。"
+            "5G-Proxy-Pro 的 SOCKS5 握手執行緒有限（64 條、阻塞式），"
+            "同一條 5G 線路開太多 BT 任務會互相拖慢甚至丟連線（建議 2）。0 = 不提醒。")
+        self.bt_max_tasks_per_line_spinbox.valueChanged.connect(self.on_bt_max_tasks_per_line_changed)
+        dl_form.addRow("每線同時 BT 任務上限:", self.bt_max_tasks_per_line_spinbox)
+
         self.bt_force_tcp_checkbox = QCheckBox("BT 僅用 TCP 連線（停用 uTP/UDP）")
         self.bt_force_tcp_checkbox.setToolTip(
             "適用於 UDP 被封的環境（如 5G 行動網路 + SOCKS5 轉接）。"
@@ -1410,12 +1425,28 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "錯誤", f"添加種子下載失敗:\n{e}")
             return
 
-        self.add_task_to_table(task_id, self.download_manager.task_ids[task_id])
+        task = self.download_manager.task_ids[task_id]
+        self._warn_bt_concurrency(task)
+        self.add_task_to_table(task_id, task)
         threading.Thread(
             target=self._start_task_in_background,
             args=(task_id, source),
             daemon=True,
         ).start()
+
+    def _warn_bt_concurrency(self, task):
+        """BT 任務新增後，若任一 SOCKS5 線路超出同時任務上限，跳軟提醒（不阻止）。"""
+        line_proxies = getattr(task, '_line_proxies', [])
+        overloaded = self.download_manager.bt_overloaded_lines(line_proxies)
+        if not overloaded:
+            return
+        lines = "、".join(overloaded)
+        QMessageBox.warning(
+            self, "BT 同時任務過多",
+            f"以下 SOCKS5 線路已達每線同時 BT 任務上限"
+            f"（{self.download_manager.bt_max_tasks_per_line} 個）：\n{lines}\n\n"
+            "5G-Proxy-Pro 的 SOCKS5 握手執行緒有限，同一條線開太多 BT 任務會互相拖慢、"
+            "甚至丟連線。建議等既有任務完成後再新增。\n\n本次仍會繼續新增。")
 
     # --- 拖放支援 ---
     def dragEnterEvent(self, event):
@@ -2285,6 +2316,15 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"已設定 BT SOCKS5 線連線數上限: {value}", 2000)
         else:
             self.statusBar().showMessage("BT SOCKS5 線連線數上限已改為不限（libtorrent 預設）", 2000)
+
+    def on_bt_max_tasks_per_line_changed(self, value):
+        """每線同時 BT 任務上限變更時套用（0 = 不提醒）。"""
+        self.download_manager.set_bt_max_tasks_per_line(value)
+        self.download_manager.save_config()
+        if value > 0:
+            self.statusBar().showMessage(f"已設定每線同時 BT 任務上限: {value}", 2000)
+        else:
+            self.statusBar().showMessage("每線同時 BT 任務上限已關閉（不提醒）", 2000)
 
     def on_bt_force_tcp_changed(self, checked):
         """BT 僅用 TCP（停用 uTP）變更時套用。"""

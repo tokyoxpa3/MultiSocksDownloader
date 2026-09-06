@@ -1356,6 +1356,7 @@ class DownloadManager:
         self.bt_resume_interval = 10  # BT resume 自動保存間隔（秒），最小 1 秒
         self.bt_max_connections = 200  # BT 直連線最大連線數，0 表示用 libtorrent 預設
         self.bt_proxy_max_connections = 30  # BT SOCKS5 代理線最大連線數（CGNAT 下可達 peer 少，壓低避免死連線 churn）
+        self.bt_max_tasks_per_line = 2  # 每條 SOCKS5 線路同時進行的 BT 任務數上限（5G-Proxy-Pro 握手執行緒有限；0 = 不提醒）
         self.bt_force_tcp = False     # 僅用 TCP（停用 uTP/UDP），UDP 被封的環境適用
         self.bt_listen_port = 6881    # BT 直連監聽埠，0 = 動態埠（配合 UPnP/NAT-PMP）
 
@@ -1455,6 +1456,8 @@ class DownloadManager:
                 self.bt_max_connections = max(0, int(config['bt_max_connections']))
             if 'bt_proxy_max_connections' in config:
                 self.bt_proxy_max_connections = max(0, int(config['bt_proxy_max_connections']))
+            if 'bt_max_tasks_per_line' in config:
+                self.bt_max_tasks_per_line = max(0, int(config['bt_max_tasks_per_line']))
             if 'bt_force_tcp' in config:
                 self.bt_force_tcp = bool(config['bt_force_tcp'])
             if 'bt_listen_port' in config:
@@ -1484,6 +1487,7 @@ class DownloadManager:
                 'bt_resume_interval': self.bt_resume_interval,
                 'bt_max_connections': self.bt_max_connections,
                 'bt_proxy_max_connections': self.bt_proxy_max_connections,
+                'bt_max_tasks_per_line': self.bt_max_tasks_per_line,
                 'bt_force_tcp': self.bt_force_tcp,
                 'bt_listen_port': self.bt_listen_port,
                 'bt_dht_autotune': self.bt_dht_autotune,
@@ -1627,6 +1631,46 @@ class DownloadManager:
             for p in self.socks_proxies.values()
             if p['status'].startswith('可用') or p['status'].startswith('有限可用')
         ]
+
+    def _proxy_line_key(self, proxy):
+        """SOCKS5 線路的身分鍵（host:port）；直連（None）回傳 None 不列入計數。"""
+        if not proxy:
+            return None
+        return f"{proxy.get('host')}:{int(proxy.get('port') or 0)}"
+
+    def bt_active_tasks_per_line(self):
+        """計算每條 SOCKS5 線路目前進行中的 BT 任務數（直連不計）。"""
+        counts = {}
+        with self._lock:
+            tasks = list(self.tasks.values())
+        for t in tasks:
+            if not isinstance(t, BTTask) or not t.is_running():
+                continue
+            for p in getattr(t, '_line_proxies', []):
+                key = self._proxy_line_key(p)
+                if key is None:
+                    continue
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def bt_overloaded_lines(self, line_proxies):
+        """回傳新 BT 任務會超出「每線同時任務上限」的 SOCKS5 線路鍵清單（軟提醒用）。
+
+        上限為 0（不提醒）或 line_proxies 為空時回傳空清單。
+        """
+        if not self.bt_max_tasks_per_line or not line_proxies:
+            return []
+        counts = self.bt_active_tasks_per_line()
+        overloaded = []
+        seen = set()
+        for p in line_proxies:
+            key = self._proxy_line_key(p)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            if counts.get(key, 0) >= self.bt_max_tasks_per_line:
+                overloaded.append(key)
+        return overloaded
 
     # ------------------------------------------------------------------ #
     # task management
@@ -1853,6 +1897,10 @@ class DownloadManager:
     def set_bt_proxy_max_connections(self, value):
         """設定 BT SOCKS5 代理線最大連線數，0 表示用 libtorrent 預設（不限）。"""
         self.bt_proxy_max_connections = max(0, int(value or 0))
+
+    def set_bt_max_tasks_per_line(self, value):
+        """設定每條 SOCKS5 線路同時進行的 BT 任務數上限（0 = 不提醒）。"""
+        self.bt_max_tasks_per_line = max(0, int(value or 0))
 
     def set_bt_force_tcp(self, enabled):
         """設定是否僅用 TCP（停用 uTP/UDP），UDP 被封的環境建議啟用。"""
