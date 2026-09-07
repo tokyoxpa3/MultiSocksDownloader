@@ -129,21 +129,11 @@ if __name__ == "__main__":
     # 創建主窗口，傳入已有的下載管理器
     window = MainWindow(download_manager)
 
-    # 更新 UI 上的伺服器狀態
     if server_started:
-        server_urls = http_server.get_server_url()
-        # 顯示本地 IP 的 URL，這樣其他設備可以訪問
-        if "local_ip" in server_urls:
-            window.update_server_status(server_urls["local_ip"], True)
-        else:
-            window.update_server_status(server_urls["localhost"], True)
-
         # 註冊回調函數，讓 HTTP 伺服器可以通知 UI 有新任務添加
         http_server.add_task_added_callback(window.on_task_added)
         # 攔截下載請求：轉交 UI 彈出「選擇儲存位置」對話框後再建立任務
         http_server.add_download_request_callback(window.download_requested.emit)
-    else:
-        window.update_server_status(None, False)
 
     def flush_pending():
         """把累積的待處理來源加入對應任務：.torrent/magnet 走種子流程，URL 走一般下載。"""

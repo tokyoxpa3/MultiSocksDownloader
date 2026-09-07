@@ -2,24 +2,22 @@
 setlocal enabledelayedexpansion
 
 set "SRC=%~dp0chrome_extension"
-set "DST=%LOCALAPPDATA%\MultiSocksDownloader\chrome_extension"
 
 echo ================================================
 echo  MultiSocksDownloader - Chrome Extension Install
 echo ================================================
 echo.
 
-echo [1/2] Copying extension to a stable location...
-echo        %DST%
-if exist "%DST%" rmdir /s /q "%DST%"
-xcopy "%SRC%" "%DST%" /e /i /h /y >nul
-if errorlevel 1 (
-    echo ERROR: Failed to copy extension files.
+if not exist "%SRC%\manifest.json" (
+    echo ERROR: Extension folder not found:
+    echo        %SRC%
+    echo        Make sure this script is in the same folder as
+    echo        MultiSocksDownloader.exe and chrome_extension\.
     pause
     exit /b 1
 )
 
-echo [2/2] Opening Chrome extensions page...
+echo Opening Chrome extensions page...
 set "CHROME="
 if exist "%ProgramFiles%\Google\Chrome\Application\chrome.exe" set "CHROME=%ProgramFiles%\Google\Chrome\Application\chrome.exe"
 if not defined CHROME if exist "%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe" set "CHROME=%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"
@@ -38,7 +36,7 @@ echo  Next steps (in the Chrome extensions page):
 echo    1. Turn ON "Developer mode"  (top-right)
 echo    2. Click "Load unpacked"
 echo    3. Select this folder:
-echo       %DST%
+echo       %SRC%
 echo ================================================
 echo.
 pause

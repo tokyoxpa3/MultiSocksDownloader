@@ -19,7 +19,7 @@
 > 每個 BT 任務在代理線路最多開 30 條連線；即便握手池已放大，
 > 單線同時開太多 BT 任務仍會互相搶握手執行緒、拖慢甚至丟連線。
 >
-> 程式預設「每線同時 BT 任務上限 = 2」（設定 → 每線同時 BT 任務上限，可調整，0 = 不提醒）。
+> 程式預設「每線同時 BT 任務上限 = 5」（設定 → 每線同時 BT 任務上限，可調整，0 = 不提醒）。
 > 超過上限仍會繼續新增，但會跳出提醒。
 
 ## 為什麼 5G 行動網路也能下載 BT？
@@ -134,3 +134,9 @@ nuitka --standalone --windows-console-mode=disable --enable-plugin=pyside6 Multi
 ## Chrome 擴充功能
 
 安裝與使用方式請見 [`chrome_extension/README.md`](chrome_extension/README.md)。
+
+> **打包與自動更新**：`chrome_extension/`、`install_extension.bat`、`open_extensions.ps1`
+> 會隨主程式一起打包進發佈 zip，並放在 `MultiSocksDownloader.exe` 旁邊，
+> 與主程式綁定、隨自動更新一起換新。擴充套件直接從該資料夾載入，無需另外複製。
+> Chrome 不會自動重載「未封裝」擴充套件，更新後請在 `chrome://extensions/`
+> 點該擴充套件的 ↻ 重載，或重啟 Chrome，才會套用新版。

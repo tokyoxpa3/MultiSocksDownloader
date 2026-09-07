@@ -154,36 +154,70 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   }
 });
 
-// 監聽下載開始事件
+// 判斷下載是否應由本機應用攔截（而非瀏覽器原生下載）。
+// blob:/data: 是瀏覽器記憶體資料，外部下載器讀不到；停用、黑名單也要放行原生。
+function shouldIntercept(downloadItem) {
+  let scheme = '';
+  try {
+    scheme = new URL(downloadItem.url).protocol;
+  } catch (e) {
+    scheme = '';
+  }
+  if (scheme === 'blob:' || scheme === 'data:') {
+    console.log("blob/data 本地資料，改用瀏覽器原生下載:", downloadItem.url);
+    return false;
+  }
+  if (!enabled) {
+    console.log("下載攔截已禁用，跳過:", downloadItem.url);
+    return false;
+  }
+  if (isBlacklisted(downloadItem.url, downloadItem.referrer)) {
+    console.log("站點在黑名單內，改用瀏覽器原生下載:", downloadItem.url);
+    return false;
+  }
+  return true;
+}
+
+// 監聽下載開始事件：只負責把原始 URL 轉送給本機應用。
+// 取消原始下載、阻止另存新檔視窗改由 onDeterminingFilename 同步處理，因為
+// onCreated 階段的 cancel 在 service worker 冷啟動（閒置數分鐘被回收後）時，
+// 會因 worker 重新載入的延遲而慢於 Chrome 的「確定檔名」階段，導致停頓後
+// 第一次下載仍彈出另存視窗。
 chrome.downloads.onCreated.addListener(function(downloadItem) {
   console.log("監測到下載開始:", downloadItem);
 
-  // 同步檢查攔截是否被禁用。
-  if (!enabled) {
-    console.log("下載攔截已禁用，跳過:", downloadItem.url);
+  if (!shouldIntercept(downloadItem)) {
     return;
-  }
-
-  // 站點在黑名單內：跳過攔截，讓瀏覽器用原生下載（帶自己的 cookie / JS 會話）。
-  if (isBlacklisted(downloadItem.url, downloadItem.referrer)) {
-    console.log("站點在黑名單內，改用瀏覽器原生下載:", downloadItem.url);
-    return;
-  }
-
-  if (cancelOriginalDownload) {
-    console.log("立即取消原始下載（阻止另存新檔視窗）:", downloadItem.id, downloadItem.url);
-
-    // 在 onCreated 階段就取消，Chrome 不會進入「確定檔名 → 彈出另存新檔視窗」的
-    // 階段。這是阻止視窗跳出的關鍵：onDeterminingFilename 的 suggest({cancel:true})
-    // 雖能取消下載，但 MV3 下若 worker 回應過慢，Chrome 可能已先彈出視窗
-    // （先前 log 顯示下載已 USER_CANCELED 但視窗仍跳出）。
-    chrome.downloads.cancel(downloadItem.id);
   }
 
   // 直接送原始 URL 給本機應用。重導向、Content-Disposition 檔名、Range 支援偵測
   // 與 Cookie 重放，統一交由應用端的 DownloadTask 用 requests 處理；擴充端不對目標
   // 網址發 fetch/HEAD，以免破壞重導向鏈或拿到不正確的最終連結。
   sendDownloadRequest(downloadItem.url, null, downloadItem.filename, downloadItem.referrer);
+});
+
+// 在 Chrome「確定檔名」階段同步攔截。Chrome 會等 suggest() 回應才決定是否彈出
+// 另存視窗，因此這是唯一能可靠擋掉視窗的時機（onCreated 的 cancel 在 worker 冷
+// 啟動時會慢半拍）。
+//
+// 注意：suggest() 的參數型別只有 {filename, conflictAction}，沒有 cancel 欄位。
+// 先前的 suggest({cancel:true}) 會被 Chrome 忽略、等於空建議，又走回預設流程。
+// 正確做法是先 cancel 原始下載，再給一個明確檔名（uniquify）以免另存視窗跳出。
+chrome.downloads.onDeterminingFilename.addListener(function(downloadItem, suggest) {
+  if (!shouldIntercept(downloadItem)) {
+    // 放行：交還瀏覽器原生流程。
+    suggest();
+    return;
+  }
+
+  if (cancelOriginalDownload) {
+    console.log("取消原始下載（阻止另存新檔視窗）:", downloadItem.id, downloadItem.url);
+    chrome.downloads.cancel(downloadItem.id);
+    suggest({ filename: downloadItem.filename || 'download', conflictAction: 'uniquify' });
+  } else {
+    // 使用者選擇保留瀏覽器原生下載（只轉送、不取消），交還原生流程。
+    suggest();
+  }
 });
 
 // 監聽下載狀態變化
@@ -326,11 +360,11 @@ function sendDownloadRequest(url, downloadId = null, filename = null, referrer =
         });
       }
 
-      // 下載成功，保持URL在已處理列表中一段時間後再移除
-      setTimeout(() => {
-        processedUrls.delete(normalizedUrl);
-        console.log(`已從處理列表中移除URL: ${normalizedUrl}`);
-      }, 60000); // 1分鐘後清理
+      // 請求已回覆（本機應用已收到），立即解除去重標記，不能保留 60 秒：
+      // 使用者可能在「選擇儲存位置」對話框按取消、並未真正建立任務，若仍標記
+      // 已處理，短時間內再點同一連結會被誤判為重複而無反應。
+      processedUrls.delete(normalizedUrl);
+      console.log(`已從處理列表中移除URL: ${normalizedUrl}`);
     })
     .catch(error => {
       // 如果發送失敗，立即從已處理列表中移除，允許重試

@@ -24,21 +24,19 @@
 
 #### 方式一：一鍵安裝腳本（推薦）
 
-在專案根目錄雙擊執行 `install_extension.bat`，腳本會自動：
+擴展程式與下載器綁定在一起，打包後 `chrome_extension/` 會直接放在
+`MultiSocksDownloader.exe` 旁邊。在下載器資料夾內雙擊執行
+`install_extension.bat`，腳本會自動：
 
-1. 把擴展檔案複製到穩定位置 `%LOCALAPPDATA%\MultiSocksDownloader\chrome_extension`
-2. 開啟 Chrome，並嘗試自動導向擴展程式管理頁面 `chrome://extensions/`
-3. 在命令列視窗中印出需要選擇的資料夾路徑
+1. 開啟 Chrome，並嘗試自動導向擴展程式管理頁面 `chrome://extensions/`
+2. 在命令列視窗中印出需要選擇的資料夾路徑
 
 接著只需在 Chrome 頁面手動完成最後三個步驟：
 
 1. 開啟右上角的「開發者模式」
 2. 點擊「載入未封裝項目」
-3. 在檔案選擇視窗中，選取腳本印出的資料夾路徑：
-   `%LOCALAPPDATA%\MultiSocksDownloader\chrome_extension`
-
-> **為什麼要複製到 `%LOCALAPPDATA%`？**
-> Chrome 會記住你載入資料夾的絕對路徑。如果直接從專案目錄載入，之後搬移或刪除專案，擴展程式會因找不到檔案而失效。複製到 `%LOCALAPPDATA%` 下的獨立資料夾可避免此問題。
+3. 在檔案選擇視窗中，選取腳本印出的資料夾路徑（即下載器資料夾內的
+   `chrome_extension`）
 
 > **找不到 Chrome 時**：腳本會顯示警告，此時請手動開啟瀏覽器並前往 `chrome://extensions/`。
 
@@ -47,10 +45,11 @@
 1. 開啟 Chrome，在網址列輸入 `chrome://extensions/` 並按 Enter
 2. 開啟右上角的「開發者模式」開關
 3. 點擊「載入未封裝項目」
-4. 選取專案中的 `chrome_extension` 資料夾。請務必選取**直接包含 `manifest.json` 的那一層**，而不是專案根目錄或更上層資料夾
+4. 選取 `chrome_extension` 資料夾（在專案中為專案根目錄下的
+   `chrome_extension`，在打包後為 `MultiSocksDownloader.exe` 旁的
+   `chrome_extension`）。請務必選取**直接包含 `manifest.json` 的那一層**，
+   而不是專案根目錄或更上層資料夾
 5. 載入成功後，擴展程式卡片上會顯示名稱「多代理下載器」與一組擴展程式 ID
-
-> **注意**：方式二直接從專案目錄載入，若日後搬移或刪除專案，擴展程式會失效。如需長期使用，建議改採方式一，或先把 `chrome_extension` 複製到固定路徑再載入。
 
 ### 2. 驗證安裝結果
 
@@ -62,7 +61,7 @@
 
 - **載入後顯示「無法載入」或紅色錯誤**：通常是選錯資料夾（選到專案根目錄或上一層）所致。請確認選取的資料夾內直接包含 `manifest.json` 與 `background.js`。
 - **腳本沒有自動開啟管理頁面**：腳本透過模擬鍵盤輸入網址，偶爾會因視窗焦點問題失敗。請手動在 Chrome 網址列輸入 `chrome://extensions/` 即可。
-- **擴展程式莫名失效或消失**：若曾以方式二從專案目錄載入，專案被搬移後擴展會一併失效。改用方式一複製到固定位置可解決。
+- **擴展程式莫名失效或消失**：請確認你是從下載器資料夾內的 `chrome_extension`（`MultiSocksDownloader.exe` 旁）載入，而不是從可能被搬移或刪除的開發用專案目錄載入。若載入路徑的資料夾被刪除，擴展程式會一併失效，重新「載入未封裝項目」指向正確資料夾即可。
 
 ## 使用方法
 

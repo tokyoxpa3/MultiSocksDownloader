@@ -1356,7 +1356,7 @@ class DownloadManager:
         self.bt_resume_interval = 10  # BT resume 自動保存間隔（秒），最小 1 秒
         self.bt_max_connections = 200  # BT 直連線最大連線數，0 表示用 libtorrent 預設
         self.bt_proxy_max_connections = 30  # BT SOCKS5 代理線最大連線數（CGNAT 下可達 peer 少，壓低避免死連線 churn）
-        self.bt_max_tasks_per_line = 2  # 每條 SOCKS5 線路同時進行的 BT 任務數上限（5G-Proxy-Pro 握手執行緒有限；0 = 不提醒）
+        self.bt_max_tasks_per_line = 5  # 每條 SOCKS5 線路同時進行的 BT 任務數上限（5G-Proxy-Pro 握手執行緒有限；0 = 不提醒）
         self.bt_force_tcp = False     # 僅用 TCP（停用 uTP/UDP），UDP 被封的環境適用
         self.bt_listen_port = 6881    # BT 直連監聽埠，0 = 動態埠（配合 UPnP/NAT-PMP）
 
@@ -1500,6 +1500,32 @@ class DownloadManager:
                 json.dump(config, f, ensure_ascii=False)
         except Exception as e:
             logger.warning("儲存設定失敗: %s", e)
+
+    def reset_preferences(self):
+        """還原所有偏好設定到預設值，並寫回設定檔。
+
+        僅動可調參數；SOCKS5 代理（socks_proxies / next_proxy_id）與下載歷史
+        紀錄（history / next_history_id）均保留。bt_dht_autotune 不在設置頁
+        暴露、且變更需要重啟 DHT governor，故一併維持不變。
+        """
+        self.save_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        self.download_dirs = {self.save_dir}
+        self.default_chunks_per_part = 0   # 0 = 自適應切片
+        self.default_threads_per_proxy = 6
+
+        self.set_speed_limit(0)
+        self.set_bt_seed_hours(0)
+        self.set_bt_upload_rate(0)
+        self.set_bt_resume_interval(10)
+        self.set_bt_max_connections(200)
+        self.set_bt_proxy_max_connections(30)
+        self.set_bt_max_tasks_per_line(5)
+        self.set_bt_force_tcp(False)
+        self.set_bt_listen_port(6881)
+        self.set_custom_headers({})
+        self.auto_check_update = True
+
+        self.save_config()
 
     # ------------------------------------------------------------------ #
     # history（歷史下載紀錄）

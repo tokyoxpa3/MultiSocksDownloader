@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import threading
+import ctypes
 from collections import deque
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -32,6 +33,22 @@ def format_time(seconds):
         return f"{seconds/60:.0f}分{seconds%60:.0f}秒"
     else:
         return f"{seconds/3600:.0f}時{(seconds%3600)/60:.0f}分"
+
+
+class WheelProtectedSpinBox(QSpinBox):
+    """QSpinBox 子類：只有取得鍵盤焦點（點擊進入）時才回應滾輪。
+
+    設定頁放在 QScrollArea 內，滑鼠停在 spinbox 上方滾動時若直接改值，
+    使用者想捲動頁面卻會不小心改到設定。未聚焦時忽略滾輪事件，
+    讓事件往上傳給捲動區域來捲動頁面。
+    """
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
 
 # SOCKS5代理測試線程
 class ProxyTester(QThread):
@@ -1106,29 +1123,22 @@ class MainWindow(QMainWindow):
         history_layout.addWidget(self.history_table)
 
         # === 設置標籤頁 ===
+        # 將設置內容包進 QScrollArea：視窗高度縮小時改以捲動呈現，
+        # 避免 QFormLayout 的標籤列被壓扁、上下交疊而看不到部分設定文字。
         settings_tab = QWidget()
-        settings_layout = QVBoxLayout(settings_tab)
+        settings_outer_layout = QVBoxLayout(settings_tab)
+        settings_outer_layout.setContentsMargins(0, 0, 0, 0)
 
-        # HTTP 伺服器（供 Chrome 擴充功能連線）
-        server_group = QGroupBox("HTTP 伺服器（供 Chrome 擴充功能連線）")
-        server_vlayout = QHBoxLayout(server_group)
-        server_label = QLabel("位址:")
-        self.server_url_label = QLabel("http://localhost:8765")
-        self.server_url_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.server_status_label = QLabel("啟動中...")
-        copy_url_btn = QPushButton("複製")
-        copy_url_btn.clicked.connect(self.copy_server_url)
-        server_vlayout.addWidget(server_label)
-        server_vlayout.addWidget(self.server_url_label)
-        server_vlayout.addWidget(self.server_status_label)
-        server_vlayout.addWidget(copy_url_btn)
-        server_vlayout.addStretch()
-        settings_layout.addWidget(server_group)
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        settings_container = QWidget()
+        settings_layout = QVBoxLayout(settings_container)
+        settings_scroll.setWidget(settings_container)
+        settings_outer_layout.addWidget(settings_scroll)
 
-        # 儲存設定
-        save_group = QGroupBox("儲存設定")
-        save_form = QFormLayout(save_group)
-
+        # 預設儲存目錄：路徑可能很長，獨立成一個整列欄位置於最上方。
+        dir_form = QFormLayout()
         self.dir_input = QLineEdit()
         self.dir_input.setReadOnly(True)
         dir_button = QPushButton("瀏覽...")
@@ -1136,33 +1146,36 @@ class MainWindow(QMainWindow):
         dir_row = QHBoxLayout()
         dir_row.addWidget(self.dir_input)
         dir_row.addWidget(dir_button)
-        save_form.addRow("預設儲存目錄:", dir_row)
+        dir_form.addRow("預設儲存目錄:", dir_row)
+        settings_layout.addLayout(dir_form)
 
-        self.speed_limit_spinbox = QSpinBox()
+        # 下方分左右兩欄：左為「下載預設值」，右為「其他」。
+        cols_row = QHBoxLayout()
+        cols_row.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        # 下載預設值（左欄）
+        dl_group = QGroupBox("下載預設值")
+        dl_form = QFormLayout(dl_group)
+
+        self.speed_limit_spinbox = WheelProtectedSpinBox()
         self.speed_limit_spinbox.setRange(0, 1024 * 1024)
         self.speed_limit_spinbox.setValue(0)
         self.speed_limit_spinbox.setSpecialValueText("不限速")
         self.speed_limit_spinbox.valueChanged.connect(self.on_speed_limit_changed)
-        save_form.addRow("全域限速 (KB/s):", self.speed_limit_spinbox)
+        dl_form.addRow("全域限速 (KB/s):", self.speed_limit_spinbox)
 
-        settings_layout.addWidget(save_group)
-
-        # 下載預設值
-        dl_group = QGroupBox("下載預設值")
-        dl_form = QFormLayout(dl_group)
-
-        self.chunks_spinbox = QSpinBox()
+        self.chunks_spinbox = WheelProtectedSpinBox()
         self.chunks_spinbox.setRange(0, 2000)
         self.chunks_spinbox.setValue(0)
         self.chunks_spinbox.setSpecialValueText("自動")
         dl_form.addRow("分片數:", self.chunks_spinbox)
 
-        self.threads_per_proxy_spinbox = QSpinBox()
+        self.threads_per_proxy_spinbox = WheelProtectedSpinBox()
         self.threads_per_proxy_spinbox.setRange(1, 32)
         self.threads_per_proxy_spinbox.setValue(6)
         dl_form.addRow("每代理線程數:", self.threads_per_proxy_spinbox)
 
-        self.bt_seed_spinbox = QSpinBox()
+        self.bt_seed_spinbox = WheelProtectedSpinBox()
         self.bt_seed_spinbox.setRange(0, 720)  # 最多 30 天
         self.bt_seed_spinbox.setValue(0)
         self.bt_seed_spinbox.setSpecialValueText("不做種")
@@ -1170,21 +1183,21 @@ class MainWindow(QMainWindow):
         self.bt_seed_spinbox.valueChanged.connect(self.on_bt_seed_hours_changed)
         dl_form.addRow("BT 做種時數:", self.bt_seed_spinbox)
 
-        self.bt_upload_limit_spinbox = QSpinBox()
+        self.bt_upload_limit_spinbox = WheelProtectedSpinBox()
         self.bt_upload_limit_spinbox.setRange(0, 1024 * 1024)
         self.bt_upload_limit_spinbox.setValue(0)
         self.bt_upload_limit_spinbox.setSpecialValueText("不限速")
         self.bt_upload_limit_spinbox.valueChanged.connect(self.on_bt_upload_limit_changed)
         dl_form.addRow("BT 上傳限速 (KB/s):", self.bt_upload_limit_spinbox)
 
-        self.bt_resume_interval_spinbox = QSpinBox()
+        self.bt_resume_interval_spinbox = WheelProtectedSpinBox()
         self.bt_resume_interval_spinbox.setRange(1, 600)
         self.bt_resume_interval_spinbox.setValue(10)
         self.bt_resume_interval_spinbox.setSuffix(" 秒")
         self.bt_resume_interval_spinbox.valueChanged.connect(self.on_bt_resume_interval_changed)
         dl_form.addRow("BT 續傳保存間隔:", self.bt_resume_interval_spinbox)
 
-        self.bt_max_connections_spinbox = QSpinBox()
+        self.bt_max_connections_spinbox = WheelProtectedSpinBox()
         self.bt_max_connections_spinbox.setRange(0, 1000)
         self.bt_max_connections_spinbox.setValue(200)
         self.bt_max_connections_spinbox.setSpecialValueText("不限")
@@ -1194,7 +1207,7 @@ class MainWindow(QMainWindow):
         self.bt_max_connections_spinbox.valueChanged.connect(self.on_bt_max_connections_changed)
         dl_form.addRow("BT 連線數上限（直連）:", self.bt_max_connections_spinbox)
 
-        self.bt_proxy_max_connections_spinbox = QSpinBox()
+        self.bt_proxy_max_connections_spinbox = WheelProtectedSpinBox()
         self.bt_proxy_max_connections_spinbox.setRange(0, 500)
         self.bt_proxy_max_connections_spinbox.setValue(30)
         self.bt_proxy_max_connections_spinbox.setSpecialValueText("不限")
@@ -1204,25 +1217,18 @@ class MainWindow(QMainWindow):
         self.bt_proxy_max_connections_spinbox.valueChanged.connect(self.on_bt_proxy_max_connections_changed)
         dl_form.addRow("BT 連線數上限（SOCKS5）:", self.bt_proxy_max_connections_spinbox)
 
-        self.bt_max_tasks_per_line_spinbox = QSpinBox()
+        self.bt_max_tasks_per_line_spinbox = WheelProtectedSpinBox()
         self.bt_max_tasks_per_line_spinbox.setRange(0, 20)
-        self.bt_max_tasks_per_line_spinbox.setValue(2)
+        self.bt_max_tasks_per_line_spinbox.setValue(5)
         self.bt_max_tasks_per_line_spinbox.setSpecialValueText("不提醒")
         self.bt_max_tasks_per_line_spinbox.setToolTip(
             "每條 SOCKS5 線路同時進行的 BT 任務數上限。"
             "5G-Proxy-Pro 的 SOCKS5 握手是阻塞式（執行緒池 192 條、握手逾時 3 秒），"
-            "同一條 5G 線路開太多 BT 任務會互相拖慢甚至丟連線（建議 2）。0 = 不提醒。")
+            "同一條 5G 線路開太多 BT 任務會互相拖慢甚至丟連線（建議 5）。0 = 不提醒。")
         self.bt_max_tasks_per_line_spinbox.valueChanged.connect(self.on_bt_max_tasks_per_line_changed)
         dl_form.addRow("每線同時 BT 任務上限:", self.bt_max_tasks_per_line_spinbox)
 
-        self.bt_force_tcp_checkbox = QCheckBox("BT 僅用 TCP 連線（停用 uTP/UDP）")
-        self.bt_force_tcp_checkbox.setToolTip(
-            "適用於 UDP 被封的環境（如 5G 行動網路 + SOCKS5 轉接）。"
-            "停用 uTP 後所有 peer 資料傳輸走 TCP，避免無效的 UDP 連線嘗試佔用資源、拖慢下載。")
-        self.bt_force_tcp_checkbox.toggled.connect(self.on_bt_force_tcp_changed)
-        dl_form.addRow(self.bt_force_tcp_checkbox)
-
-        self.bt_listen_port_spinbox = QSpinBox()
+        self.bt_listen_port_spinbox = WheelProtectedSpinBox()
         self.bt_listen_port_spinbox.setRange(0, 65535)
         self.bt_listen_port_spinbox.setValue(6881)
         self.bt_listen_port_spinbox.setSpecialValueText("動態埠")
@@ -1232,9 +1238,27 @@ class MainWindow(QMainWindow):
         self.bt_listen_port_spinbox.valueChanged.connect(self.on_bt_listen_port_changed)
         dl_form.addRow("BT 監聽埠（直連）:", self.bt_listen_port_spinbox)
 
-        settings_layout.addWidget(dl_group)
+        self.bt_force_tcp_checkbox = QCheckBox("BT 僅用 TCP 連線（停用 uTP/UDP）")
+        self.bt_force_tcp_checkbox.setToolTip(
+            "適用於 UDP 被封的環境（如 5G 行動網路 + SOCKS5 轉接）。"
+            "停用 uTP 後所有 peer 資料傳輸走 TCP，避免無效的 UDP 連線嘗試佔用資源、拖慢下載。")
+        self.bt_force_tcp_checkbox.toggled.connect(self.on_bt_force_tcp_changed)
+        dl_form.addRow(self.bt_force_tcp_checkbox)
 
-        # 其他
+        # 還原預設設定（移至下載預設值群組內）
+        self.reset_preferences_button = QPushButton("還原預設設定")
+        self.reset_preferences_button.setToolTip(
+            "還原儲存目錄、限速、下載預設值、BT 各項數值、自訂表頭與自動更新"
+            "到預設值；SOCKS5 代理與下載歷史紀錄不會被清除。")
+        self.reset_preferences_button.clicked.connect(self.on_reset_preferences)
+        reset_row = QHBoxLayout()
+        reset_row.addWidget(self.reset_preferences_button)
+        reset_row.addStretch()
+        dl_form.addRow(reset_row)
+
+        cols_row.addWidget(dl_group, 1)
+
+        # 其他（右欄）
         misc_group = QGroupBox("其他")
         misc_layout = QVBoxLayout(misc_group)
 
@@ -1246,9 +1270,9 @@ class MainWindow(QMainWindow):
         self.clipboard_checkbox.setToolTip("開啟後，複製網址/連結會自動加入下載")
         misc_layout.addWidget(self.clipboard_checkbox)
 
-        self.tray_checkbox = QCheckBox("最小化視窗時縮到系統匣")
-        self.tray_checkbox.setToolTip("開啟後，點最小化鈕會縮到系統匣繼續下載")
-        self.tray_checkbox.setChecked(True)
+        self.tray_checkbox = QCheckBox("關閉時縮到系統匣")
+        self.tray_checkbox.setToolTip("開啟後，點右上角關閉鈕會直接縮到系統匣繼續下載，不再詢問")
+        self.tray_checkbox.setChecked(False)
         misc_layout.addWidget(self.tray_checkbox)
 
         self.assoc_checkbox = QCheckBox("關聯 .torrent 檔案（設為預設開啟程式）")
@@ -1271,8 +1295,11 @@ class MainWindow(QMainWindow):
         self.update_status_label.setWordWrap(True)
         misc_layout.addWidget(self.update_status_label)
 
-        settings_layout.addWidget(misc_group)
-        settings_layout.addStretch()
+        cols_row.addWidget(misc_group, 1)
+
+        settings_layout.addLayout(cols_row)
+        # 把多餘的垂直空間推到最底部，避免「預設儲存目錄」列下方被撐出一大片空白
+        settings_layout.addStretch(1)
 
         # 將標籤頁添加到標籤頁小部件
         self.tab_widget.addTab(download_tab, "下載管理")
@@ -1317,6 +1344,10 @@ class MainWindow(QMainWindow):
         由 download_requested 信號觸發（已排入 UI 執行緒）。儲存路徑預設為全域
         儲存目錄，使用者可改到任意位置、也可改存檔名稱；取消則不建立任何任務。
         """
+        # 攔截到 Chrome 下載：先把主視窗帶到前景，否則「選擇儲存位置」對話框
+        # 可能被埋在瀏覽器後面，或主視窗縮到系統匣時根本看不到。
+        self.bring_to_front()
+
         url = request.get('url', '')
         if not url:
             return
@@ -2135,10 +2166,53 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def bring_to_front(self):
+        """把主視窗帶到前景並取得輸入焦點。
+
+        當攔截到 Chrome 下載連結時呼叫，讓「選擇儲存位置」對話框能立即出現在
+        使用者眼前。除 Qt 的還原／抬升／啟用外，再補上 Win32 ShowWindow /
+        SetForegroundWindow，克服 Windows 對背景程序搶佔前景的限制。
+        """
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        if sys.platform == 'win32':
+            try:
+                hwnd = int(self.winId())
+                user32 = ctypes.windll.user32
+                kernel32 = ctypes.windll.kernel32
+                # SW_RESTORE = 9：先確保視窗非最小化（縮到系統匣時靠這步還原）。
+                user32.ShowWindow(hwnd, 9)
+
+                # Windows 前景鎖會擋下背景程序直接搶佔焦點——Chrome 未縮小時
+                # 正是這種情況。把本執行緒的輸入佇列掛接到目前前景視窗的執行緒，
+                # 即可讓 SetForegroundWindow 放行。
+                foreground = user32.GetForegroundWindow()
+                fg_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+                cur_thread = kernel32.GetCurrentThreadId()
+                attached = bool(fg_thread) and fg_thread != cur_thread
+                if attached:
+                    user32.AttachThreadInput(fg_thread, cur_thread, True)
+                try:
+                    user32.BringWindowToTop(hwnd)
+                    user32.SetForegroundWindow(hwnd)
+                finally:
+                    if attached:
+                        user32.AttachThreadInput(fg_thread, cur_thread, False)
+            except Exception:
+                pass
+
     def quit_app(self):
         """真正結束程式（觸發 closeEvent 執行清理）。"""
         self._force_quit = True
         self.close()
+        # 視窗縮到系統匣時已用 hide() 隱藏，不再是「可見視窗」；Qt 的
+        # quitOnLastWindowClosed 只會在「最後一個可見視窗」關閉時才退出，
+        # 因此 close() 關閉隱藏視窗並不會讓事件迴圈結束。這裡補一次
+        # quit() 確保行程真正終止（closeEvent 已同步完成清理）。
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
+        QApplication.quit()
 
     def _minimize_to_tray(self):
         self.hide()
@@ -2157,24 +2231,15 @@ class MainWindow(QMainWindow):
                 3000,
             )
 
-    def changeEvent(self, event):
-        """最小化視窗時依設定縮到系統匣。"""
-        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
-            if (getattr(self, 'tray_checkbox', None) and self.tray_checkbox.isChecked()
-                    and QSystemTrayIcon.isSystemTrayAvailable()):
-                QTimer.singleShot(0, self._minimize_to_tray)
-        super().changeEvent(event)
-
     def _ask_close_action(self):
         """關閉時詢問要縮到系統匣或完全關閉，回傳 'tray' / 'quit' / 'cancel'。"""
         box = QMessageBox(self)
         box.setWindowTitle("關閉程式")
         box.setIcon(QMessageBox.Icon.Question)
         box.setText("要縮到系統匣繼續下載，還是完全關閉程式？")
-        box.setInformativeText("縮到系統匣後，下載會在背景繼續進行。")
+        box.setInformativeText("選擇「縮到系統匣」會記住此選擇，之後點關閉都直接縮到系統匣。")
         tray_btn = box.addButton("縮到系統匣", QMessageBox.ButtonRole.AcceptRole)
         quit_btn = box.addButton("完全關閉", QMessageBox.ButtonRole.DestructiveRole)
-        cancel_btn = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(tray_btn)
         box.exec()
 
@@ -2186,10 +2251,19 @@ class MainWindow(QMainWindow):
         return "cancel"
 
     def closeEvent(self, event):
-        # 點右上角關閉時，彈窗詢問要縮到系統匣或完全關閉
+        # 點右上角關閉時：已勾選「關閉時縮到系統匣」就直接縮到系統匣；
+        # 否則詢問要縮到系統匣或完全關閉，選「縮到系統匣」就記住此選擇。
         if not self._force_quit and QSystemTrayIcon.isSystemTrayAvailable():
+            close_to_tray = (getattr(self, 'tray_checkbox', None)
+                             and self.tray_checkbox.isChecked())
+            if close_to_tray:
+                self._minimize_to_tray()
+                event.ignore()
+                return
+
             action = self._ask_close_action()
             if action == "tray":
+                self.tray_checkbox.setChecked(True)
                 self._minimize_to_tray()
                 event.ignore()
                 return
@@ -2247,27 +2321,6 @@ class MainWindow(QMainWindow):
                 if task.status in ['downloading', 'initialized']:
                     print(f"自動開始恢復的任務: {task.filename}")
                     self.download_manager.start_task(task_id)
-
-    def update_server_status(self, url=None, is_running=False):
-        """更新 HTTP 伺服器狀態顯示"""
-        if url:
-            self.server_url_label.setText(url)
-
-        if is_running:
-            self.server_status_label.setText("運行中")
-            self.server_status_label.setStyleSheet("color: green;")
-        else:
-            self.server_status_label.setText("已停止")
-            self.server_status_label.setStyleSheet("color: red;")
-
-    def copy_server_url(self):
-        """複製伺服器 URL 到剪貼簿"""
-        url = self.server_url_label.text()
-        if url:
-            clipboard = QApplication.clipboard()
-            clipboard.setText(url)
-            # 顯示短暫的提示
-            self.statusBar().showMessage("已複製伺服器 URL 到剪貼簿", 2000)
 
     def copy_download_url(self, url):
         """複製下載URL到剪貼板"""
@@ -2396,6 +2449,62 @@ class MainWindow(QMainWindow):
         """切換「啟動時自動檢查更新」並儲存。"""
         self.download_manager.auto_check_update = checked
         self.download_manager.save_config()
+
+    def on_reset_preferences(self):
+        """確認後把偏好設定還原為預設值，並同步設置頁所有控制項。"""
+        reply = QMessageBox.question(
+            self, "還原預設設定",
+            "確定要還原所有偏好設定到預設值嗎？\n\n"
+            "會重置：儲存目錄、全域限速、下載預設值、BT 各項數值、\n"
+            "自訂表頭、自動更新等。\n"
+            "不會清除：SOCKS5 代理、下載歷史紀錄。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.download_manager.reset_preferences()
+
+        # 同步 UI 控制項；blockSignals 避免觸發各自的 on_*_changed 再寫設定檔。
+        self.dir_input.setText(self.download_manager.save_dir)
+        self.speed_limit_spinbox.blockSignals(True)
+        self.speed_limit_spinbox.setValue(0)
+        self.speed_limit_spinbox.blockSignals(False)
+        self.chunks_spinbox.blockSignals(True)
+        self.chunks_spinbox.setValue(0)
+        self.chunks_spinbox.blockSignals(False)
+        self.threads_per_proxy_spinbox.blockSignals(True)
+        self.threads_per_proxy_spinbox.setValue(6)
+        self.threads_per_proxy_spinbox.blockSignals(False)
+        self.bt_seed_spinbox.blockSignals(True)
+        self.bt_seed_spinbox.setValue(0)
+        self.bt_seed_spinbox.blockSignals(False)
+        self.bt_upload_limit_spinbox.blockSignals(True)
+        self.bt_upload_limit_spinbox.setValue(0)
+        self.bt_upload_limit_spinbox.blockSignals(False)
+        self.bt_resume_interval_spinbox.blockSignals(True)
+        self.bt_resume_interval_spinbox.setValue(10)
+        self.bt_resume_interval_spinbox.blockSignals(False)
+        self.bt_max_connections_spinbox.blockSignals(True)
+        self.bt_max_connections_spinbox.setValue(200)
+        self.bt_max_connections_spinbox.blockSignals(False)
+        self.bt_proxy_max_connections_spinbox.blockSignals(True)
+        self.bt_proxy_max_connections_spinbox.setValue(30)
+        self.bt_proxy_max_connections_spinbox.blockSignals(False)
+        self.bt_max_tasks_per_line_spinbox.blockSignals(True)
+        self.bt_max_tasks_per_line_spinbox.setValue(5)
+        self.bt_max_tasks_per_line_spinbox.blockSignals(False)
+        self.bt_force_tcp_checkbox.blockSignals(True)
+        self.bt_force_tcp_checkbox.setChecked(False)
+        self.bt_force_tcp_checkbox.blockSignals(False)
+        self.bt_listen_port_spinbox.blockSignals(True)
+        self.bt_listen_port_spinbox.setValue(6881)
+        self.bt_listen_port_spinbox.blockSignals(False)
+        self.auto_check_update_checkbox.blockSignals(True)
+        self.auto_check_update_checkbox.setChecked(True)
+        self.auto_check_update_checkbox.blockSignals(False)
+
+        self.statusBar().showMessage("已還原預設設定", 3000)
 
     def on_check_update_clicked(self):
         """使用者手動觸發「立即檢查更新」。"""
