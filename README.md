@@ -10,6 +10,8 @@
 > 否則本程式通往 SOCKS5 代理的連線會被 NetRedirector 再次轉送，
 > 導致**多代理聚合失效、速度變慢，甚至完全無法連線**。
 
+![NetRedirector 直連清單設定](docs/images/netredirector_bypass.png)
+
 > ## ⚠️ 搭配 5G-Proxy-Pro（手機 5G SOCKS5）注意事項
 >
 > 使用 [5G-Proxy-Pro](https://github.com/tokyoxpa3/5G-Proxy-Pro) 這類「手機 5G 架 SOCKS5」的線路時，
@@ -47,6 +49,10 @@
 - **BT 下載（magnet/.torrent）**：支援磁力連結與 `.torrent` 檔，以 libtorrent 為引擎；公開種子支援多線路聚合下載（多個 session 各綁定直連或 SOCKS5 代理、分片下載），private（PT）種子與選擇性下載（僅勾選部分檔案）維持單線路。
 - **Chrome 擴充功能**：攔截瀏覽器下載事件，自動把連結送進本程式（見 `chrome_extension/`）。
 - **區塊進度視覺**：磁碟叢集風格的區塊圖，即時顯示各分段下載狀態。
+
+## 畫面
+
+!![下載主畫面](docs/images/ui_download.png)
 
 ## 架構
 
