@@ -23,6 +23,14 @@ import zipfile
 
 import requests
 
+# CI（GitHub Actions）的 stdout 可能是 cp1252，print 中文會拋 UnicodeEncodeError；
+# 強制以 UTF-8 輸出，讓訊息在 CI 與本地都能正常列印。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
 
