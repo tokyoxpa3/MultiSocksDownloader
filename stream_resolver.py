@@ -17,9 +17,16 @@
 """
 
 import re
+import os
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+
+# 強制走非 lazy 的 extractor 載入路徑：lazy_extractors.py 是 yt-dlp 安裝時
+# 生成的單一巨型模組，Nuitka 打包會讓 MSVC 編譯器 heap 溢位（C1002），
+# 故建置時以 --nofollow-import-to 排除，執行期改由 _extractors 匯入各獨立
+# extractor 模組。
+os.environ.setdefault('YTDLP_NO_LAZY_EXTRACTORS', '1')
 
 # 模組層級匯入（讓 Nuitka 靜態打包能偵測到 yt-dlp）；未安裝時設為 None，
 # resolver 會回傳結構化錯誤而非拋例外。
