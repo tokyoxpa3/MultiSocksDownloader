@@ -47,6 +47,7 @@
 - **多線程分片**：檔案切成多個區塊（bitmap 追蹤），每個代理以多條線程同時抓取不同區塊。
 - **斷點續傳**：進度以 `.progress` 檔持久化，關閉程式後重啟可自動恢復未完成的任務。
 - **BT 下載（magnet/.torrent）**：支援磁力連結與 `.torrent` 檔，以 libtorrent 為引擎；公開種子支援多線路聚合下載（多個 session 各綁定直連或 SOCKS5 代理、分片下載），private（PT）種子與選擇性下載（僅勾選部分檔案）維持單線路。
+- **串流解析下載（YouTube 等影音網站）**：勾選「解析影片連結」後，用 yt-dlp 把影片/音訊網頁網址解析成單檔直連 URL，再交給現有的多代理分段引擎續傳；DASH/HLS 分段串流改走 yt-dlp 原生下載，並以內建 ffmpeg 合併視訊+音訊為 MP4，可選畫質（最高 4K）與 FPS 上限。DRM 加密串流會自動略過，不會試圖破解。
 - **Chrome 擴充功能**：攔截瀏覽器下載事件，自動把連結送進本程式（見 `chrome_extension/`）。
 - **區塊進度視覺**：磁碟叢集風格的區塊圖，即時顯示各分段下載狀態。
 
@@ -63,6 +64,7 @@
 - `ui.py` — PySide6 圖形介面
 - `http_server.py` — 接收 Chrome 擴充功能請求的本機 HTTP 伺服器
 - `logging_setup.py` — 全專案唯一的 logging 設定入口（`setup_logging(debug)`）
+- `fetch_ffmpeg.py` — 建置/發佈時下載 LGPL 版 ffmpeg 並打包（供串流視訊+音訊合併使用）
 - `MultiSocksDownloader.py` — 程式入口
 - `repro.py` — 無 GUI 的 headless 複現工具（`add_task → start_task` 全鏈路）
 - `chrome_extension/` — Chrome 擴充功能（Manifest V3）
