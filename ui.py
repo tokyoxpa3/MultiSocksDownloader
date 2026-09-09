@@ -3,6 +3,8 @@ import os
 import time
 import threading
 import ctypes
+import logging
+import shutil
 from collections import deque
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -17,13 +19,16 @@ from PySide6.QtCore import Qt, QTimer, Signal, QThread, QSize, QEvent, QPointF, 
 from PySide6.QtGui import QFont, QColor, QPainter, QPainterPath, QPen
 from urllib.parse import urlparse, unquote, parse_qs
 
-from downloader import DownloadManager, format_size
+from downloader import DownloadManager, format_size, probe_url_metadata, _sanitize_filename
+from stream_resolver import list_video_formats, is_direct_file
 from app_icon import load_app_icon
 import libtorrent as lt
 from bt_downloader import torrent_file_tree, magnet_display_name
 import file_association
 import version
 import updater
+
+logger = logging.getLogger('ui')
 
 # 格式化時間顯示
 def format_time(seconds):
@@ -36,15 +41,33 @@ def format_time(seconds):
 
 
 class WheelProtectedSpinBox(QSpinBox):
-    """QSpinBox 子類：只有取得鍵盤焦點（點擊進入）時才回應滾輪。
+    """QSpinBox 子類：只有被滑鼠點擊進入過、且目前仍持有焦點時才回應滾輪。
 
     設定頁放在 QScrollArea 內，滑鼠停在 spinbox 上方滾動時若直接改值，
-    使用者想捲動頁面卻會不小心改到設定。未聚焦時忽略滾輪事件，
+    使用者想捲動頁面卻會不小心改到設定。未點擊過時忽略滾輪事件，
     讓事件往上傳給捲動區域來捲動頁面。
+
+    注意：不能只靠 hasFocus()。視窗/分頁顯示時 spinbox 會自動取得鍵盤焦點
+    （FocusReason.ActiveWindowFocusReason），此時 hasFocus() 已為 True，
+    導致「未點擊卻回應滾輪」。因此用滑鼠點擊旗標 _wheel_armed 來區分。
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._wheel_armed = False
+
+    def mousePressEvent(self, event):
+        # 點擊（含文字區、上下箭頭）後才允許滾輪改值
+        self._wheel_armed = True
+        super().mousePressEvent(event)
+
+    def focusOutEvent(self, event):
+        # 失去焦點後關閉，需再次點擊才會重新啟用滾輪
+        self._wheel_armed = False
+        super().focusOutEvent(event)
+
     def wheelEvent(self, event):
-        if self.hasFocus():
+        if self._wheel_armed and self.hasFocus():
             super().wheelEvent(event)
         else:
             event.ignore()
@@ -63,27 +86,27 @@ class ProxyTester(QThread):
 
     def run(self):
         """執行測試"""
-        print(f"開始測試代理 {self.proxy_id}")
+        logger.debug("開始測試代理 %s", self.proxy_id)
         try:
             # 檢查是否被取消
             if self.is_canceled:
-                print(f"代理 {self.proxy_id} 測試已被取消")
+                logger.debug("代理 %s 測試已被取消", self.proxy_id)
                 return
 
             # 調用下載管理器的測試方法
             result = self.download_manager.test_socks_proxy(self.proxy_id)
             success, message = result
-            print(f"測試結果: success={success}, message={message}")
+            logger.debug("測試結果: success=%s, message=%s", success, message)
 
             # 檢查是否被取消
             if self.is_canceled:
-                print(f"代理 {self.proxy_id} 測試已被取消")
+                logger.debug("代理 %s 測試已被取消", self.proxy_id)
                 return
 
             # 測試完成後發送信號
             self.test_finished.emit(self.proxy_id)
         except Exception as e:
-            print(f"測試代理時出錯: {e}")
+            logger.exception("測試代理 %s 時出錯: %s", self.proxy_id, e)
             # 即使出錯也發送信號，確保UI更新
             if not self.is_canceled:
                 self.test_finished.emit(self.proxy_id)
@@ -91,7 +114,7 @@ class ProxyTester(QThread):
     def cancel(self):
         """取消測試"""
         self.is_canceled = True
-        print(f"代理 {self.proxy_id} 測試被標記為取消")
+        logger.debug("代理 %s 測試被標記為取消", self.proxy_id)
 
 # 單行分段進度條：每一小段依 frac 顯示部分填充
 class SegmentProgressBar(QWidget):
@@ -297,6 +320,25 @@ def extract_filename_from_url(url):
     return ''
 
 
+def disk_free(path):
+    """回傳 path 所在磁碟的剩餘位元組；無法判斷時回傳 None。"""
+    if not path:
+        return None
+    p = path.strip()
+    # 目錄可能尚未建立，沿路徑向上找第一個已存在的節點，再取其磁碟用量。
+    while p and not os.path.exists(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    if not p:
+        p = os.path.splitdrive(path)[0] or os.sep
+    try:
+        return shutil.disk_usage(p).free
+    except OSError:
+        return None
+
+
 # 分線 chip 配色（依序套用：直連綠、代理藍紫橙…）
 LINE_COLORS = ["#2ecc71", "#3498db", "#9b59b6", "#e67e22", "#1abc9c", "#e74c3c"]
 
@@ -412,12 +454,65 @@ class FlowLayout(QLayout):
         return y + line_height - rect.y() + self._margin
 
 
+# 畫質選項：(顯示文字, 最高畫素高度, 是否只要音訊)。
+# 高度為 None 且 audio_only=False 表示「最高畫質」；「僅音訊」設 audio_only=True。
+STREAM_QUALITY_OPTIONS = [
+    ("最高畫質", None, False),
+    ("2160p（4K）", 2160, False),
+    ("1440p（2K）", 1440, False),
+    ("1080p", 1080, False),
+    ("720p", 720, False),
+    ("480p", 480, False),
+    ("360p", 360, False),
+    ("僅音訊", None, True),
+]
+
+# FPS 選項：(顯示文字, 最高幀率)。None 表示自動。
+STREAM_FPS_OPTIONS = [
+    ("自動", None),
+    ("60", 60),
+    ("50", 50),
+    ("30", 30),
+    ("25", 25),
+    ("24", 24),
+]
+
+# 高度 → 顯示標籤（其餘直接用 f"{h}p"）。
+_HEIGHT_LABELS = {2160: "2160p（4K）", 1440: "1440p（2K）"}
+
+
+def _height_label(h):
+    return _HEIGHT_LABELS.get(h, f"{h}p")
+
+
 # 新增下載對話框：貼 URL → 自動帶出檔名（可自訂）→ 確認加入佇列
 class AddDownloadDialog(QDialog):
-    def __init__(self, parent=None, default_save_dir="", url=None, filename=None):
+    _probe_result = Signal(int, object)
+    _format_result = Signal(int, object)
+
+    def __init__(self, parent=None, default_save_dir="", url=None, filename=None,
+                 lock_url=True, show_resolve=True, download_manager=None,
+                 show_stream_options=True, auto_detect=False):
         super().__init__(parent)
         self.setWindowTitle("新增下載")
         self.setMinimumWidth(520)
+
+        self.download_manager = download_manager
+        self._auto_detect = auto_detect
+        self._detected_video = False
+        self._probe_gen = 0
+        self._probe_timer = QTimer(self)
+        self._probe_timer.setSingleShot(True)
+        self._probe_timer.setInterval(400)
+        self._probe_timer.timeout.connect(self._start_probe)
+        self._probe_result.connect(self._apply_probe_result)
+        self._probed_size = 0
+        self._format_gen = 0
+        self._format_result.connect(self._apply_format_result)
+        self._format_timer = QTimer(self)
+        self._format_timer.setSingleShot(True)
+        self._format_timer.setInterval(600)
+        self._format_timer.timeout.connect(self._list_formats_now)
 
         layout = QVBoxLayout(self)
 
@@ -432,6 +527,72 @@ class AddDownloadDialog(QDialog):
         self.name_edit.setPlaceholderText("留空則由程式自動判斷")
         layout.addWidget(self.name_edit)
 
+        self.size_label = QLabel("檔案大小：—")
+        self.size_label.setStyleSheet("color: #55606c;")
+        layout.addWidget(self.size_label)
+
+        # 「解析影片連結」選項：勾選＝先用 yt-dlp 解析出單檔直連網址再下載；
+        # 未勾選＝把網址當一般檔案直接下載。遠端攔截（已由擴充套件決定）時隱藏。
+        # 自動偵測模式下同樣隱藏：改由背景判斷自動決定是否解析。
+        self.resolve_checkbox = QCheckBox("解析影片連結（YouTube 等串流網站）")
+        self.resolve_checkbox.setToolTip(
+            "勾選後會先用 yt-dlp 解析出單檔直連網址再下載；"
+            "未勾選則把網址當作一般檔案直接下載。")
+        self.resolve_checkbox.setVisible(show_resolve and not auto_detect)
+        layout.addWidget(self.resolve_checkbox)
+
+        # 自動偵測狀態提示（僅 auto_detect 模式顯示）。
+        self.detect_label = QLabel("")
+        self.detect_label.setWordWrap(True)
+        self.detect_label.setVisible(auto_detect)
+        layout.addWidget(self.detect_label)
+
+        # 畫質 / FPS 選擇（僅在解析串流可用時顯示）。
+        # 有解析核取框時隨核取框啟停；遠端攔截已決定要解析（核取框隱藏）時直接啟用；
+        # 自動偵測模式則在偵測到影片後才顯示。
+        self._show_resolve = show_resolve
+        self._show_stream_options = show_stream_options
+
+        self._stream_container = QWidget()
+        stream_row = QHBoxLayout(self._stream_container)
+        stream_row.setContentsMargins(0, 0, 0, 0)
+        stream_row.addWidget(QLabel("畫質："))
+        self.quality_combo = QComboBox()
+        for label, height, audio_only in STREAM_QUALITY_OPTIONS:
+            self.quality_combo.addItem(label, (height, audio_only))
+        stream_row.addWidget(self.quality_combo)
+        stream_row.addWidget(QLabel("FPS："))
+        self.fps_combo = QComboBox()
+        for label, fps in STREAM_FPS_OPTIONS:
+            self.fps_combo.addItem(label, fps)
+        stream_row.addWidget(self.fps_combo)
+        stream_row.addStretch()
+        self._stream_row_layout = stream_row
+
+        # 初始可見性：非自動偵測且（有核取框或遠端已決定解析）時才顯示。
+        self._stream_row_visible = (not auto_detect) and (show_resolve or show_stream_options)
+        self._stream_container.setVisible(self._stream_row_visible)
+        layout.addWidget(self._stream_container)
+
+        def _sync_stream_options(checked=False):
+            if auto_detect:
+                enabled = self._detected_video
+            else:
+                enabled = checked if show_resolve else bool(show_stream_options)
+            self.quality_combo.setEnabled(enabled)
+            self.fps_combo.setEnabled(enabled)
+
+        self._sync_stream_options = _sync_stream_options
+        self.resolve_checkbox.toggled.connect(_sync_stream_options)
+        self.resolve_checkbox.toggled.connect(lambda _c: self._maybe_list_formats())
+        _sync_stream_options(self.resolve_checkbox.isChecked())
+
+        self._stream_error_label = QLabel("")
+        self._stream_error_label.setWordWrap(True)
+        self._stream_error_label.setStyleSheet("color: #e74c3c;")
+        self._stream_error_label.setVisible(False)
+        layout.addWidget(self._stream_error_label)
+
         layout.addWidget(QLabel("儲存位置："))
         dir_row = QHBoxLayout()
         self.dir_edit = QLineEdit(default_save_dir or "")
@@ -440,6 +601,10 @@ class AddDownloadDialog(QDialog):
         dir_row.addWidget(self.dir_edit)
         dir_row.addWidget(browse_btn)
         layout.addLayout(dir_row)
+
+        self.free_space_label = QLabel("")
+        self.free_space_label.setStyleSheet("color: #55606c;")
+        layout.addWidget(self.free_space_label)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -456,7 +621,8 @@ class AddDownloadDialog(QDialog):
         # 攔截下載模式：URL 已固定，鎖住編輯框；檔名可預填但仍可修改。
         if url:
             self.url_edit.setPlainText(url)
-            self.url_edit.setReadOnly(True)
+            if lock_url:
+                self.url_edit.setReadOnly(True)
             if filename:
                 self.name_edit.setText(filename)
             else:
@@ -464,19 +630,96 @@ class AddDownloadDialog(QDialog):
                 self._on_url_changed()
 
         self.url_edit.textChanged.connect(self._on_url_changed)
+        self.dir_edit.textChanged.connect(self._update_free_space)
+        self._update_free_space()
 
     def _on_url_changed(self):
         urls = self.urls()
+        self._probed_size = 0
         if not urls:
+            self.size_label.setText("檔案大小：—")
+            self._update_free_space()
             return
         name = extract_filename_from_url(urls[0])
         if name:
             self.name_edit.setText(name)
+        self._probe_timer.start()
+        self._maybe_list_formats()
+
+    def _start_probe(self):
+        urls = self.urls()
+        if not urls:
+            return
+        if len(urls) > 1:
+            self.size_label.setText(f"共 {len(urls)} 筆連結（不預覽大小）")
+            return
+        url = urls[0]
+        if urlparse(url).scheme.lower() not in ('http', 'https'):
+            self.size_label.setText("檔案大小：—")
+            return
+        self.size_label.setText("檔案大小：探測中…")
+        self._probe_gen += 1
+        gen = self._probe_gen
+        manager = self.download_manager
+        proxies = manager.get_available_proxies() if manager else []
+        headers = dict(getattr(manager, 'custom_headers', {}) or {})
+
+        def _run():
+            try:
+                result = probe_url_metadata(url, proxies=proxies, headers=headers)
+            except Exception:
+                result = None
+            try:
+                self._probe_result.emit(gen, result)
+            except RuntimeError:
+                pass  # 對話框已銷毀
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _apply_probe_result(self, gen, result):
+        if gen != self._probe_gen:
+            return  # 過期結果，捨棄
+        if not result:
+            self._probed_size = 0
+            self.size_label.setText("檔案大小：無法取得")
+            self._update_free_space()
+            return
+        size = result.get('size') or 0
+        self._probed_size = size
+        if size > 0:
+            self.size_label.setText(f"檔案大小：{format_size(size)}")
+        else:
+            self.size_label.setText("檔案大小：未知（串流或未提供）")
+        self._update_free_space()
+        fname = result.get('filename')
+        urls = self.urls()
+        if fname and urls:
+            current = self.name_edit.text().strip()
+            auto = extract_filename_from_url(urls[0])
+            # 只在使用者尚未自訂檔名時，才用伺服器的 Content-Disposition 覆寫
+            if not current or current == auto:
+                self.name_edit.setText(fname)
 
     def _browse_dir(self):
         d = QFileDialog.getExistingDirectory(self, "選擇儲存位置", self.dir_edit.text())
         if d:
             self.dir_edit.setText(d)
+
+    def _update_free_space(self):
+        d = self.dir_edit.text().strip()
+        free = disk_free(d)
+        if free is None:
+            self.free_space_label.setText("磁碟剩餘空間：—")
+            self.free_space_label.setStyleSheet("color: #55606c;")
+            return
+        text = f"磁碟剩餘空間：{format_size(free)}"
+        if self._probed_size and self._probed_size > free:
+            short = format_size(self._probed_size - free)
+            self.free_space_label.setText(f"{text}  ⚠ 空間不足，還差 {short}")
+            self.free_space_label.setStyleSheet("color: #e74c3c;")
+        else:
+            self.free_space_label.setText(text)
+            self.free_space_label.setStyleSheet("color: #55606c;")
 
     def _on_confirm(self):
         if not self.urls():
@@ -492,6 +735,182 @@ class AddDownloadDialog(QDialog):
 
     def filename(self):
         return self.name_edit.text().strip() or None
+
+    def resolve_stream(self):
+        if self._auto_detect:
+            return 'auto'
+        return self.resolve_checkbox.isChecked()
+
+    def stream_max_height(self):
+        """畫質選擇對應的最高畫素高度；None 表示不限（最高畫質）。"""
+        height, audio_only = self.quality_combo.currentData()
+        return height
+
+    def stream_audio_only(self):
+        """是否只要音訊。"""
+        height, audio_only = self.quality_combo.currentData()
+        return bool(audio_only)
+
+    def stream_max_fps(self):
+        """最高幀率；None 表示自動。"""
+        return self.fps_combo.currentData()
+
+    # ------------------------------------------------------------------ #
+    # 格式預覽：勾選解析後，背景抓取真實畫質/幀率填入選單，並提示可用範圍
+    # ------------------------------------------------------------------ #
+    def _maybe_list_formats(self):
+        """串流解析啟用且有單一影片網址時，觸發（延遲）格式查詢。"""
+        if self._auto_detect:
+            # 自動偵測：貼上/改網址就嘗試偵測，不用等核取框。
+            enabled = True
+        else:
+            enabled = ((self._show_resolve and self.resolve_checkbox.isChecked()) or
+                       (not self._show_resolve and self._show_stream_options))
+        if not enabled:
+            self._clear_format_options()
+            return
+        self._format_timer.start()
+
+    def _list_formats_now(self):
+        """背景解析可用畫質/幀率，不阻塞 UI。"""
+        urls = self.urls()
+        if len(urls) != 1:
+            self._clear_format_options()
+            return
+        url = urls[0]
+        if urlparse(url).scheme.lower() not in ('http', 'https'):
+            self._clear_format_options()
+            return
+        if is_direct_file(url):
+            self._clear_format_options()
+            return
+
+        if self._auto_detect:
+            self.detect_label.setText("偵測中…（判斷是否為影片）")
+            self.detect_label.setStyleSheet("color: #55606c;")
+
+        self._format_gen += 1
+        gen = self._format_gen
+        self._stream_error_label.setText("")
+        self._stream_error_label.setVisible(False)
+
+        headers = dict(getattr(self.download_manager, 'custom_headers', {}) or {})
+
+        def _run():
+            result = list_video_formats(url, headers=headers)
+            try:
+                self._format_result.emit(gen, result)
+            except RuntimeError:
+                pass  # 對話框已銷毀
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _apply_format_result(self, gen, result):
+        if gen != self._format_gen:
+            return
+        is_video = bool(result and result.ok and (result.heights or result.has_audio))
+        if self._auto_detect:
+            self._detected_video = is_video
+            self._stream_container.setVisible(is_video)
+            self._sync_stream_options()
+            if is_video:
+                self.detect_label.setText("已偵測到影片（自動解析）")
+                self.detect_label.setStyleSheet("color: #1a9c5c;")
+                self._stream_error_label.setText("")
+                self._stream_error_label.setVisible(False)
+                self._populate_format_options(result)
+                self._maybe_prefill_title(result)
+            else:
+                self.detect_label.setText("一般檔案下載（未偵測到影片）")
+                self.detect_label.setStyleSheet("color: #55606c;")
+                self._reset_quality_options()
+            return
+        if not result or not result.ok:
+            err = (result.error if result else '') or '未知錯誤'
+            self._stream_error_label.setText(
+                f"無法解析影片：{err}（可能不存在、已刪除、私人或需登入）")
+            self._stream_error_label.setVisible(True)
+            self._reset_quality_options()
+            return
+        self._stream_error_label.setText("")
+        self._stream_error_label.setVisible(False)
+        self._populate_format_options(result)
+        self._maybe_prefill_title(result)
+
+    def _populate_format_options(self, result):
+        heights = result.heights or []
+        fpses = result.fps_values or []
+        has_audio = bool(result.has_audio)
+
+        # 畫質下拉：保留「最高畫質」與實際可用的高度；有音訊軌才加「僅音訊」。
+        prev_q = self.quality_combo.currentData()
+        self.quality_combo.blockSignals(True)
+        self.quality_combo.clear()
+        self.quality_combo.addItem("最高畫質", (None, False))
+        for h in heights:
+            self.quality_combo.addItem(_height_label(h), (h, False))
+        if has_audio:
+            self.quality_combo.addItem("僅音訊", (None, True))
+        for i in range(self.quality_combo.count()):
+            if self.quality_combo.itemData(i) == prev_q:
+                self.quality_combo.setCurrentIndex(i)
+                break
+        self.quality_combo.blockSignals(False)
+
+        # FPS 下拉：保留「自動」與實際可用的幀率。
+        prev_fps = self.fps_combo.currentData()
+        self.fps_combo.blockSignals(True)
+        self.fps_combo.clear()
+        self.fps_combo.addItem("自動", None)
+        for f in fpses:
+            self.fps_combo.addItem(str(f), f)
+        for i in range(self.fps_combo.count()):
+            if self.fps_combo.itemData(i) == prev_fps:
+                self.fps_combo.setCurrentIndex(i)
+                break
+        self.fps_combo.blockSignals(False)
+
+    def _maybe_prefill_title(self, result):
+        """解析成功後，用影片標題預填「存檔名稱」（僅在使用者尚未自訂時）。
+
+        只填標題本身、不含副檔名——副檔名在開始下載時由解析結果補上，
+        使用者不需要在此決定副檔名。
+        """
+        title = getattr(result, 'title', '') or ''
+        if not title:
+            return
+        urls = self.urls()
+        if len(urls) != 1:
+            return
+        current = self.name_edit.text().strip()
+        auto = extract_filename_from_url(urls[0])
+        if not current or current == auto:
+            self.name_edit.setText(_sanitize_filename(title))
+
+    def _clear_format_options(self):
+        """清除格式預覽與錯誤訊息，並還原預設選單。"""
+        self._format_gen += 1
+        self._stream_error_label.setText("")
+        self._stream_error_label.setVisible(False)
+        self._reset_quality_options()
+        if self._auto_detect:
+            self._detected_video = False
+            self._stream_container.setVisible(False)
+            self._sync_stream_options()
+            self.detect_label.setText("一般檔案下載" if self.urls() else "")
+            self.detect_label.setStyleSheet("color: #55606c;")
+
+    def _reset_quality_options(self):
+        self.quality_combo.blockSignals(True)
+        self.quality_combo.clear()
+        for label, height, audio_only in STREAM_QUALITY_OPTIONS:
+            self.quality_combo.addItem(label, (height, audio_only))
+        self.quality_combo.blockSignals(False)
+        self.fps_combo.blockSignals(True)
+        self.fps_combo.clear()
+        for label, fps in STREAM_FPS_OPTIONS:
+            self.fps_combo.addItem(label, fps)
+        self.fps_combo.blockSignals(False)
 
     def save_dir(self):
         return self.dir_edit.text().strip()
@@ -828,6 +1247,11 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         self._tray_hint_shown = False
 
+        # 「新增下載」視窗開啟狀態；避免 Chrome / 剪貼簿等多個觸發同時彈出多個視窗。
+        self._add_dialog_open = False
+        # 開啟「新增下載」視窗期間累積的遠端下載請求，待目前視窗關閉後逐一處理。
+        self._pending_download_requests = []
+
         self.setup_ui()  # 首先設置 UI，確保 task_table 被初始化
 
         # 更新保存目錄顯示
@@ -905,7 +1329,7 @@ class MainWindow(QMainWindow):
         count = self.download_manager.scan_unfinished_tasks()
         if count > 0:
             # 不再顯示確認對話框，直接恢復
-            print(f"已自動恢復 {count} 個未完成的下載任務")
+            logger.info("已自動恢復 %d 個未完成的下載任務", count)
             # 將恢復的任務添加到任務列表
             self.display_restored_tasks()
 
@@ -1329,14 +1753,27 @@ class MainWindow(QMainWindow):
 
     def add_download(self):
         """開啟「新增下載」對話框，確認後加入任務佇列。"""
-        dialog = AddDownloadDialog(self, self.download_manager.save_dir)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        if self._add_dialog_open:
             return
-        self._add_urls(
-            dialog.urls(),
-            filename=dialog.filename(),
-            save_dir=dialog.save_dir(),
-        )
+        self._add_dialog_open = True
+        try:
+            dialog = AddDownloadDialog(self, self.download_manager.save_dir,
+                                      download_manager=self.download_manager,
+                                      auto_detect=True)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            self._add_urls(
+                dialog.urls(),
+                filename=dialog.filename(),
+                save_dir=dialog.save_dir(),
+                resolve_stream=dialog.resolve_stream(),
+                stream_max_height=dialog.stream_max_height(),
+                stream_max_fps=dialog.stream_max_fps(),
+                stream_audio_only=dialog.stream_audio_only(),
+            )
+        finally:
+            self._add_dialog_open = False
+            self._drain_pending_requests()
 
     def _on_remote_download_request(self, request):
         """攔截下載請求：跳出「新增下載」對話框（URL 鎖住），讓使用者改檔名與儲存位置。
@@ -1344,49 +1781,94 @@ class MainWindow(QMainWindow):
         由 download_requested 信號觸發（已排入 UI 執行緒）。儲存路徑預設為全域
         儲存目錄，使用者可改到任意位置、也可改存檔名稱；取消則不建立任何任務。
         """
-        # 攔截到 Chrome 下載：先把主視窗帶到前景，否則「選擇儲存位置」對話框
+        # 攔截到 Chrome 下載：先把主視窗帶到前景並切到下載管理分頁，否則對話框
         # 可能被埋在瀏覽器後面，或主視窗縮到系統匣時根本看不到。
         self.bring_to_front()
+        self._switch_to_download_tab()
 
         url = request.get('url', '')
         if not url:
             return
+
+        # 已有一個「新增下載」視窗開啟時，先排入佇列，待目前視窗關閉後再依序處理，
+        # 避免同時跳出多個視窗互相遮蔽。
+        if self._add_dialog_open:
+            self._pending_download_requests.append(request)
+            return
+
+        self._process_remote_download_request(request)
+
+    def _process_remote_download_request(self, request):
+        """開啟「新增下載」對話框處理單一遠端下載請求（URL 鎖住）。"""
+        url = request.get('url', '')
         filename = request.get('filename')
         headers = request.get('headers')
         chunks_per_part = request.get('chunks_per_part', 0)
         threads_per_proxy = request.get('threads_per_proxy', 6)
+        resolve_stream = request.get('resolve_stream', False)
         default_dir = request.get('save_dir') or self.download_manager.save_dir
 
-        # URL 已固定（鎖住不可編輯），檔名與儲存位置留給使用者設定。
-        dialog = AddDownloadDialog(self, default_dir, url=url, filename=filename)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        save_dir = dialog.save_dir()
-        filename = dialog.filename()
-
+        self._add_dialog_open = True
         try:
-            task_id = self.download_manager.add_task(
-                url,
-                filename,
-                save_dir=save_dir,
-                use_proxy=True,
-                chunks_per_part=chunks_per_part,
-                threads_per_proxy=threads_per_proxy,
-                headers=headers,
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "錯誤", f"添加下載任務失敗:\n{e}")
+            # URL 已固定（鎖住不可編輯），檔名與儲存位置留給使用者設定。
+            # 「是否解析串流」由擴充套件在右鍵選單已決定，這裡不顯示核取框。
+            dialog = AddDownloadDialog(self, default_dir, url=url, filename=filename,
+                                      show_resolve=False, download_manager=self.download_manager,
+                                      show_stream_options=resolve_stream)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            save_dir = dialog.save_dir()
+            filename = dialog.filename()
+
+            try:
+                task_id = self.download_manager.add_task(
+                    url,
+                    filename,
+                    save_dir=save_dir,
+                    use_proxy=True,
+                    chunks_per_part=chunks_per_part,
+                    threads_per_proxy=threads_per_proxy,
+                    headers=headers,
+                    resolve_stream=resolve_stream,
+                    stream_max_height=dialog.stream_max_height(),
+                    stream_max_fps=dialog.stream_max_fps(),
+                    stream_audio_only=dialog.stream_audio_only(),
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "錯誤", f"添加下載任務失敗:\n{e}")
+                return
+
+            self.add_task_to_table(task_id, self.download_manager.task_ids[task_id])
+            threading.Thread(
+                target=self._start_task_in_background,
+                args=(task_id, url),
+                daemon=True,
+            ).start()
+            self.statusBar().showMessage(f"已加入下載: {url[:60]}", 4000)
+        finally:
+            self._add_dialog_open = False
+            self._drain_pending_requests()
+
+    def _switch_to_download_tab(self):
+        """切換到下載管理分頁（index 0）。"""
+        if getattr(self, 'tab_widget', None) is not None and self.tab_widget.currentIndex() != 0:
+            self.tab_widget.setCurrentIndex(0)
+
+    def _drain_pending_requests(self):
+        """「新增下載」視窗關閉後，依序處理期間累積的遠端下載請求。
+
+        只處理一個，其餘交由該請求關閉後的遞迴鏈接續；flag 避免重入時多開視窗。
+        """
+        if self._add_dialog_open:
             return
+        if not self._pending_download_requests:
+            return
+        next_request = self._pending_download_requests.pop(0)
+        self._process_remote_download_request(next_request)
 
-        self.add_task_to_table(task_id, self.download_manager.task_ids[task_id])
-        threading.Thread(
-            target=self._start_task_in_background,
-            args=(task_id, url),
-            daemon=True,
-        ).start()
-        self.statusBar().showMessage(f"已加入下載: {url[:60]}", 4000)
-
-    def _add_urls(self, urls, filename=None, silent=False, save_dir=None):
+    def _add_urls(self, urls, filename=None, silent=False, save_dir=None,
+                  resolve_stream=False, stream_max_height=None,
+                  stream_max_fps=None, stream_audio_only=False):
         """新增一批 URL 下載任務。回傳是否至少新增了一個任務。"""
         if not urls:
             return False
@@ -1416,7 +1898,11 @@ class MainWindow(QMainWindow):
                     save_dir=save_dir,
                     use_proxy=True,
                     chunks_per_part=chunks_per_part,
-                    threads_per_proxy=threads_per_proxy
+                    threads_per_proxy=threads_per_proxy,
+                    resolve_stream=resolve_stream,
+                    stream_max_height=stream_max_height,
+                    stream_max_fps=stream_max_fps,
+                    stream_audio_only=stream_audio_only,
                 )
 
                 # 立即把任務加到表格（狀態先顯示為初始化）
@@ -1432,7 +1918,7 @@ class MainWindow(QMainWindow):
                 added += 1
 
             except Exception as e:
-                print(f"下載任務添加失敗: {e}")
+                logger.exception("下載任務添加失敗: %s", e)
                 if not silent:
                     QMessageBox.critical(self, "錯誤", f"添加下載任務失敗:\n{e}\n\nURL: {url}")
         return added > 0
@@ -1545,18 +2031,55 @@ class MainWindow(QMainWindow):
         if first == getattr(self, '_last_clipboard_url', None):
             return
         self._last_clipboard_url = first
-        if self._add_urls([first], silent=True):
-            self.statusBar().showMessage(f"已自動加入下載: {first[:60]}", 4000)
+
+        # 偵測到下載連結：把主視窗帶到前景並切到下載管理分頁，再彈出「新增下載」
+        # 對話框讓使用者確認，而非直接下載。
+        self.bring_to_front()
+        self._switch_to_download_tab()
+
+        # 已有「新增下載」視窗開啟時不再重複彈出，避免多個視窗互相遮蔽。
+        if self._add_dialog_open:
+            return
+        self._open_clipboard_add_dialog(first)
+
+    def _open_clipboard_add_dialog(self, url):
+        """剪貼簿偵測到的連結：跳出「新增下載」對話框，確認後加入佇列。"""
+        self._add_dialog_open = True
+        try:
+            # 剪貼簿來源 URL 預填但可編輯（貼上的可能是多行，讓使用者自行調整）。
+            dialog = AddDownloadDialog(self, self.download_manager.save_dir, url=url,
+                                      lock_url=False, download_manager=self.download_manager,
+                                      auto_detect=True)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            self._add_urls(
+                dialog.urls(),
+                filename=dialog.filename(),
+                save_dir=dialog.save_dir(),
+                resolve_stream=dialog.resolve_stream(),
+                stream_max_height=dialog.stream_max_height(),
+                stream_max_fps=dialog.stream_max_fps(),
+                stream_audio_only=dialog.stream_audio_only(),
+            )
+        finally:
+            self._add_dialog_open = False
+            self._drain_pending_requests()
 
     def _start_task_in_background(self, task_id, url):
         """在背景執行緒啟動下載任務，避免 start_task 的網路探測阻塞 UI。"""
         try:
             if not self.download_manager.start_task(task_id):
-                print(f"任務 {task_id} 啟動失敗: {url}")
+                task = self.download_manager.task_ids.get(task_id)
+                status = getattr(task, 'status', '?') if task else '?'
+                err = getattr(task, 'error_message', '') if task else ''
+                logger.error(
+                    "event=start_task_failed task_id=%s url=%s status=%s error_reason=%s error=%s",
+                    task_id, url, status, getattr(task, 'error_reason', '') if task else '',
+                    err)
                 # 失敗時 start_task 已把 task.status 設為 'error'，
                 # MonitorThread 會自動把狀態同步到表格。
         except Exception as e:
-            print(f"任務 {task_id} 執行失敗: {e}")
+            logger.exception("任務 %s 執行失敗", task_id)
 
     def add_task_to_table(self, task_id, task):
         # 去重：同一個 task_id 只應在表格中出現一次。相同磁力/URL 加入時，
@@ -1617,7 +2140,8 @@ class MainWindow(QMainWindow):
             # 已完成任務已移入歷史紀錄，不再顯示於下載管理列表
             if task.status == 'completed':
                 return
-            print(f"檢測到新任務 (可能來自 HTTP 伺服器): {task.filename}，添加到 UI 表格")
+                logger.info("檢測到新任務 (可能來自 HTTP 伺服器): %s，添加到 UI 表格",
+                            task.filename)
             self.add_task_to_table(task_id, task)
 
         # 查找對應的行（可能是剛添加的）
@@ -1760,7 +2284,7 @@ class MainWindow(QMainWindow):
                 self._tray_icon.showMessage("下載完成", msg, QSystemTrayIcon.MessageIcon.Information, 5000)
                 return
         except Exception as e:
-            print(f"系統列通知失敗: {e}")
+            logger.debug("系統列通知失敗: %s", e)
         # 退回：警告主視窗 + 狀態列訊息
         QApplication.instance().alert(self)
         self.statusBar().showMessage(msg, 5000)
@@ -2281,24 +2805,24 @@ class MainWindow(QMainWindow):
 
         # 先嘗試優雅地取消所有測試線程
         for proxy_id, tester in list(self.proxy_testers.items()):
-            print(f"嘗試取消代理 {proxy_id} 的測試...")
+            logger.debug("嘗試取消代理 %s 的測試...", proxy_id)
             tester.cancel()
 
         # 然後等待它們完成
         for proxy_id, tester in list(self.proxy_testers.items()):
-            print(f"等待代理 {proxy_id} 的測試線程完成...")
+            logger.debug("等待代理 %s 的測試線程完成...", proxy_id)
             if not tester.wait(2000):  # 最多等待2秒
-                print(f"代理 {proxy_id} 的測試線程無法在2秒內完成，將被強制終止")
+                logger.warning("代理 %s 的測試線程無法在2秒內完成，將被強制終止", proxy_id)
                 try:
                     # 斷開連接信號以避免在對象被銷毀後調用
                     tester.test_finished.disconnect()
                 except Exception as e:
-                    print(f"斷開信號連接時出錯: {e}")
+                    logger.debug("斷開信號連接時出錯: %s", e)
 
         # 暫停所有仍在下載的任務，確保進度保存
         for task_id, task in self.download_manager.task_ids.items():
             if task.status == 'downloading':
-                print(f"關閉應用程式時自動暫停下載任務: {task.filename}")
+                logger.info("關閉應用程式時自動暫停下載任務: %s", task.filename)
                 self.download_manager.pause_task(task_id)
 
         # 保存配置文件
@@ -2308,18 +2832,18 @@ class MainWindow(QMainWindow):
 
     def display_restored_tasks(self):
         """將恢復的未完成任務顯示到任務列表中"""
-        print("添加恢復的任務到列表中...")
+        logger.info("添加恢復的任務到列表中...")
         tasks = self.download_manager.get_all_tasks()
         for task_info in tasks:
             task_id = task_info['id']
             task = self.download_manager.task_ids.get(task_id)
             if task:
-                print(f"添加恢復的任務到列表: {task.filename}")
+                logger.info("添加恢復的任務到列表: %s", task.filename)
                 self.add_task_to_table(task_id, task)
                 # 如果任務狀態是暫停的，保持暫停狀態
                 # 如果是下載中或初始化狀態的，則自動開始下載
                 if task.status in ['downloading', 'initialized']:
-                    print(f"自動開始恢復的任務: {task.filename}")
+                    logger.info("自動開始恢復的任務: %s", task.filename)
                     self.download_manager.start_task(task_id)
 
     def copy_download_url(self, url):
@@ -2619,13 +3143,13 @@ class MainWindow(QMainWindow):
     def event(self, event):
         """處理事件，主要用於在應用激活時更新下載列表"""
         if event.type() == QEvent.Type.WindowActivate:
-            print("窗口激活，刷新任務列表")
+            logger.debug("窗口激活，刷新任務列表")
             tasks = self.download_manager.get_all_tasks()
             for task in tasks:
                 self.update_task_progress(task)
         elif event.type() == QEvent.Type.User:
             # 刷新任務列表
-            print("處理自定義事件：刷新任務列表")
+            logger.debug("處理自定義事件：刷新任務列表")
             tasks = self.download_manager.get_all_tasks()
             for task_info in tasks:
                 task_id = task_info['id']
@@ -2641,7 +3165,8 @@ class MainWindow(QMainWindow):
 
                     # 如果任務不在表格中，添加它
                     if not found:
-                        print(f"添加新任務到表格: ID={task_id}, 檔案名={task.filename}")
+                        logger.info("添加新任務到表格: ID=%s, 檔案名=%s",
+                                    task_id, task.filename)
                         self.add_task_to_table(task_id, task)
             return True
 
@@ -2729,7 +3254,7 @@ class MainWindow(QMainWindow):
         """測試SOCKS5代理連接"""
         # 檢查是否已有測試線程在運行
         if proxy_id in self.proxy_testers and self.proxy_testers[proxy_id].isRunning():
-            print(f"代理 {proxy_id} 測試已在進行中，忽略請求")
+            logger.debug("代理 %s 測試已在進行中，忽略請求", proxy_id)
             return
 
         # 先標記為測試中狀態
@@ -2755,7 +3280,7 @@ class MainWindow(QMainWindow):
 
     def on_proxy_test_finished(self, proxy_id):
         """代理測試完成的回調"""
-        print(f"代理 {proxy_id} 測試完成，刷新UI顯示")
+        logger.debug("代理 %s 測試完成，刷新UI顯示", proxy_id)
         # 直接從下載管理器獲取最新狀態
         self.refresh_proxy_status(proxy_id)
 
@@ -2765,14 +3290,14 @@ class MainWindow(QMainWindow):
             self.proxy_testers[proxy_id].wait()
             # 移除線程引用
             self.proxy_testers.pop(proxy_id, None)
-            print(f"代理 {proxy_id} 的測試線程已安全結束")
+            logger.debug("代理 %s 的測試線程已安全結束", proxy_id)
 
     def refresh_proxy_status(self, proxy_id):
         """從下載管理器刷新代理狀態"""
         # 獲取最新狀態
         if proxy_id in self.download_manager.socks_proxies:
             status = self.download_manager.socks_proxies[proxy_id]['status']
-            print(f"從下載管理器獲取到代理 {proxy_id} 的最新狀態: {status}")
+            logger.debug("從下載管理器獲取到代理 %s 的最新狀態: %s", proxy_id, status)
 
             # 更新UI顯示
             self.update_proxy_status(proxy_id, status)
@@ -2785,10 +3310,10 @@ class MainWindow(QMainWindow):
                     if test_button:
                         test_button.setEnabled(True)
                         test_button.setText("測試")
-                        print(f"測試按鈕已恢復")
+                        logger.debug("測試按鈕已恢復")
                     break
         else:
-            print(f"代理 {proxy_id} 不存在於下載管理器中")
+            logger.debug("代理 %s 不存在於下載管理器中", proxy_id)
 
     def show_socks_context_menu(self, position):
         """顯示SOCKS5代理右鍵功能表"""
@@ -2977,7 +3502,7 @@ class MainWindow(QMainWindow):
                     try:
                         os.remove(filepath)
                     except Exception as exc:
-                        print(f"刪除檔案失敗: {filepath} - {exc}")
+                        logger.warning("刪除檔案失敗: %s - %s", filepath, exc)
             self.download_manager.remove_history(e.get('id'))
 
         # 從表格移除選取的列

@@ -7,7 +7,7 @@
      避免手動改兩處（Nuitka 會把常數字面量凍進二進位檔）。
 """
 
-APP_VERSION = "1.7.0"                      # 唯一版本來源，發佈前手動遞增
+APP_VERSION = "1.8.0"                      # 唯一版本來源，發佈前手動遞增
 GITHUB_REPO = "tokyoxpa3/MultiSocksDownloader"
 UPDATE_API_URL = "https://api.github.com/repos/{}/releases/latest".format(GITHUB_REPO)
 

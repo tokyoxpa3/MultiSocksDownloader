@@ -1,12 +1,14 @@
 import os
+import sys
 import time
 import json
 import logging
 import threading
 import re
+import random
 import base64
 from collections import deque
-from urllib.parse import urlparse, unquote, parse_qs, quote
+from urllib.parse import urlparse, urlunparse, unquote, parse_qs, quote
 
 import requests
 import urllib3
@@ -14,6 +16,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from ftp_downloader import SocksFTP, parse_ftp_url
 from bt_downloader import BTTask, DHTService, DHTGovernor, source_kind, bt_info_hash
+import stream_resolver
+from stream_resolver import YtDlpStreamResolver, build_native_format_selector
 
 logger = logging.getLogger('downloader')
 
@@ -23,9 +27,14 @@ MIN_BLOCKS = 1
 MAX_BLOCKS = 4096
 
 # 前沿串流：每個 HTTP Range 請求一次涵蓋的連續位元組目標量。
-# 區塊仍是進度/續傳的最小單位，但一次請求會抓一大段（約 64 MiB），
-# 把網站每次簽章/跳轉的固定延遲攤平，避免每塊 4 MiB 都重新請求（HuggingFace 尤甚）。
+# 區塊仍是進度/續傳的最小單位。握手/跳轉延遲改由預取（_prefetch_run）
+# 隱藏，run 不需太大；過大的 run 會在 worker 數多時讓 run 數少於 worker 數，
+# 導致分攤不均、預取失效、完成時 worker 驟減造成速率斷崖。64 MiB 為平衡值。
 TARGET_RUN_BYTES = 64 * 1024 * 1024
+
+
+class _NativeStopped(Exception):
+    """原生 yt-dlp 下載被暫停/取消時，由進度 hook 拋出以中止下載。"""
 
 
 def format_size(size_bytes):
@@ -38,6 +47,121 @@ def format_size(size_bytes):
         value /= 1024
         i += 1
     return f"{value:.2f} {names[i]}"
+
+
+def probe_url_metadata(url, proxies=None, headers=None, timeout=(3, 5)):
+    """對單一 HTTP(S) 連結做輕量 Range 探測，取得真實檔名與檔案大小。
+
+    先直連、失敗再依序走 SOCKS5 代理；兩者拿到的 Content-Length /
+    Content-Disposition 相同，故誰先成功就用誰。回傳 {'filename', 'size'}，
+    連不上（或非 http/https）回傳 None；size 可能為 0（伺服器不提供長度）。
+    """
+    scheme = urlparse(url).scheme.lower()
+    if scheme not in ('http', 'https'):
+        return None
+
+    req_headers = {
+        'User-Agent': 'Multi-Socks-Downloader/1.1',
+        'Accept-Encoding': 'identity',
+        'Connection': 'close',
+        'Range': 'bytes=0-0',
+    }
+    if headers:
+        req_headers.update(headers)
+
+    def _attempt(url, proxy):
+        s = requests.Session()
+        try:
+            s.verify = False
+            if proxy:
+                host, port = proxy['host'], proxy['port']
+                user = proxy.get('username') or ''
+                pwd = proxy.get('password') or ''
+                if user or pwd:
+                    auth = f"{quote(user, safe='')}:{quote(pwd, safe='')}"
+                    proxy_url = f"socks5://{auth}@{host}:{port}"
+                else:
+                    proxy_url = f"socks5://{host}:{port}"
+                s.proxies.update({'http': proxy_url, 'https': proxy_url})
+            r = s.get(url, headers=req_headers, stream=True,
+                      timeout=timeout, allow_redirects=True)
+            if r.status_code not in (200, 206):
+                r.close()
+                return None
+            is_html = (r.headers.get('content-type') or '').lower().startswith('text/html')
+            if is_html:
+                # 串流站台 / 下載頁的 HTML 長度並非檔案大小，避免誤導使用者。
+                r.close()
+                return {'filename': None, 'size': 0}
+            size = 0
+            if r.status_code == 206:
+                cr = r.headers.get('content-range', '')
+                m = re.search(r'/(\d+)\s*$', cr)
+                if m:
+                    size = int(m.group(1))
+                if not size:
+                    size = int(r.headers.get('content-length', 0) or 0)
+            else:
+                size = int(r.headers.get('content-length', 0) or 0)
+            filename = DownloadTask._filename_from_headers(r.headers)
+            r.close()
+            return {'filename': filename, 'size': size}
+        except Exception:
+            return None
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    for proxy in ([None] + list(proxies or [])):
+        info = _attempt(url, proxy)
+        if info is not None:
+            return info
+
+    # HTTP 探測失敗時升級 HTTPS 重試，與實際下載的 prepare() 行為一致：
+    # 部分伺服器在 HTTP(80) 埠對 Range 請求回 416/失敗，但 HTTPS(443) 正常。
+    if scheme == 'http' and urlparse(url).netloc:
+        https_url = urlunparse(urlparse(url)._replace(scheme='https'))
+        for proxy in ([None] + list(proxies or [])):
+            info = _attempt(https_url, proxy)
+            if info is not None:
+                return info
+    return None
+
+
+# 檔名安全化：移除 Windows 不允許的字元，並裁掉尾端句點/空白。
+_ILLEGAL_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
+
+
+def _sanitize_filename(name):
+    name = _ILLEGAL_FILENAME_CHARS.sub('_', name).strip().rstrip('. ')
+    return (name or 'video')[:200]
+
+
+def _find_ffmpeg():
+    """定位 ffmpeg 執行檔，供原生下載合併視訊+音訊。
+
+    打包後優先找執行檔旁的 ffmpeg\\ffmpeg.exe（或同層 ffmpeg.exe），
+    其次退回系統 PATH。Nuitka standalone 的 sys.executable 指向內建
+    python.exe，故凍結路徑要用 sys.argv[0]，與 updater.frozen_exe_path() 同因。
+    """
+    import shutil
+    base_dirs = []
+    if getattr(sys, 'frozen', False) or globals().get('__compiled__', False):
+        argv0 = sys.argv[0] if sys.argv else ''
+        p = os.path.abspath(argv0) if argv0 else ''
+        if p.lower().endswith('.exe'):
+            base_dirs.append(os.path.dirname(p))
+    # 原始碼執行（python MultiSocksDownloader.py）時也找 __file__ 所在專案
+    # 根目錄下的 ffmpeg，避免明明有 ffmpeg\ffmpeg.exe 卻因不在 PATH 而找不到。
+    base_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    for d in base_dirs:
+        for cand in (os.path.join(d, 'ffmpeg', 'ffmpeg.exe'),
+                     os.path.join(d, 'ffmpeg.exe')):
+            if os.path.isfile(cand):
+                return cand
+    return shutil.which('ffmpeg')
 
 
 class RateLimiter:
@@ -88,7 +212,9 @@ class DownloadTask:
 
     def __init__(self, url, save_dir, filename=None, proxies=None,
                  chunks_per_part=100, threads_per_proxy=3, headers=None,
-                 rate_limiter=None):
+                 rate_limiter=None, resolve_stream=False, stream_resolver=None,
+                 stream_max_height=None, stream_max_fps=None,
+                 stream_audio_only=False):
         self.url = url
         self.save_dir = save_dir
 
@@ -110,6 +236,23 @@ class DownloadTask:
         self.chunks_per_part = int(chunks_per_part or 0)
         self.headers = dict(headers or {})
         self.rate_limiter = rate_limiter
+        # 是否在 prepare() 時先用 yt-dlp 解析出單檔直連 URL。三態：
+        #   False   = 把網址當一般檔案直接下載；
+        #   True    = 先解析串流再下載，解析失敗即中止任務（避免抓成網頁 HTML）；
+        #   'auto'  = 先試解析，失敗自動退回一般下載（不中止）。
+        self._resolve_stream = resolve_stream
+        # 串流解析器（可注入）：預設 yt-dlp 實作；測試可替換成 fake。
+        self._stream_resolver = stream_resolver or YtDlpStreamResolver()
+        # 原生下載模式：解析器判定只有 DASH/HLS 分段串流時設為 True，
+        # 由 yt-dlp 原生下載（視訊+音訊合併）取代 Range 分段引擎。
+        self._native_mode = False
+        # 畫質/FPS 選擇（僅在 resolve_stream=True 時生效）：
+        # max_height 為最高畫素高度（None=最高畫質）、max_fps 為最高幀率
+        # （None=自動）、audio_only=True 只要音訊。三者都交由串流解析器
+        # 在挑選格式時套用，並持久化以供續傳還原。
+        self._stream_max_height = stream_max_height
+        self._stream_max_fps = stream_max_fps
+        self._stream_audio_only = bool(stream_audio_only)
         self.chunk_size = self.CHUNK_SIZE
 
         self.filename = filename
@@ -131,11 +274,16 @@ class DownloadTask:
         self._partial = {}  # block_idx -> 區塊內已寫入的位元組數（含續傳偏移，持久化用）
         self.status = 'initialized'
         self.error_message = ''
+        # 機器可讀的失敗類別（狀態轉換時的結構化原因），便於跨邊界定位。
+        self.error_reason = ''
         self.start_time = None
         self.end_time = None
 
         self.supports_range = False
         self._single_mode = False
+        # 跳轉後的最終 CDN 簽名 URL 快取：後續 run 直接打它、跳過每次的 302 跳轉，
+        # 避免每個 64 MiB run 都重新付一次 HuggingFace 簽章/跳轉延遲。
+        self._resolved_url = None
 
         self._lock = threading.Lock()
         self._save_lock = threading.Lock()
@@ -166,6 +314,25 @@ class DownloadTask:
 
         self.task_id = None
         self.threads = []
+
+    # ------------------------------------------------------------------ #
+    # 狀態機 + 事件 log
+    # ------------------------------------------------------------------ #
+    def _log_event(self, event, **ctx):
+        """記錄一個統一格式的任務事件，帶 task_id 與階段脈絡，方便串起整條鏈。"""
+        extra = " ".join(f"{k}={v!r}" for k, v in ctx.items())
+        logger.info("event=%s task_id=%s %s", event, self.task_id, extra)
+
+    def _set_status(self, new_status, reason=''):
+        """設定任務狀態並記錄轉換；reason 為機器可讀的結構化失敗類別。"""
+        old = self.status
+        if old == new_status and not reason:
+            return
+        if reason:
+            self.error_reason = reason
+        self.status = new_status
+        logger.info("event=status_changed task_id=%s phase=%s->%s reason=%s",
+                    self.task_id, old, new_status, reason or '')
 
     # ------------------------------------------------------------------ #
     # helpers
@@ -347,6 +514,10 @@ class DownloadTask:
                         'supports_range': self.supports_range,
                         'status': self.status,
                         'single_mode': self._single_mode,
+                        'resolve_stream': self._resolve_stream,
+                        'stream_max_height': self._stream_max_height,
+                        'stream_max_fps': self._stream_max_fps,
+                        'stream_audio_only': self._stream_audio_only,
                     }
 
                 tmp = f"{self.progress_filepath}.tmp"
@@ -378,6 +549,10 @@ class DownloadTask:
             self.chunks_per_part = data.get('chunks_per_part', self.chunks_per_part)
             self.supports_range = data.get('supports_range', self.supports_range)
             self._single_mode = data.get('single_mode', False)
+            self._resolve_stream = data.get('resolve_stream', False)
+            self._stream_max_height = data.get('stream_max_height')
+            self._stream_max_fps = data.get('stream_max_fps')
+            self._stream_audio_only = data.get('stream_audio_only', False)
 
             # 舊格式（segments）不支援，視為新下載
             if 'bitmap' not in data:
@@ -412,6 +587,34 @@ class DownloadTask:
     # prepare + probe
     # ------------------------------------------------------------------ #
     def prepare(self):
+        if self._resolve_stream:
+            if not self._maybe_resolve_stream():
+                if self._resolve_stream is True:
+                    # 明確要求解析：失敗即中止，避免把網頁 HTML 當成檔案下載。
+                    reason = self.error_reason or 'stream_resolve_failed'
+                    self._set_status('error', reason=reason)
+                    self.error_message = (
+                        '無法解析影片串流：' + (self.error_reason or
+                         '可能需要登入、Cookie 已過期，或該站不提供單檔直連'))
+                    logger.error("event=resolve_failed task_id=%s url=%s reason=%s error=%s",
+                                 self.task_id, self.url, reason, self.error_message)
+                    return False
+                # 'auto' 模式：解析失敗自動退回一般下載（不中止）。
+                logger.warning("event=resolve_fallback task_id=%s url=%s reason=%s",
+                               self.task_id, self.url,
+                               self.error_reason or 'stream_resolve_failed')
+        if self._native_mode:
+            # 原生 yt-dlp 下載：不需 probe/分段，備妥目錄與唯一檔名即可。
+            try:
+                os.makedirs(self.save_dir, exist_ok=True)
+                self._ensure_unique_filepath()
+            except Exception as e:
+                logger.exception("準備原生下載時出錯: task_id=%s url=%s",
+                                 self.task_id, self.url)
+                self._set_status('error', reason='prepare_exception')
+                self.error_message = f"準備下載時出錯: {e}"
+                return False
+            return True
         if self.load_progress():
             self._ensure_temp_file()
             self._rebuild_pool()
@@ -423,12 +626,20 @@ class DownloadTask:
                 info = self._probe_ftp()
             else:
                 info = self._probe(self._build_lines())
+                if info is None and self._upgrade_http_to_https():
+                    logger.warning("HTTP 探測失敗，改用 HTTPS 重試: %s", self.url)
+                    info = self._probe(self._build_lines())
             if info is None:
-                self.status = 'error'
+                self._set_status('error', reason='probe_failed')
                 self.error_message = '無法連接伺服器或取得檔案資訊'
+                logger.error("event=probe_failed task_id=%s url=%s",
+                             self.task_id, self.url)
                 return False
 
             self.supports_range = info['supports_range']
+            # 探測時已跟隨 302，記下最終 CDN 簽名 URL，讓 worker 首次請求就跳過跳轉、
+            # 縮短開場的首次握手（從跳轉+TLS 降到只剩 TLS）。
+            self._resolved_url = info.get('resolved_url') or None
             if info.get('total_size'):
                 self.total_size = info['total_size']
             self._compute_chunk_size()
@@ -455,9 +666,97 @@ class DownloadTask:
             self.save_progress()
             return True
         except Exception as e:
-            self.status = 'error'
+            logger.exception("準備下載時出錯: task_id=%s url=%s", self.task_id, self.url)
+            self._set_status('error', reason='prepare_exception')
             self.error_message = f"準備下載時出錯: {e}"
             return False
+
+    def _upgrade_http_to_https(self):
+        """HTTP 探測失敗時的 HTTPS 升級兜底。
+
+        部分伺服器（如 HiNet 測速檔）在 HTTP(80) 埠對 Range 請求一律回 416，
+        但 HTTPS(443) 埠正常支援分段。此方法僅在 http:// 網址下首次嘗試升級，
+        回傳 True 表示網址已改為 https://，呼叫端可重新探測；非 http 網址或
+        無效網址回傳 False。
+        """
+        parts = urlparse(self.url)
+        if parts.scheme.lower() != 'http' or not parts.netloc:
+            return False
+        self.url = urlunparse(parts._replace(scheme='https'))
+        self._resolved_url = None
+        return True
+
+    def _maybe_resolve_stream(self):
+        """嘗試把影音網頁網址解析成單檔直連 URL（走可注入的 StreamResolver）。
+
+        只對 http/https、且非明顯直接檔案的網址生效。解析成功時：
+        - self._resolved_url 設為直連網址，之後的探測與下載都改用它；
+          簽名 URL 會過期，故每次 prepare()（含續傳）都重新解析一次。
+        - 合併 resolver 提供的請求標頭（Referer/User-Agent 等，部分 CDN 必填）。
+        - 若檔名仍是依 URL 自動推導的值，改用影片標題＋正確副檔名。
+
+        回傳 True 表示可繼續原本的下載流程（解析成功，或網址本就無需解析）；
+        回傳 False 表示使用者要求解析但失敗——呼叫端應中止任務，避免把網頁
+        HTML 當成檔案下載（例如檔名變成「watch」）。
+        """
+        self._log_event('resolve_begin', url=self.url)
+        if urlparse(self.url).scheme.lower() not in ('http', 'https'):
+            return True
+        if stream_resolver.is_direct_file(self.url):
+            self._log_event('resolve_skip_direct_file', url=self.url)
+            return True
+        # 把瀏覽器送來的 Cookie/User-Agent 一起帶給 resolver：需登入的影片少了
+        # Cookie 時 extract_info 會直接回 None。
+        result = self._stream_resolver.resolve(
+            self.url, headers=self.headers,
+            max_height=self._stream_max_height,
+            max_fps=self._stream_max_fps,
+            audio_only=self._stream_audio_only)
+        if not result.ok:
+            self.error_reason = result.error_kind or 'stream_resolve_failed'
+            logger.error("event=resolve_failed task_id=%s url=%s reason=%s error=%s",
+                         self.task_id, self.url, self.error_reason, result.error)
+            return False
+
+        # DASH/HLS 分段串流：改走 yt-dlp 原生下載（視訊+音訊合併）。
+        # 不設 _resolved_url，原生下載仍以原始 URL 交給 yt-dlp 全權處理。
+        if result.mode == 'native':
+            self._native_mode = True
+            title = result.title
+            ext = result.ext or '.mp4'
+            auto_name = self._extract_filename_from_url() or 'download_file'
+            if title and self.filename in (auto_name, _sanitize_filename(title)):
+                new_name = _sanitize_filename(title) + ext
+                if new_name != self.filename:
+                    self.filename = new_name
+                    self.filepath = os.path.join(self.save_dir, self.filename)
+                    self.temp_filepath = f"{self.filepath}.downloading"
+                    self.progress_filepath = f"{self.filepath}.progress"
+            self._log_event('resolve_native', url=self.url, title=title)
+            return True
+
+        direct_url = result.direct_url
+        title = result.title
+        ext = result.ext
+        self._resolved_url = direct_url
+        if result.headers:
+            # 解析標頭不覆蓋使用者自訂的同一標頭。
+            merged = dict(result.headers)
+            merged.update(self.headers)
+            self.headers = merged
+
+        # 檔名仍是依 URL 自動推導、或已由對話框用標題預填（無副檔名）時，
+        # 才補上副檔名；避免覆蓋使用者自訂的完整檔名。
+        auto_name = self._extract_filename_from_url() or 'download_file'
+        if title and self.filename in (auto_name, _sanitize_filename(title)):
+            new_name = _sanitize_filename(title) + ext
+            if new_name != self.filename:
+                self.filename = new_name
+                self.filepath = os.path.join(self.save_dir, self.filename)
+                self.temp_filepath = f"{self.filepath}.downloading"
+                self.progress_filepath = f"{self.filepath}.progress"
+        self._log_event('resolve_ok', direct_url=direct_url, title=title)
+        return True
 
     def _probe(self, lines):
         headers = self._request_headers()
@@ -465,7 +764,8 @@ class DownloadTask:
         deadline = time.time() + 15
 
         def _build_info(r):
-            info = {'headers': r.headers}
+            info = {'headers': r.headers,
+                    'resolved_url': r.url}
             if r.status_code == 206:
                 info['supports_range'] = True
                 cr = r.headers.get('content-range', '')
@@ -492,7 +792,7 @@ class DownloadTask:
                 if done.is_set():
                     s.close()
                     return
-                r = s.get(self.url, headers=headers, stream=True,
+                r = s.get(self._resolved_url or self.url, headers=headers, stream=True,
                           timeout=(5, 8), allow_redirects=True)
                 ok = r.status_code in (200, 206)
                 info = _build_info(r)
@@ -506,8 +806,9 @@ class DownloadTask:
                         if 'info' not in result:
                             result['info'] = info
                     done.set()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("HTTP 探測線路失敗（line=%s）: %s",
+                             self._line_key(proxy), e)
 
         threads = [threading.Thread(target=_attempt, args=(p,), daemon=True)
                    for p in lines]
@@ -708,40 +1009,79 @@ class DownloadTask:
             return (start, end)
 
     def _worker(self, proxy, stop):
+        # 初始去同步：隨機延遲一小段，避免多線同時首次握手形成併發共振。
+        time.sleep(random.uniform(0, 0.2))
         session = self._make_session(proxy)
         try:
+            run = self._pop_run()
+            if run is None:
+                return
+            state = self._request_run(run[0], run[1], session, stop, proxy)
             while not stop.is_set():
-                run = self._pop_run()
-                if run is None:
+                if state in ('done', 'fail'):
                     break
-                start_idx, end_idx = run
+                if state == 'fallback':
+                    self._fallback_event.set()
+                    break
+                _, start_idx, end_idx, req_start, end, r = state
+
+                # 認領下一個 run 並在背景預取：把握手/跳轉延遲藏進本次串流。
+                nxt = self._pop_run()
+                box = {}
+                thr = None
+                if nxt is not None:
+                    thr = threading.Thread(
+                        target=self._prefetch_run,
+                        args=(nxt[0], nxt[1], proxy, stop, box), daemon=True)
+                    thr.start()
+
+                # 寫入當前 run
                 with self._lock:
                     for b in range(start_idx, end_idx + 1):
                         self._active_blocks.add(b)
                 try:
-                    result = self._download_run(start_idx, end_idx, session, stop, proxy)
+                    result = self._write_run(
+                        start_idx, end_idx, req_start, end, r, stop, proxy)
                 finally:
                     with self._lock:
                         for b in range(start_idx, end_idx + 1):
                             self._active_blocks.discard(b)
-                if result == 'ok':
-                    if self._all_blocks_done():
-                        break
-                elif result == 'fallback':
-                    self._fallback_event.set()
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                session = None
+
+                if result == 'ok' and self._all_blocks_done():
+                    if thr is not None:
+                        thr.join(timeout=1)
                     break
+
+                # 取用預取的下一個 run；無下一個或已被取消則結束。
+                if thr is None or stop.is_set():
+                    break
+                thr.join()
+                got = box.get('result')
+                if got is None:
+                    break
+                session, state = got
         finally:
             try:
-                session.close()
+                if session is not None:
+                    session.close()
             except Exception:
                 pass
 
-    def _download_run(self, start_idx, end_idx, session, stop, proxy=None):
+    def _request_run(self, start_idx, end_idx, session, stop, proxy=None):
+        """發起一個 run 的 Range 請求。回傳：
+        ('stream', start_idx, end_idx, req_start, end, r) 可開始串流；
+        'fallback'（伺服器忽略 Range）、'done'（已完成）、'fail'（失敗已處理）。
+        """
         start, _ = self._block_bounds(start_idx)
         _, end_excl = self._block_bounds(end_idx)
         end = end_excl - 1  # inclusive
         if start >= self.total_size:
-            return 'ok'
+            return 'done'
 
         # 續傳：run 的第一個區塊從區塊內已寫入的偏移繼續，其餘區塊均為全新。
         with self._lock:
@@ -753,31 +1093,52 @@ class DownloadTask:
                     if not self._is_block_done(b):
                         self._set_block_done(b)
                         self._partial.pop(b, None)
-            return 'ok'
+            return 'done'
 
         headers = self._request_headers()
         headers['Range'] = f"bytes={req_start}-{end}"
 
+        # 優先用已解析的 CDN 簽名 URL：跳過每個 run 都要重走一次的 302 跳轉。
+        url = self._resolved_url or self.url
         try:
-            r = session.get(self.url, headers=headers, stream=True,
+            r = session.get(url, headers=headers, stream=True,
                             timeout=(15, 60), allow_redirects=True)
         except Exception as e:
-            return self._handle_run_failure(
+            self._handle_run_failure(
                 start_idx, end_idx, start_idx, f"連接失敗: {e}", stop)
+            return 'fail'
 
         if r.status_code == 206:
-            return self._write_run(start_idx, end_idx, req_start, end, r, stop, proxy)
-        elif r.status_code == 200:
+            # 記住最終 URL（簽名 CDN），供後續 run 直接複用、省去跳轉延遲。
+            if r.url and r.url != self.url:
+                self._resolved_url = r.url
+            return ('stream', start_idx, end_idx, req_start, end, r)
+        if r.status_code == 200:
             r.close()
-            return self._handle_run_fallback(start_idx, end_idx)
-        elif r.status_code == 416:
+            self._handle_run_fallback(start_idx, end_idx)
+            return 'fallback'
+        if r.status_code == 416:
             r.close()
-            return self._handle_run_failure(
+            self._handle_run_failure(
                 start_idx, end_idx, start_idx, "HTTP 416：範圍請求被拒絕", stop)
-        else:
-            r.close()
-            return self._handle_run_failure(
-                start_idx, end_idx, start_idx, f"HTTP {r.status_code}", stop)
+            return 'fail'
+        r.close()
+        # 403/401 可能是簽名 URL 已過期：清掉快取後用原始 URL 重解析一次。
+        if self._resolved_url and r.status_code in (401, 403):
+            self._resolved_url = None
+            return self._request_run(start_idx, end_idx, session, stop, proxy)
+        self._handle_run_failure(
+            start_idx, end_idx, start_idx, f"HTTP {r.status_code}", stop)
+        return 'fail'
+
+    def _prefetch_run(self, start_idx, end_idx, proxy, stop, box):
+        """背景預取下一個 run：用獨立 session 發起請求，把握手延遲藏進串流。"""
+        session = self._make_session(proxy)
+        if stop.is_set():
+            box['result'] = (session, 'fail')
+            return
+        state = self._request_run(start_idx, end_idx, session, stop, proxy)
+        box['result'] = (session, state)
 
     def _write_run(self, start_idx, end_idx, req_start, end, r, stop, proxy=None):
         need = end - req_start + 1
@@ -856,7 +1217,7 @@ class DownloadTask:
         if retries >= self.MAX_RETRIES:
             self.error_message = f"區塊 {failed_idx} 下載失敗: {reason}"
             self._fatal = True
-            self.status = 'error'
+            self._set_status('error', reason='run_failed')
             stop.set()
             return 'fail'
         return 'fail'
@@ -870,7 +1231,7 @@ class DownloadTask:
         if retries >= self.MAX_RETRIES:
             self.error_message = f"區塊 {idx} 下載失敗: {reason}"
             self._fatal = True
-            self.status = 'error'
+            self._set_status('error', reason='block_failed')
             stop.set()
             return 'fail'
         self._queue_block(idx)
@@ -884,10 +1245,10 @@ class DownloadTask:
         session = self._make_session(proxy)
         try:
             headers = self._request_headers()
-            r = session.get(self.url, headers=headers, stream=True,
+            r = session.get(self._resolved_url or self.url, headers=headers, stream=True,
                             timeout=(15, 60), allow_redirects=True)
             if r.status_code != 200:
-                self.status = 'error'
+                self._set_status('error', reason='http_status')
                 self.error_message = f"HTTP {r.status_code}"
                 r.close()
                 return
@@ -916,8 +1277,10 @@ class DownloadTask:
             r.close()
         except Exception as e:
             if not stop.is_set():
-                self.status = 'error'
+                self._set_status('error', reason='single_worker_exception')
                 self.error_message = str(e)
+                logger.error("event=single_worker_failed task_id=%s error=%s",
+                             self.task_id, e)
         finally:
             try:
                 session.close()
@@ -925,6 +1288,95 @@ class DownloadTask:
                 pass
         # 只有仍是當前世代（stop 未被新 start() 取代）才允許完成收尾，
         # 避免暫停/恢復後舊 worker 誤把新世代的下載標記為完成。
+        if stop is self._stop:
+            self.complete_download()
+
+    def _native_worker(self, stop):
+        """DASH/HLS 串流的原生下載：整段交給 yt-dlp（單一 SOCKS5 代理 + ffmpeg 合併）。
+
+        路徑 A：只走單一代理（優先第一條可用 SOCKS5，無代理則直連），
+        由 yt-dlp 依 bestvideo*+bestaudio 選軌並用 ffmpeg 合併成 MP4。
+        進度透過 progress_hook 對映回 task 的 total_size / downloaded_size，
+        讓 UI 的 get_progress() 持續更新；pause/cancel 靠 stop 事件中止。
+        """
+        try:
+            import yt_dlp
+        except ImportError:
+            self._set_status('error', reason='ytdlp_missing')
+            self.error_message = '未安裝 yt-dlp，無法原生下載影音串流'
+            return
+
+        proxy = self.proxies[0] if self.proxies else None
+        proxy_url = None
+        if proxy:
+            host = proxy.get('host')
+            port = proxy.get('port')
+            user = proxy.get('username') or ''
+            pwd = proxy.get('password') or ''
+            if user or pwd:
+                proxy_url = f"socks5://{quote(user, safe='')}:{quote(pwd, safe='')}@{host}:{port}"
+            else:
+                proxy_url = f"socks5://{host}:{port}"
+
+        ffmpeg = _find_ffmpeg()
+
+        def _hook(d):
+            if stop.is_set():
+                raise _NativeStopped()
+            if d.get('status') == 'downloading':
+                downloaded = d.get('downloaded_bytes')
+                total = d.get('total_bytes') or d.get('total_bytes_estimate')
+                with self._lock:
+                    if downloaded is not None:
+                        self.downloaded_size = int(downloaded)
+                    if total:
+                        self.total_size = int(total)
+                    self._single_mode = True
+
+        fmt = build_native_format_selector(
+            max_height=self._stream_max_height,
+            max_fps=self._stream_max_fps,
+            audio_only=self._stream_audio_only)
+        opts = {
+            'format': fmt,
+            'merge_output_format': 'm4a' if self._stream_audio_only else 'mp4',
+            'outtmpl': self.filepath,
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'progress_hooks': [_hook],
+            'socket_timeout': 15,
+            'retries': 3,
+            'continuedl': True,
+        }
+        if proxy_url:
+            opts['proxy'] = proxy_url
+        if ffmpeg:
+            opts['ffmpeg_location'] = ffmpeg
+        else:
+            logger.warning("未找到 ffmpeg，DASH/HLS 合併將失敗: task_id=%s", self.task_id)
+        if self.headers:
+            # 帶上瀏覽器送來的 UA/Referer（部分 CDN 必填），但不要把 Cookie
+            # 當 header 傳——yt-dlp 會警告安全風險，YouTube 偵測到這類 Cookie
+            # header 還會觸發 bot 檢查（The page needs to be reloaded）。
+            hdrs = {k: v for k, v in self.headers.items()
+                    if k.lower() not in ('cookie', 'cookie2')}
+            if hdrs:
+                opts['http_headers'] = hdrs
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([self.url])
+        except _NativeStopped:
+            return
+        except Exception as e:
+            if not stop.is_set():
+                self._set_status('error', reason='native_failed')
+                self.error_message = str(e)
+                logger.error("event=native_failed task_id=%s url=%s error=%s",
+                             self.task_id, self.url, e)
+            return
+
         if stop is self._stop:
             self.complete_download()
 
@@ -1087,8 +1539,10 @@ class DownloadTask:
             pass
         except Exception as e:
             if not stop.is_set():
-                self.status = 'error'
+                self._set_status('error', reason='ftp_single_worker_exception')
                 self.error_message = str(e)
+                logger.error("event=ftp_single_worker_failed task_id=%s error=%s",
+                             self.task_id, e)
         finally:
             if ftp is not None:
                 try:
@@ -1115,15 +1569,19 @@ class DownloadTask:
     # lifecycle
     # ------------------------------------------------------------------ #
     def start(self):
-        self.status = 'downloading'
+        self._log_event('start_begin', url=self.url)
+        self._set_status('downloading')
         self.error_message = ''
+        self.error_reason = ''
         self._fatal = False
 
         if not self.prepare():
+            logger.error("event=prepare_failed task_id=%s url=%s status=%s error=%s",
+                         self.task_id, self.url, self.status, self.error_message)
             return False
 
         # prepare()/load_progress() 可能把 status 改回 'paused'，必須再次確認為下載中
-        self.status = 'downloading'
+        self._set_status('downloading')
         # 每次 start() 建立新的停止事件（世代分離）：舊 worker 捕捉的是上一代的
         # 已 set 的事件，會自行退出，不會因 clear() 而復活造成重複下載。
         self._stop = threading.Event()
@@ -1137,6 +1595,13 @@ class DownloadTask:
 
         if self.is_ftp:
             return self._start_ftp(stop)
+
+        if self._native_mode:
+            self.threads = []
+            t = threading.Thread(target=self._native_worker, args=(stop,), daemon=True)
+            self.threads.append(t)
+            t.start()
+            return True
 
         if self._single_mode:
             proxy = self.proxies[0] if self.proxies else None
@@ -1214,11 +1679,13 @@ class DownloadTask:
         if self.status != 'downloading':
             return False
         self._stop.set()
-        self.status = 'paused'
+        self._set_status('paused')
         for t in self._workers:
             if t.is_alive():
                 t.join(timeout=1.0)
-        self.save_progress()
+        # 原生下載不走 .progress 續傳（由 yt-dlp .part 接手），勿寫出誤導的進度檔
+        if not self._native_mode:
+            self.save_progress()
         return True
 
     def resume(self):
@@ -1233,12 +1700,13 @@ class DownloadTask:
         self._fatal = False
         self._block_retries = {}
         self.error_message = ''
-        self.status = 'initialized'
+        self.error_reason = ''
+        self._set_status('initialized')
         return self.start()
 
     def cancel(self):
         self._stop.set()
-        self.status = 'canceled'
+        self._set_status('canceled')
         for t in self.threads:
             if t is not threading.current_thread() and t.is_alive():
                 t.join(timeout=1)
@@ -1248,6 +1716,15 @@ class DownloadTask:
                     os.remove(p)
             except Exception:
                 pass
+        # 原生下載的 yt-dlp 中繼檔（.part / .ytdl）一併清掉，避免殘留半成品
+        if self._native_mode:
+            for suffix in ('.part', '.ytdl'):
+                p = self.filepath + suffix
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
         return True
 
     def complete_download(self):
@@ -1260,7 +1737,7 @@ class DownloadTask:
             if self._stop.is_set() and self.status != 'downloading':
                 return
             self.end_time = time.time()
-            self.status = 'completed'
+            self._set_status('completed')
             try:
                 # 落盤最後一批資料：移除逐片 fsync 後，完成時必須確保 temp 檔內容
                 # 已寫入磁碟，否則 os.replace 只改檔名、資料可能仍留在 OS 快取。
@@ -1273,8 +1750,9 @@ class DownloadTask:
                     os.remove(self.progress_filepath)
                 succeeded = True
             except Exception as e:
-                self.status = 'error'
+                self._set_status('error', reason='complete_exception')
                 self.error_message = f"完成下載時出錯: {e}"
+                logger.exception("完成下載時出錯: task_id=%s", self.task_id)
         finally:
             self._completion_lock.release()
         if succeeded and self.on_complete is not None:
@@ -1704,7 +2182,9 @@ class DownloadManager:
     def add_task(self, url, filename=None, save_dir=None,
                  use_proxy=True, chunks_per_part=None, threads_per_proxy=None,
                  headers=None, line=None, selected_files=None,
-                 seed_hours=None, upload_rate_limit=None):
+                 seed_hours=None, upload_rate_limit=None, resolve_stream=False,
+                 stream_resolver=None, stream_max_height=None,
+                 stream_max_fps=None, stream_audio_only=False):
         # BT 來源（magnet 連結或 .torrent 檔路徑）走獨立任務類別
         if source_kind(url) is not None:
             return self._add_bt_task(url, filename, save_dir, line=line,
@@ -1745,6 +2225,11 @@ class DownloadManager:
             threads_per_proxy=threads_per_proxy,
             headers=merged_headers,
             rate_limiter=self.rate_limiter,
+            resolve_stream=resolve_stream,
+            stream_resolver=stream_resolver,
+            stream_max_height=stream_max_height,
+            stream_max_fps=stream_max_fps,
+            stream_audio_only=stream_audio_only,
         )
         task.on_complete = self._on_download_completed
         with self._lock:
@@ -1753,6 +2238,8 @@ class DownloadManager:
             task.task_id = task_id
             self.tasks[url] = task
             self.task_ids[task_id] = task
+        logger.info("event=task_added task_id=%s url=%s resolve=%s",
+                    task_id, url, resolve_stream)
         return task_id
 
     def _on_download_completed(self, task):
@@ -1840,12 +2327,16 @@ class DownloadManager:
     def start_task(self, task_id):
         task = self.task_ids.get(task_id)
         if not task:
+            logger.warning("event=start_task_missing task_id=%s", task_id)
             return False
         # 已在執行中的任務不再重啟：重複拖入同種子/URL 時 add_task 會去重返還同一個
         # task_id，若此處再呼叫 start() 會把進行中的校驗/下載中斷並從頭重來。
         if getattr(task, 'status', None) in ('downloading', 'seeding'):
             return True
-        return task.start()
+        result = task.start()
+        logger.info("event=start_task_result task_id=%s ok=%s status=%s error=%s",
+                    task_id, result, task.status, task.error_message)
+        return result
 
     def pause_task(self, task_id):
         task = self.task_ids.get(task_id)
@@ -1960,23 +2451,35 @@ class DownloadManager:
         return True
 
     def scan_unfinished_tasks(self):
-        count = 0
+        scanned = 0
+        restored = 0
+        skipped = 0
+        skip_reasons = []
         for directory in list(self.download_dirs):
             if not os.path.isdir(directory):
                 continue
             try:
                 entries = os.listdir(directory)
-            except Exception:
+            except Exception as e:
+                logger.warning("掃描下載目錄 %s 失敗: %s", directory, e)
                 continue
             for name in entries:
                 if not name.endswith('.progress'):
                     continue
+                scanned += 1
                 progress_file = os.path.join(directory, name)
                 try:
                     with open(progress_file, 'r', encoding='utf-8') as f:
                         data = json.load(f)
                     url = data.get('url')
-                    if not url or url in self.tasks:
+                    if not url:
+                        skipped += 1
+                        skip_reasons.append(f"{name}: 缺少 url")
+                        logger.warning("跳過無效進度檔（缺少 url）: %s", progress_file)
+                        continue
+                    if url in self.tasks:
+                        skipped += 1
+                        skip_reasons.append(f"{name}: url 已有既有任務")
                         continue
                     task_save_dir = data.get('save_dir', directory)
                     filename = data.get('filename', name[:-len('.progress')])
@@ -1985,8 +2488,15 @@ class DownloadManager:
                         proxies=data.get('proxies', []),
                         headers=data.get('headers', {}),
                         rate_limiter=self.rate_limiter,
+                        resolve_stream=data.get('resolve_stream', False),
+                        stream_max_height=data.get('stream_max_height'),
+                        stream_max_fps=data.get('stream_max_fps'),
+                        stream_audio_only=data.get('stream_audio_only', False),
                     )
                     if not task.load_progress():
+                        skipped += 1
+                        skip_reasons.append(f"{name}: load_progress 失敗")
+                        logger.warning("跳過無法載入的進度檔: %s", progress_file)
                         continue
                     task.on_complete = self._on_download_completed
                     with self._lock:
@@ -1995,10 +2505,15 @@ class DownloadManager:
                         task.task_id = task_id
                         self.tasks[url] = task
                         self.task_ids[task_id] = task
-                    count += 1
+                    restored += 1
+                    logger.info("event=task_restored task_id=%s url=%s progress=%s",
+                                task_id, url, progress_file)
                 except Exception as e:
+                    skipped += 1
+                    skip_reasons.append(f"{name}: {e}")
                     logger.warning("掃描未完成任務 %s 失敗: %s", progress_file, e)
 
+        bt_restored = 0
         # BT 任務掃描：<save_dir>/.bt_tmp/<infohash>/task.json
         for directory in list(self.download_dirs):
             bt_root = os.path.join(directory, '.bt_tmp')
@@ -2048,8 +2563,18 @@ class DownloadManager:
                         task.task_id = task_id
                         self.tasks[source] = task
                         self.task_ids[task_id] = task
-                    count += 1
+                    bt_restored += 1
                 except Exception as e:
                     logger.warning("掃描未完成 BT 任務 %s 失敗: %s", task_json, e)
+
+        if scanned or skipped:
+            logger.info(
+                "event=scan_unfinished 掃到 %s 個進度檔，恢復 %s 個，跳過 %s 個",
+                scanned, restored, skipped)
+            for reason in skip_reasons:
+                logger.debug("scan_skip_reason: %s", reason)
+        if bt_restored:
+            logger.info("event=scan_unfinished 恢復 BT 任務 %s 個", bt_restored)
+
         self.save_config()
-        return count
+        return restored + bt_restored

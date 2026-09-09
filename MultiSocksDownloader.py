@@ -6,6 +6,7 @@
 import os
 import sys
 import ctypes
+import logging
 
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -13,6 +14,10 @@ from ui import QApplication, MainWindow
 from http_server import HttpServer
 from downloader import DownloadManager
 from app_icon import load_app_icon
+import version
+from logging_setup import setup_logging
+
+logger = logging.getLogger('main')
 
 # 保留 mutex 控制代碼，避免程式執行期間釋放而失去鎖定
 _single_instance_mutex = None
@@ -76,7 +81,18 @@ def _forward_to_primary(args):
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
+    # 過濾並解析 --debug 旗標：verbose 輸出統一由此處開關，不靠散落的 print。
+    argv = sys.argv[1:]
+    debug = '--debug' in argv
+    argv = [a for a in argv if a != '--debug']
+    setup_logging(debug)
+
+    # 一眼可辨執行來源與版本：source=直接跑原始碼，frozen=Nuitka 打包的 exe。
+    is_frozen = bool(getattr(sys, 'frozen', False))
+    logger.info("event=startup version=%s source=%s debug=%s",
+                version.APP_VERSION, 'frozen' if is_frozen else 'source', debug)
+
+    app = QApplication([sys.argv[0]] + argv)
     app.setWindowIcon(load_app_icon())
 
     # 設定 Windows AppUserModelID，讓執行中的任務列按鈕使用自訂圖示並正確分組
@@ -90,7 +106,7 @@ if __name__ == "__main__":
     is_primary = _ensure_single_instance()
     if not is_primary:
         # 已有實例在執行：把開啟的 .torrent 檔轉送給它後結束
-        _forward_to_primary(sys.argv[1:])
+        _forward_to_primary(argv)
         sys.exit(0)
 
     # 盡早啟動 IPC 伺服器，避免第二個實例轉送時伺服器尚未就緒
@@ -98,7 +114,7 @@ if __name__ == "__main__":
     ipc_server.listen(_IPC_SERVER_NAME)
 
     # 待處理路徑：啟動參數 + 啟動期間/事件迴圈內轉送進來的路徑
-    pending_paths = list(sys.argv[1:])
+    pending_paths = list(argv)
     sock_buffer = {}
 
     def on_ready_read(sock):

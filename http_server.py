@@ -11,8 +11,6 @@ from urllib.parse import parse_qs, urlparse
 import socket
 import logging
 
-# 配置日誌記錄
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('http_server')
 
 
@@ -77,11 +75,12 @@ class DownloadRequestHandler(BaseHTTPRequestHandler):
         if content_length > 0:
             # 讀取請求體
             post_data = self.rfile.read(content_length).decode('utf-8')
-            logger.info(f"收到POST數據: {post_data}")
+            logger.debug("收到 POST 資料（%d bytes）", len(post_data))
 
             try:
                 # 解析 JSON 數據
                 data = json.loads(post_data)
+                req_id = data.get('downloadId') or data.get('download_id') or ''
                 url = data.get('url', '')
 
                 if not url:
@@ -113,7 +112,12 @@ class DownloadRequestHandler(BaseHTTPRequestHandler):
                 except Exception:
                     threads_per_proxy = 6
 
-                logger.info(f"從HTTP請求獲取下載參數: URL={url}, 檔案名={filename}, 分片數={chunks_per_part}, 每代理線程數={threads_per_proxy}")
+                resolve_stream = bool(data.get('resolve', False))
+
+                logger.info(
+                    "event=request_received req=%s url=%s filename=%s chunks=%s threads=%s resolve=%s",
+                    req_id or 'no-id', url, filename, chunks_per_part,
+                    threads_per_proxy, resolve_stream)
 
                 # 若已註冊「下載請求」回呼（通常是主程式 UI），把請求轉交 UI 顯示
                 # 「選擇儲存位置」對話框，由使用者確認後再建立任務。每個攔截下載都可能
@@ -126,13 +130,16 @@ class DownloadRequestHandler(BaseHTTPRequestHandler):
                         'headers': headers,
                         'chunks_per_part': chunks_per_part,
                         'threads_per_proxy': threads_per_proxy,
+                        'resolve_stream': resolve_stream,
                         'save_dir': self.download_manager.save_dir,
+                        'request_id': req_id,
                     }
                     for callback in self.request_callbacks:
                         try:
                             callback(request)
-                        except Exception as e:
-                            logger.error(f"調用下載請求回呼時出錯: {str(e)}")
+                        except Exception:
+                            logger.exception("調用下載請求回呼時出錯: req=%s url=%s",
+                                             req_id or 'no-id', url)
                     self._set_response()
                     response = {
                         'status': 'received',
@@ -148,8 +155,10 @@ class DownloadRequestHandler(BaseHTTPRequestHandler):
                         chunks_per_part=chunks_per_part,
                         threads_per_proxy=threads_per_proxy,
                         headers=headers,
+                        resolve_stream=resolve_stream,
                     )
-                    logger.info(f"HTTP 請求添加了任務 ID: {task_id}, URL: {url}")
+                    logger.info("event=task_forwarded_to_engine req=%s task_id=%s url=%s",
+                                req_id or 'no-id', task_id, url)
 
                     if task_id is None:
                         self._set_response(500)
@@ -182,11 +191,11 @@ class DownloadRequestHandler(BaseHTTPRequestHandler):
                             'task_id': task_id
                         }
             except json.JSONDecodeError as e:
-                logger.error(f"JSON解析錯誤: {e}")
+                logger.error("event=request_json_error error=%s", e)
                 self._set_response(400)
                 response = {'status': 'error', 'message': f'Invalid JSON: {str(e)}'}
             except Exception as e:
-                logger.error(f"處理請求時出錯: {e}")
+                logger.exception("event=request_processing_failed url=%s", url)
                 self._set_response(500)
                 response = {'status': 'error', 'message': f'Server error: {str(e)}'}
         else:

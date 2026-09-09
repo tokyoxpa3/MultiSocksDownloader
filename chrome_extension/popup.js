@@ -1,21 +1,22 @@
+// 固定的本機應用程式伺服器地址（不可修改）
+const SERVER_URL = 'http://localhost:8765';
+
 // 當彈出視窗載入時
 document.addEventListener('DOMContentLoaded', () => {
   const enableToggle = document.getElementById('enableToggle');
   const cancelOriginalToggle = document.getElementById('cancelOriginalToggle');
-  const serverUrlInput = document.getElementById('serverUrl');
   const connectionStatus = document.getElementById('connectionStatus');
   const testConnectionBtn = document.getElementById('testConnection');
   const saveSettingsBtn = document.getElementById('saveSettings');
   const tasksList = document.getElementById('tasksList');
 
   // 載入儲存的設置
-  chrome.storage.local.get(['enabled', 'serverUrl', 'cancelOriginalDownload'], (result) => {
+  chrome.storage.local.get(['enabled', 'cancelOriginalDownload'], (result) => {
     enableToggle.checked = result.enabled !== undefined ? result.enabled : true;
     cancelOriginalToggle.checked = result.cancelOriginalDownload !== undefined ? result.cancelOriginalDownload : true;
-    serverUrlInput.value = result.serverUrl || 'http://localhost:8765';
 
     // 初始檢查連接狀態
-    checkConnection(serverUrlInput.value);
+    checkConnection(SERVER_URL);
 
     // 開始輪詢下載任務
     startTasksPolling();
@@ -45,25 +46,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // 測試連接按鈕
   testConnectionBtn.addEventListener('click', () => {
-    const serverUrl = serverUrlInput.value.trim();
-    if (!serverUrl) {
-      updateStatus('請輸入有效的伺服器地址', 'error');
-      return;
-    }
-
-    checkConnection(serverUrl);
+    checkConnection(SERVER_URL);
   });
 
   // 儲存設置按鈕
   saveSettingsBtn.addEventListener('click', () => {
-    const serverUrl = serverUrlInput.value.trim();
-    if (!serverUrl) {
-      updateStatus('請輸入有效的伺服器地址', 'error');
-      return;
-    }
-
     chrome.storage.local.set({ 
-      serverUrl: serverUrl,
       enabled: enableToggle.checked,
       cancelOriginalDownload: cancelOriginalToggle.checked
     }, () => {
@@ -137,13 +125,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // 輪詢 GET /tasks 並渲染進行中的下載
   function startTasksPolling() {
     const poll = () => {
-      const serverUrl = serverUrlInput.value.trim();
-      if (!serverUrl) {
-        tasksList.textContent = '沒有進行中的任務';
-        return;
-      }
-
-      fetch(`${serverUrl}/tasks`, {
+      fetch(`${SERVER_URL}/tasks`, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',

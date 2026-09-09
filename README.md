@@ -52,16 +52,19 @@
 
 ## 畫面
 
-!![下載主畫面](docs/images/ui_download.png)
+![下載主畫面](docs/images/ui_download.png)
 
 ## 架構
 
 - `downloader.py` — 下載核心（`DownloadTask`、`DownloadManager`）
+- `stream_resolver.py` — 串流解析（可注入的 `StreamResolver` 介面 + `YtDlpStreamResolver` 實作，回傳結構化失敗原因）
 - `bt_downloader.py` — BT 下載（libtorrent，多 session 多線路聚合）
 - `ftp_downloader.py` — FTP 下載（SOCKS5 控制/資料通道）
 - `ui.py` — PySide6 圖形介面
 - `http_server.py` — 接收 Chrome 擴充功能請求的本機 HTTP 伺服器
+- `logging_setup.py` — 全專案唯一的 logging 設定入口（`setup_logging(debug)`）
 - `MultiSocksDownloader.py` — 程式入口
+- `repro.py` — 無 GUI 的 headless 複現工具（`add_task → start_task` 全鏈路）
 - `chrome_extension/` — Chrome 擴充功能（Manifest V3）
 
 ## 安裝
@@ -79,14 +82,46 @@ pip install -r requirements-dev.txt
 ## 執行
 
 ```bash
+# 一般執行
 python MultiSocksDownloader.py
+
+# 開啟 verbose 診斷輸出（DEBUG 層級），所有內部事件/錯誤都會印到終端
+python MultiSocksDownloader.py --debug
 ```
+
+> **跑原始碼 vs 跑 exe 的差別**：`python MultiSocksDownloader.py` 直接跑原始碼，
+> 上面這些 log（尤其是 `--debug`）會印在啟動它的終端機視窗，改任何 `.py` 後
+> 重新執行即生效；`MultiSocksDownloader.dist/MultiSocksDownloader.exe` 是
+> Nuitka 打包的獨立執行檔，已把當時的程式碼編譯凍結進去，**改 `.py` 不會影響
+> 已打包的 exe**，且 exe 以 `--windows-console-mode=disable` 編譯、預設無主控台，
+> log 不會印到螢幕。要除錯請一律跑原始碼（`python MultiSocksDownloader.py --debug`），
+> 確認問題後再重新跑 `build.bat` 打包出新的 exe。
 
 ## 測試
 
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## 偵錯與複現（headless）
+
+不用啟動整包 GUI，就能在終端跑通「新增任務 → 啟動下載」全鏈路並印出每個階段的狀態與錯誤：
+
+```bash
+# 離線複現「解析失敗」：注入假解析器，不需要真實網路，直接看 error/reason
+python repro.py https://youtube.com/watch?v=badid --resolve --fake-resolve-fail
+
+# 真實解析一個不存在的 YouTube 影片，看 yt-dlp 的結構化失敗原因
+python repro.py "https://www.youtube.com/watch?v=AAAAAAAAAAA" --resolve --debug
+```
+
+`repro.py` 會以隔離的暫時設定檔與儲存目錄執行，不污染真實的
+`~/.multi_socks_downloader/config.json`；當 `resolve_stream=True` 而解析失敗時，
+任務會以 `error` 中止、`error_reason` 明確標示原因，**不會**把網頁 HTML 存成檔案。
+
+> 所有失敗路徑都透過結構化 log 記錄（`event=... task_id=... url=... reason=...`），
+> 任何 LLM 或工程師都能在 5 分鐘內沿著 `add_task → start_task → prepare → resolve → probe`
+> 這條鏈定位死因。verbose 輸出統一由 `--debug` 開關，不會有散落的臨時 print 殘留。
 
 ## 建置（獨立執行檔）
 

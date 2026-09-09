@@ -34,7 +34,7 @@ jobs:
       - name: Build standalone exe (Nuitka)
         shell: cmd
         run: |
-          nuitka --standalone --windows-console-mode=disable --windows-icon-from-ico=app_icon.ico --enable-plugin=pyside6 --include-package=libtorrent --assume-yes-for-downloads MultiSocksDownloader.py
+          nuitka --standalone --windows-console-mode=disable --windows-icon-from-ico=app_icon.ico --enable-plugin=pyside6 --include-package=libtorrent --include-package=yt_dlp --include-package=yt_dlp.extractor --assume-yes-for-downloads MultiSocksDownloader.py
 
       - name: Include Chrome extension installer
         shell: pwsh
@@ -42,6 +42,12 @@ jobs:
           Copy-Item -Recurse -Force chrome_extension MultiSocksDownloader.dist\chrome_extension
           Copy-Item -Force install_extension.bat MultiSocksDownloader.dist\
           Copy-Item -Force open_extensions.ps1 MultiSocksDownloader.dist\
+
+      - name: Bundle ffmpeg
+        shell: pwsh
+        run: |
+          python fetch_ffmpeg.py
+          Copy-Item -Recurse -Force ffmpeg MultiSocksDownloader.dist\ffmpeg
 
       - name: Package zip (dist contents, no outer folder)
         shell: pwsh

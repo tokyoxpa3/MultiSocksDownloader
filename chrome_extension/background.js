@@ -1,12 +1,12 @@
+// 固定的本機應用程式伺服器地址（不可修改）
+const SERVER_URL = 'http://localhost:8765';
+
 // 擴展程式啟動時初始化
 chrome.runtime.onInstalled.addListener(() => {
   // 初始化存儲設置
-  chrome.storage.local.get(['enabled', 'serverUrl', 'cancelOriginalDownload'], (result) => {
+  chrome.storage.local.get(['enabled', 'cancelOriginalDownload'], (result) => {
     if (result.enabled === undefined) {
       chrome.storage.local.set({ enabled: true });
-    }
-    if (result.serverUrl === undefined) {
-      chrome.storage.local.set({ serverUrl: 'http://localhost:8765' });
     }
     if (result.cancelOriginalDownload === undefined) {
       chrome.storage.local.set({ cancelOriginalDownload: true });
@@ -66,26 +66,35 @@ function toggleBlacklist(host) {
   });
 }
 
-// 建立（冪等）右鍵選單：id 已存在時忽略 duplicate 錯誤，reload 不會重複建立。
+// 建立右鍵選單。先清空再重建，避免舊版遺留的選單 id 造成重複項目。
+// 「下載檔案」與「解析影片連結」是兩個獨立動作：
+//   - 下載檔案：把連結當一般檔案直接下載（resolve=false）。
+//   - 解析影片連結：先把頁面網址交給主程式用 yt-dlp 解析出單檔直連網址（resolve=true）。
 function ensureContextMenus() {
-  const menus = [
-    {
-      id: 'download-with-multisocks',
-      title: '使用多代理下載器下載',
-      contexts: ['link']
-    },
-    {
-      id: 'toggle-site-blacklist',
-      title: '將此網站加入下載黑名單（改用瀏覽器原生下載）',
-      contexts: ['page']
+  chrome.contextMenus.removeAll(() => {
+    const menus = [
+      {
+        id: 'download-file-direct',
+        title: '下載檔案（多代理）',
+        contexts: ['link']
+      },
+      {
+        id: 'resolve-video-page',
+        title: '解析影片連結並下載（多代理）',
+        contexts: ['page', 'video']
+      },
+      {
+        id: 'toggle-site-blacklist',
+        title: '將此網站加入下載黑名單（改用瀏覽器原生下載）',
+        contexts: ['page']
+      }
+    ];
+    for (const m of menus) {
+      chrome.contextMenus.create(m, () => {
+        void chrome.runtime.lastError;
+      });
     }
-  ];
-  for (const m of menus) {
-    chrome.contextMenus.create(m, () => {
-      // 已存在時會回傳 duplicate id 錯誤，忽略即可。
-      void chrome.runtime.lastError;
-    });
-  }
+  });
 }
 
 // 快取「取消原始下載」與「啟用攔截」設定。onDeterminingFilename 必須同步呼叫
@@ -125,9 +134,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 // 處理右鍵選單點擊事件
 chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId === 'download-with-multisocks') {
+  if (info.menuItemId === 'download-file-direct') {
+    // 「下載檔案」：直接下載右鍵的連結，不解析串流。
     if (info.linkUrl) {
-      sendDownloadRequest(info.linkUrl);
+      sendDownloadRequest(info.linkUrl, null, null, '', false);
     } else {
       console.error("未獲取到連結URL");
       chrome.notifications.create({
@@ -135,6 +145,21 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
         iconUrl: 'images/icon128.png',
         title: '多代理下載器',
         message: '錯誤：未獲取到連結',
+        priority: 2
+      });
+    }
+  } else if (info.menuItemId === 'resolve-video-page') {
+    // 「解析影片連結」：送頁面網址給主程式解析串流（非影片 src，因為那常是 blob）。
+    const pageUrl = info.pageUrl || (tab && tab.url);
+    if (pageUrl) {
+      sendDownloadRequest(pageUrl, null, null, '', true);
+    } else {
+      console.error("未獲取到頁面URL");
+      chrome.notifications.create({
+        type: 'basic',
+        iconUrl: 'images/icon128.png',
+        title: '多代理下載器',
+        message: '錯誤：未獲取到頁面網址',
         priority: 2
       });
     }
@@ -263,7 +288,9 @@ function getCookieHeader(url) {
 }
 
 // 發送下載請求到本地應用
-function sendDownloadRequest(url, downloadId = null, filename = null, referrer = '') {
+// resolveStream=true 表示請主程式先用 yt-dlp 解析出單檔直連網址（解析影片連結）；
+// false 表示把網址當一般檔案直接下載。
+function sendDownloadRequest(url, downloadId = null, filename = null, referrer = '', resolveStream = false) {
   // 確保URL有效
   if (!url) {
     console.error("嘗試下載無效URL");
@@ -298,8 +325,8 @@ function sendDownloadRequest(url, downloadId = null, filename = null, referrer =
   });
 
   // 檢查是否需要取消原始下載
-  chrome.storage.local.get(['cancelOriginalDownload', 'serverUrl'], async (result) => {
-    const serverUrl = result.serverUrl || 'http://localhost:8765';
+  chrome.storage.local.get(['cancelOriginalDownload'], async (result) => {
+    const serverUrl = SERVER_URL;
 
     // 讀取瀏覽器 cookie，連同 Referer / 真實 UA 一併轉送，讓本機應用能以
     // 「已通過驗證」的身份重抓檔案（部分檔案站綁 cookie，缺了就回驗證頁）。
@@ -340,7 +367,8 @@ function sendDownloadRequest(url, downloadId = null, filename = null, referrer =
           downloadId: downloadId,
           filename: filename,
           timestamp: Date.now(), // 添加時間戳避免重複
-          headers: headers // 瀏覽器 Cookie / Referer / UA，供本機應用重抓檔案
+          headers: headers, // 瀏覽器 Cookie / Referer / UA，供本機應用重抓檔案
+          resolve: resolveStream // true=解析影片連結（yt-dlp），false=當一般檔案直接下載
         })
       });
     })

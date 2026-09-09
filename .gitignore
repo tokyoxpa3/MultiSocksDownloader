@@ -25,6 +25,9 @@ dist/
 *.zip
 apply_update.ps1
 
+# ffmpeg 建置快取（build 時下載，不入版控）
+ffmpeg/
+
 # IDE / 編輯器
 .idea/
 .vscode/
