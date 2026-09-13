@@ -18,15 +18,40 @@
 
 import re
 import os
+import sys
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 # 強制走非 lazy 的 extractor 載入路徑：lazy_extractors.py 是 yt-dlp 安裝時
 # 生成的單一巨型模組，Nuitka 打包會讓 MSVC 編譯器 heap 溢位（C1002），
 # 故建置時以 --nofollow-import-to 排除，執行期改由 _extractors 匯入各獨立
 # extractor 模組。
 os.environ.setdefault('YTDLP_NO_LAZY_EXTRACTORS', '1')
+
+
+def _ensure_plugin_path():
+    """讓 yt-dlp 找得到隨程式打包的 yt_dlp_plugins 外掛目錄。
+
+    原始碼執行時 repo 根目錄本來就在 sys.path，yt-dlp 會自動掃到
+    yt_dlp_plugins；Nuitka 打包後執行檔旁的外掛目錄則不保證在 sys.path
+    （sys.executable 在打包後會指向內建 python.exe），故明確把程式所在
+    目錄插到最前面。重複呼叫無副作用。
+    """
+    dirs = [os.path.dirname(os.path.abspath(__file__))]
+    argv0 = sys.argv[0] if sys.argv else ''
+    if argv0:
+        dirs.append(os.path.dirname(os.path.abspath(argv0)))
+    exe = sys.executable or ''
+    if exe.lower().endswith('.exe'):
+        dirs.append(os.path.dirname(os.path.abspath(exe)))
+    for d in dirs:
+        if d and d not in sys.path:
+            sys.path.insert(0, d)
+
+
+_ensure_plugin_path()
 
 # 模組層級匯入（讓 Nuitka 靜態打包能偵測到 yt-dlp）；未安裝時設為 None，
 # resolver 會回傳結構化錯誤而非拋例外。
@@ -78,12 +103,14 @@ class StreamResolver(ABC):
 
     @abstractmethod
     def resolve(self, url, headers=None, max_height=None, max_fps=None,
-                audio_only=False):
+                audio_only=False, proxy=None):
         """解析影音網頁網址，回傳 StreamResolveResult。
 
         max_height：要求的最高畫質（像素高，如 1080）；None 表示不限（最高畫質）。
         max_fps   ：要求的最高幀率（如 30）；None 表示不限（自動）。
         audio_only：True 時只要音訊，不要視訊。
+        proxy     ：yt-dlp 用的代理 URL（如 socks5h://host:port）。帶上時改由
+                    代理端解析 DNS，可繞過本機 DNS 過濾/汙染。
         """
         raise NotImplementedError
 
@@ -98,21 +125,23 @@ class YtDlpStreamResolver(StreamResolver):
     """
 
     def resolve(self, url, headers=None, max_height=None, max_fps=None,
-                audio_only=False):
+                audio_only=False, proxy=None):
         if yt_dlp is None:
             return StreamResolveResult(
                 ok=False, error_kind='not_installed',
                 error='未安裝 yt-dlp，無法解析串流')
 
         # 先匿名解析（公開影片最穩）
-        result = self._resolve_once(url, None, max_height, max_fps, audio_only)
+        result = self._resolve_once(url, None, max_height, max_fps, audio_only,
+                                   proxy=proxy)
         if result.ok:
             return result
 
         # 匿名失敗（多半需登入），改帶瀏覽器 Cookie 重試一次
         anon_err = result.error or result.error_kind
         if headers:
-            result = self._resolve_once(url, headers, max_height, max_fps, audio_only)
+            result = self._resolve_once(url, headers, max_height, max_fps,
+                                       audio_only, proxy=proxy)
             if result.ok:
                 return result
         else:
@@ -125,7 +154,7 @@ class YtDlpStreamResolver(StreamResolver):
         return result
 
     def _resolve_once(self, url, headers, max_height=None, max_fps=None,
-                      audio_only=False):
+                      audio_only=False, proxy=None):
         """單次 yt-dlp 解析；成功與失敗都回傳結構化結果。"""
         opts = {
             'quiet': True,
@@ -137,6 +166,8 @@ class YtDlpStreamResolver(StreamResolver):
         }
         if headers:
             opts['http_headers'] = dict(headers)
+        if proxy:
+            opts['proxy'] = proxy
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -203,6 +234,9 @@ class FormatListResult:
     - fps_values：可用的視訊幀率（由高到低、去重）。
     - has_audio：是否有獨立音訊軌（「僅音訊」可選）。
     - title：影片標題（供 UI 在下載前預填存檔名稱；副檔名另由下載時決定）。
+    - variants：來源/集數型影片的選項清單（如 s1e01）。此類站的網址不隨切換
+      來源/集數改變，改以多個 format 呈現；每項為
+      {'format_id', 'source', 'episode'}。無此結構時為空 list。
     - error：失敗時的人類可讀原因。
     """
     ok: bool
@@ -210,10 +244,35 @@ class FormatListResult:
     fps_values: list = field(default_factory=list)
     has_audio: bool = False
     title: str = ''
-    error: str = '' 
+    error: str = ''
+    variants: list = field(default_factory=list)
 
 
-def list_video_formats(url, headers=None):
+# 「來源/集數」型 format_id 慣例：s<來源>e<集>（如 s1e01、s3e12）。
+_VARIANT_ID_RE = re.compile(r'^s(\d+)e(.+)$')
+
+
+def _extract_variants(fmts):
+    """從 format_id 認出「來源/集數」型格式（s<來源>e<集>）。
+
+    這類站（一劇一網址、切來源/集數不改網址）把完整清單以多個 format 呈現；
+    這裡整理成 UI 可用的來源/集數選項。非此命名慣例的站回傳空 list。
+    """
+    variants = []
+    for f in fmts:
+        fmt_id = f.get('format_id')
+        m = _VARIANT_ID_RE.match(str(fmt_id or ''))
+        if not m:
+            continue
+        variants.append({
+            'format_id': fmt_id,
+            'source': m.group(1),
+            'episode': m.group(2),
+        })
+    return variants
+
+
+def list_video_formats(url, headers=None, proxy=None):
     """解析影音網址可用的畫質（高度）與幀率，供 UI 在下載前顯示選項。
 
     僅讀取 formats、不下載；Cookie 會先抽掉（同原生下載，避免觸發 bot 檢查）。
@@ -231,6 +290,8 @@ def list_video_formats(url, headers=None):
     if headers:
         opts['http_headers'] = {k: v for k, v in headers.items()
                                 if k.lower() not in ('cookie', 'cookie2')}
+    if proxy:
+        opts['proxy'] = proxy
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -262,7 +323,29 @@ def list_video_formats(url, headers=None):
         fps_values=sorted(fpses, reverse=True),
         has_audio=has_audio,
         title=info.get('title') or '',
+        variants=_extract_variants(fmts),
     )
+
+
+def build_socks_proxy_url(proxy):
+    """把代理設定 dict 轉成 yt-dlp 可用的 socks5h URL。
+
+    用 socks5h（遠端 DNS）讓 DNS 由代理端解析，可繞過本機 DNS 過濾/汙染
+    （例如把影音站台以 RPZ 導向廣告頁的 DNS）。proxy 為 None 或缺少 host/port
+    時回傳 None。
+    """
+    if not proxy:
+        return None
+    host = proxy.get('host')
+    port = proxy.get('port')
+    if not host or not port:
+        return None
+    user = proxy.get('username') or ''
+    pwd = proxy.get('password') or ''
+    if user or pwd:
+        return 'socks5h://%s:%s@%s:%s' % (
+            quote(str(user), safe=''), quote(str(pwd), safe=''), host, port)
+    return 'socks5h://%s:%s' % (host, port)
 
 
 # 模組層級預設實例，供下游與相容函式共用。

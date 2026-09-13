@@ -20,11 +20,13 @@ from PySide6.QtGui import QFont, QColor, QPainter, QPainterPath, QPen
 from urllib.parse import urlparse, unquote, parse_qs
 
 from downloader import DownloadManager, format_size, probe_url_metadata, _sanitize_filename
-from stream_resolver import list_video_formats, is_direct_file
+from stream_resolver import (list_video_formats, is_direct_file,
+                             build_socks_proxy_url)
 from app_icon import load_app_icon
 import libtorrent as lt
 from bt_downloader import torrent_file_tree, magnet_display_name
 import file_association
+import startup
 import version
 import updater
 
@@ -554,8 +556,10 @@ class AddDownloadDialog(QDialog):
         self._show_stream_options = show_stream_options
 
         self._stream_container = QWidget()
-        stream_row = QHBoxLayout(self._stream_container)
-        stream_row.setContentsMargins(0, 0, 0, 0)
+        stream_box = QVBoxLayout(self._stream_container)
+        stream_box.setContentsMargins(0, 0, 0, 0)
+        stream_box.setSpacing(4)
+        stream_row = QHBoxLayout()
         stream_row.addWidget(QLabel("畫質："))
         self.quality_combo = QComboBox()
         for label, height, audio_only in STREAM_QUALITY_OPTIONS:
@@ -567,7 +571,28 @@ class AddDownloadDialog(QDialog):
             self.fps_combo.addItem(label, fps)
         stream_row.addWidget(self.fps_combo)
         stream_row.addStretch()
+        stream_box.addLayout(stream_row)
         self._stream_row_layout = stream_row
+
+        # 來源/集數列：僅在解析結果含 s<來源>e<集> 型格式時顯示（一劇一網址、
+        # 切來源/集數不改網址的站，由解析器把完整清單展開成多個 format）。
+        self._variants = []
+        self._series_title = ''
+        self._last_variant_name = ''
+        self._variant_container = QWidget()
+        variant_row = QHBoxLayout(self._variant_container)
+        variant_row.setContentsMargins(0, 0, 0, 0)
+        variant_row.addWidget(QLabel("來源："))
+        self.source_combo = QComboBox()
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        variant_row.addWidget(self.source_combo)
+        variant_row.addWidget(QLabel("集數："))
+        self.episode_combo = QComboBox()
+        self.episode_combo.currentIndexChanged.connect(self._on_variant_changed)
+        variant_row.addWidget(self.episode_combo)
+        variant_row.addStretch()
+        stream_box.addWidget(self._variant_container)
+        self._variant_container.setVisible(False)
 
         # 初始可見性：非自動偵測且（有核取框或遠端已決定解析）時才顯示。
         self._stream_row_visible = (not auto_detect) and (show_resolve or show_stream_options)
@@ -755,6 +780,46 @@ class AddDownloadDialog(QDialog):
         """最高幀率；None 表示自動。"""
         return self.fps_combo.currentData()
 
+    def stream_format_id(self):
+        """指定的來源/集數（yt-dlp format_id，如 s3e05）；未選則 None。"""
+        if not self._variants or not self._variant_container.isVisible():
+            return None
+        return self._variant_tag() or None
+
+    def _variant_tag(self):
+        src = self.source_combo.currentData()
+        ep = self.episode_combo.currentData()
+        if src is None or ep is None:
+            return ''
+        return f"s{src}e{ep}"
+
+    def _on_source_changed(self):
+        """切換來源時，重建該來源底下的集數清單。"""
+        src = self.source_combo.currentData()
+        self.episode_combo.blockSignals(True)
+        self.episode_combo.clear()
+        if src is not None:
+            for v in self._variants:
+                if v.get('source') == src:
+                    self.episode_combo.addItem(
+                        f"第{v.get('episode')}集", v.get('episode'))
+        self.episode_combo.blockSignals(False)
+        self._on_variant_changed()
+
+    def _on_variant_changed(self):
+        """來源/集數變更時更新自動檔名（不覆蓋使用者自訂的名稱）。"""
+        if not self._variants or not self._series_title:
+            return
+        tag = self._variant_tag()
+        if not tag:
+            return
+        current = self.name_edit.text().strip()
+        if current and current != self._last_variant_name:
+            return  # 使用者已自訂名稱，不覆蓋
+        name = _sanitize_filename(f"{self._series_title} [{tag}]")
+        self._last_variant_name = name
+        self.name_edit.setText(name)
+
     # ------------------------------------------------------------------ #
     # 格式預覽：勾選解析後，背景抓取真實畫質/幀率填入選單，並提示可用範圍
     # ------------------------------------------------------------------ #
@@ -795,9 +860,13 @@ class AddDownloadDialog(QDialog):
         self._stream_error_label.setVisible(False)
 
         headers = dict(getattr(self.download_manager, 'custom_headers', {}) or {})
+        # 解析也用代理（socks5h＝遠端 DNS），繞過本機 DNS 對影音站台的封鎖。
+        proxies = (self.download_manager.get_available_proxies()
+                   if self.download_manager else []) or []
+        proxy = build_socks_proxy_url(proxies[0]) if proxies else None
 
         def _run():
-            result = list_video_formats(url, headers=headers)
+            result = list_video_formats(url, headers=headers, proxy=proxy)
             try:
                 self._format_result.emit(gen, result)
             except RuntimeError:
@@ -808,7 +877,9 @@ class AddDownloadDialog(QDialog):
     def _apply_format_result(self, gen, result):
         if gen != self._format_gen:
             return
-        is_video = bool(result and result.ok and (result.heights or result.has_audio))
+        is_video = bool(result and result.ok and
+                        (result.heights or result.has_audio
+                         or getattr(result, 'variants', None)))
         if self._auto_detect:
             self._detected_video = is_video
             self._stream_container.setVisible(is_video)
@@ -870,11 +941,29 @@ class AddDownloadDialog(QDialog):
                 break
         self.fps_combo.blockSignals(False)
 
+        # 來源/集數下拉：解析結果含 s<來源>e<集> 型格式時才顯示。
+        self._variants = getattr(result, 'variants', None) or []
+        if self._variants:
+            sources = sorted({v['source'] for v in self._variants},
+                             key=lambda x: int(x))
+            self.source_combo.blockSignals(True)
+            self.source_combo.clear()
+            for s in sources:
+                self.source_combo.addItem(f"來源 {s}", s)
+            self.source_combo.blockSignals(False)
+            self._on_source_changed()
+            self._variant_container.setVisible(True)
+        else:
+            self._variant_container.setVisible(False)
+            self.source_combo.clear()
+            self.episode_combo.clear()
+
     def _maybe_prefill_title(self, result):
         """解析成功後，用影片標題預填「存檔名稱」（僅在使用者尚未自訂時）。
 
         只填標題本身、不含副檔名——副檔名在開始下載時由解析結果補上，
-        使用者不需要在此決定副檔名。
+        使用者不需要在此決定副檔名。含來源/集數選項時一併帶上標籤
+        （如「片名 [s1e01]」），避免多集下載互相覆蓋。
         """
         title = getattr(result, 'title', '') or ''
         if not title:
@@ -882,10 +971,14 @@ class AddDownloadDialog(QDialog):
         urls = self.urls()
         if len(urls) != 1:
             return
+        self._series_title = title
         current = self.name_edit.text().strip()
         auto = extract_filename_from_url(urls[0])
         if not current or current == auto:
-            self.name_edit.setText(_sanitize_filename(title))
+            tag = self._variant_tag() if self._variants else ''
+            name = _sanitize_filename(title + (f" [{tag}]" if tag else ""))
+            self._last_variant_name = name
+            self.name_edit.setText(name)
 
     def _clear_format_options(self):
         """清除格式預覽與錯誤訊息，並還原預設選單。"""
@@ -893,6 +986,12 @@ class AddDownloadDialog(QDialog):
         self._stream_error_label.setText("")
         self._stream_error_label.setVisible(False)
         self._reset_quality_options()
+        self._variants = []
+        self._series_title = ''
+        self._last_variant_name = ''
+        self._variant_container.setVisible(False)
+        self.source_combo.clear()
+        self.episode_combo.clear()
         if self._auto_detect:
             self._detected_video = False
             self._stream_container.setVisible(False)
@@ -1300,6 +1399,11 @@ class MainWindow(QMainWindow):
         self.assoc_checkbox.setChecked(file_association.is_registered())
         self.assoc_checkbox.blockSignals(False)
 
+        # 載入開機自動啟動狀態（實際狀態存於登錄檔，非設定檔）
+        self.auto_start_checkbox.blockSignals(True)
+        self.auto_start_checkbox.setChecked(startup.is_enabled())
+        self.auto_start_checkbox.blockSignals(False)
+
         # 載入「啟動時自動檢查更新」狀態
         self.auto_check_update_checkbox.blockSignals(True)
         self.auto_check_update_checkbox.setChecked(bool(self.download_manager.auto_check_update))
@@ -1673,7 +1777,7 @@ class MainWindow(QMainWindow):
         self.reset_preferences_button = QPushButton("還原預設設定")
         self.reset_preferences_button.setToolTip(
             "還原儲存目錄、限速、下載預設值、BT 各項數值、自訂表頭與自動更新"
-            "到預設值；SOCKS5 代理與下載歷史紀錄不會被清除。")
+            "到預設值；SOCKS5 代理、下載歷史紀錄與開機自動啟動不會被清除。")
         self.reset_preferences_button.clicked.connect(self.on_reset_preferences)
         reset_row = QHBoxLayout()
         reset_row.addWidget(self.reset_preferences_button)
@@ -1705,6 +1809,13 @@ class MainWindow(QMainWindow):
             "若 Windows 已指定其他預設程式，可能需要經「開啟檔案」對話框確認。")
         self.assoc_checkbox.toggled.connect(self.on_torrent_assoc_changed)
         misc_layout.addWidget(self.assoc_checkbox)
+
+        self.auto_start_checkbox = QCheckBox("開機時自動啟動")
+        self.auto_start_checkbox.setToolTip(
+            "登錄到目前使用者的啟動項目，開機登入後自動執行本程式。"
+            "僅影響目前使用者，不需系統管理員權限。")
+        self.auto_start_checkbox.toggled.connect(self.on_auto_start_changed)
+        misc_layout.addWidget(self.auto_start_checkbox)
 
         self.auto_check_update_checkbox = QCheckBox("啟動時自動檢查更新")
         self.auto_check_update_checkbox.setToolTip("開啟後，每次啟動會於背景檢查是否有新版本")
@@ -1770,6 +1881,7 @@ class MainWindow(QMainWindow):
                 stream_max_height=dialog.stream_max_height(),
                 stream_max_fps=dialog.stream_max_fps(),
                 stream_audio_only=dialog.stream_audio_only(),
+                stream_format_id=dialog.stream_format_id(),
             )
         finally:
             self._add_dialog_open = False
@@ -1833,6 +1945,7 @@ class MainWindow(QMainWindow):
                     stream_max_height=dialog.stream_max_height(),
                     stream_max_fps=dialog.stream_max_fps(),
                     stream_audio_only=dialog.stream_audio_only(),
+                    stream_format_id=dialog.stream_format_id(),
                 )
             except Exception as e:
                 QMessageBox.critical(self, "錯誤", f"添加下載任務失敗:\n{e}")
@@ -1868,7 +1981,8 @@ class MainWindow(QMainWindow):
 
     def _add_urls(self, urls, filename=None, silent=False, save_dir=None,
                   resolve_stream=False, stream_max_height=None,
-                  stream_max_fps=None, stream_audio_only=False):
+                  stream_max_fps=None, stream_audio_only=False,
+                  stream_format_id=None):
         """新增一批 URL 下載任務。回傳是否至少新增了一個任務。"""
         if not urls:
             return False
@@ -1903,6 +2017,7 @@ class MainWindow(QMainWindow):
                     stream_max_height=stream_max_height,
                     stream_max_fps=stream_max_fps,
                     stream_audio_only=stream_audio_only,
+                    stream_format_id=stream_format_id,
                 )
 
                 # 立即把任務加到表格（狀態先顯示為初始化）
@@ -2060,6 +2175,7 @@ class MainWindow(QMainWindow):
                 stream_max_height=dialog.stream_max_height(),
                 stream_max_fps=dialog.stream_max_fps(),
                 stream_audio_only=dialog.stream_audio_only(),
+                stream_format_id=dialog.stream_format_id(),
             )
         finally:
             self._add_dialog_open = False
@@ -2961,6 +3077,21 @@ class MainWindow(QMainWindow):
             file_association.unregister()
             self.statusBar().showMessage("已移除 .torrent 檔案關聯", 3000)
 
+    def on_auto_start_changed(self, checked):
+        """勾選/取消開機自動啟動（寫入目前使用者的 Run 機碼）。"""
+        if checked:
+            if not startup.enable():
+                QMessageBox.warning(
+                    self, "錯誤", "無法設定開機自動啟動，請稍後再試。")
+                self.auto_start_checkbox.blockSignals(True)
+                self.auto_start_checkbox.setChecked(False)
+                self.auto_start_checkbox.blockSignals(False)
+                return
+            self.statusBar().showMessage("已設定開機自動啟動", 3000)
+        else:
+            startup.disable()
+            self.statusBar().showMessage("已取消開機自動啟動", 3000)
+
     def maybe_auto_check_update(self):
         """啟動時若使用者啟用「自動檢查更新」，於背景檢查一次。"""
         if not self.download_manager.auto_check_update:
@@ -2981,7 +3112,7 @@ class MainWindow(QMainWindow):
             "確定要還原所有偏好設定到預設值嗎？\n\n"
             "會重置：儲存目錄、全域限速、下載預設值、BT 各項數值、\n"
             "自訂表頭、自動更新等。\n"
-            "不會清除：SOCKS5 代理、下載歷史紀錄。",
+            "不會清除：SOCKS5 代理、下載歷史紀錄、開機自動啟動。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:

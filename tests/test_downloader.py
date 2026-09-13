@@ -2,11 +2,15 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from downloader import DownloadTask, DownloadManager, format_size
+from downloader import (DownloadTask, DownloadManager, format_size,
+                        _better_filename, _filename_from_url,
+                        _looks_like_endpoint,
+                        LINE_FAIL_THRESHOLD, LINE_QUARANTINE_SECONDS)
 
 
 class TestFormatSize(unittest.TestCase):
@@ -466,6 +470,261 @@ class TestHandleRunFailure(unittest.TestCase):
         self.assertTrue(t._fatal)
         self.assertEqual(t.status, 'error')
         self.assertTrue(stop.is_set())
+
+
+class TestFilenameFromRedirect(unittest.TestCase):
+    """302 轉址、伺服器不帶 Content-Disposition 時，應改用最終網址推導檔名。"""
+
+    def test_filename_from_url_strips_query(self):
+        self.assertEqual(
+            _filename_from_url("https://x.com/a/b.pdf?X-Amz-Signature=abc"),
+            "b.pdf")
+
+    def test_filename_from_url_invalid(self):
+        self.assertEqual(_filename_from_url(""), "")
+        self.assertEqual(_filename_from_url(None), "")
+
+    def test_endpoint_detection(self):
+        self.assertTrue(_looks_like_endpoint("getfile.jsp"))
+        self.assertTrue(_looks_like_endpoint("download"))          # 無副檔名
+        self.assertFalse(
+            _looks_like_endpoint("postgresql-18.6-3-windows-x64.exe"))
+
+    def test_better_filename_upgrades_endpoint(self):
+        self.assertEqual(
+            _better_filename("getfile.jsp", "pkg-1.2.exe"), "pkg-1.2.exe")
+
+    def test_better_filename_keeps_custom_name(self):
+        self.assertEqual(
+            _better_filename("My Video.mp4", "pkg-1.2.exe"), "My Video.mp4")
+
+    def test_better_filename_rejects_endpoint_candidate(self):
+        # 轉址目標本身也是端點（無副檔名）時，不應覆蓋原值
+        self.assertEqual(
+            _better_filename("getfile.jsp", "videoplayback"), "getfile.jsp")
+
+    def test_prepare_uses_redirect_target(self):
+        tmpdir = tempfile.mkdtemp()
+        t = DownloadTask(
+            "https://sbp.enterprisedb.com/getfile.jsp?fileid=1260486", tmpdir)
+        self.assertEqual(t.filename, "getfile.jsp")
+        t._probe = lambda lines: {
+            "headers": {},
+            "resolved_url": ("https://get.enterprisedb.com/postgresql/"
+                             "postgresql-18.6-3-windows-x64.exe"),
+            "supports_range": False,
+            "total_size": 0,
+        }
+        self.assertTrue(t.prepare())
+        self.assertEqual(t.filename, "postgresql-18.6-3-windows-x64.exe")
+
+    def test_prepare_prefers_content_disposition(self):
+        tmpdir = tempfile.mkdtemp()
+        t = DownloadTask("https://x.com/getfile.jsp?fileid=1", tmpdir)
+        t._probe = lambda lines: {
+            "headers": {
+                "content-disposition": 'attachment; filename="real.zip"'},
+            "resolved_url": "https://cdn.x.com/other.exe",
+            "supports_range": False,
+            "total_size": 0,
+        }
+        self.assertTrue(t.prepare())
+        self.assertEqual(t.filename, "real.zip")
+
+
+class _DeadThread:
+    def is_alive(self):
+        return False
+
+
+class _AliveThread:
+    def is_alive(self):
+        return True
+
+
+class TestLineHealth(unittest.TestCase):
+    """線路連續失敗後應暫時隔離，避免壞線把無辜區塊的重試次數推向 fatal。"""
+
+    def _proxy(self):
+        return {"host": "1.2.3.4", "port": 1080}
+
+    def test_quarantine_after_threshold(self):
+        t = DownloadTask("http://example.com/f.bin", tempfile.mkdtemp())
+        p = self._proxy()
+        for _ in range(LINE_FAIL_THRESHOLD):
+            t._note_line_failure(p)
+        self.assertFalse(t._line_available(p, time.monotonic()))
+        # 隔離期滿後應恢復可用
+        self.assertTrue(
+            t._line_available(p, time.monotonic() + LINE_QUARANTINE_SECONDS + 1))
+
+    def test_success_clears_quarantine(self):
+        t = DownloadTask("http://example.com/f.bin", tempfile.mkdtemp())
+        p = self._proxy()
+        for _ in range(LINE_FAIL_THRESHOLD):
+            t._note_line_failure(p)
+        t._note_line_success(p)
+        self.assertTrue(t._line_available(p, time.monotonic()))
+
+    def test_next_line_skips_quarantined(self):
+        t = DownloadTask("http://example.com/f.bin", tempfile.mkdtemp(),
+                         proxies=[self._proxy()])
+        t._lines = t._build_lines()      # [None, proxy]
+        p = self._proxy()
+        for _ in range(LINE_FAIL_THRESHOLD):
+            t._note_line_failure(p)
+        # 代理被隔離後，輪派應只挑到直連（None）
+        for _ in range(4):
+            self.assertIsNone(t._next_line(time.monotonic()))
+
+
+class TestWorkerRespawn(unittest.TestCase):
+    """worker 全數退場後，看門狗必須補位，否則任務會永久卡在 downloading。"""
+
+    def _make(self):
+        t = DownloadTask("http://example.com/f.bin", tempfile.mkdtemp(),
+                         filename="f.bin")
+        t.total_size = 1000
+        t.block_size = 100
+        t.block_count = 10
+        t.bitmap = bytearray((10 + 7) // 8)
+        t._claimed = bytearray((10 + 7) // 8)
+        t._single_mode = False
+        t._lines = [None]
+        t._target_workers = 2
+        t.threads_per_proxy = 2
+        t._spawn_index = 0
+        return t
+
+    def test_respawns_when_all_workers_dead(self):
+        t = self._make()
+        spawned = []
+        t._spawn_http_workers = lambda stop, count: spawned.append(count)
+        t._workers = [_DeadThread()]
+        self.assertTrue(t._maintain_workers(_StopFlag()))
+        self.assertEqual(spawned, [2])
+
+    def test_no_respawn_while_worker_alive(self):
+        t = self._make()
+        spawned = []
+        t._spawn_http_workers = lambda stop, count: spawned.append(count)
+        t._workers = [_AliveThread()]
+        self.assertFalse(t._maintain_workers(_StopFlag()))
+        self.assertEqual(spawned, [])
+
+    def test_respawn_clears_stale_claims(self):
+        t = self._make()
+        t._spawn_http_workers = lambda stop, count: None
+        t._workers = []
+        t._set_block_claimed(0)
+        t._set_block_claimed(1)
+        self.assertTrue(t._maintain_workers(_StopFlag()))
+        self.assertFalse(t._is_block_claimed(0))
+        self.assertFalse(t._is_block_claimed(1))
+
+
+class TestRunStallDetection(unittest.TestCase):
+    """線路慢速滴流時，_write_run 應主動中斷該 run 並計一次重試。"""
+
+    def _make(self):
+        t = DownloadTask("http://example.com/f.bin", tempfile.mkdtemp(),
+                         filename="f.bin")
+        t.total_size = 500
+        t.block_size = 100
+        t.block_count = 5
+        t.bitmap = bytearray((5 + 7) // 8)
+        t._claimed = bytearray((5 + 7) // 8)
+        t._single_mode = False
+        t.chunk_size = 150
+        # 測試用：窗長歸零、門檻拉高，首批 150 bytes 即被判定停滯。
+        t.STALL_WINDOW = 0.0
+        t.STALL_MIN_BYTES = 1024
+        with open(t.temp_filepath, 'wb') as f:
+            f.truncate(t.total_size)
+        return t
+
+    def test_slow_trickle_aborts_run(self):
+        t = self._make()
+        for i in range(5):
+            t._set_block_claimed(i)
+        r = _FakeResp(bytes(range(256)) * 2, chunk_size=150)
+        stop = _StopFlag()
+        result = t._write_run(0, 4, 0, 499, r, stop, None)
+        self.assertEqual(result, 'fail')
+        self.assertTrue(r.closed)
+        self.assertGreaterEqual(sum(t._block_retries.values()), 1)
+        self.assertFalse(t._fatal)
+
+
+class TestSingleModeRetry(unittest.TestCase):
+    """單線模式失敗應自動重試，且失敗時不得把半成品標記為完成。"""
+
+    def _make(self):
+        t = DownloadTask("http://example.com/f.bin", tempfile.mkdtemp(),
+                         filename="f.bin")
+        t._single_mode = True
+        t.RETRY_BACKOFF = 0.0
+        return t
+
+    def test_retries_then_succeeds(self):
+        t = self._make()
+        attempts = {'n': 0}
+
+        def fake(proxy, stop):
+            attempts['n'] += 1
+            return attempts['n'] >= 2
+
+        t._single_attempt = fake
+        completed = []
+        t.complete_download = lambda: completed.append(True)
+        t._single_worker(None, t._stop)
+        self.assertEqual(attempts['n'], 2)
+        self.assertEqual(completed, [True])
+
+    def test_marks_error_after_max_retries(self):
+        t = self._make()
+        t._single_attempt = lambda proxy, stop: False
+        t.error_message = 'boom'
+        t.complete_download = lambda: self.fail("失敗的任務不該被標記為完成")
+        t._single_worker(None, t._stop)
+        self.assertEqual(t.status, 'error')
+        self.assertEqual(t.error_message, 'boom')
+
+
+class TestRetryCounterReset(unittest.TestCase):
+    def test_block_done_clears_retry_counter(self):
+        t = DownloadTask("http://example.com/f.bin", tempfile.mkdtemp(),
+                         filename="f.bin")
+        t.total_size = 1000
+        t.block_size = 100
+        t.block_count = 10
+        t.bitmap = bytearray((10 + 7) // 8)
+        t._single_mode = False
+        t._block_retries[3] = 2
+        t._set_block_done(3)
+        self.assertNotIn(3, t._block_retries)
+
+
+class TestCompleteGuard(unittest.TestCase):
+    """complete_download 只允許在 downloading 狀態收尾。"""
+
+    def test_error_task_not_marked_completed(self):
+        t = DownloadTask("http://example.com/f.bin", tempfile.mkdtemp(),
+                         filename="f.bin")
+        t._set_status('error')
+        t.complete_download()
+        self.assertEqual(t.status, 'error')
+
+    def test_downloading_task_completes(self):
+        tmpdir = tempfile.mkdtemp()
+        t = DownloadTask("http://example.com/f.bin", tmpdir, filename="f.bin")
+        with open(t.temp_filepath, 'wb') as f:
+            f.write(b'0123456789')
+        t._set_status('downloading')
+        t.complete_download()
+        self.assertEqual(t.status, 'completed')
+        self.assertTrue(os.path.exists(t.filepath))
+        self.assertFalse(os.path.exists(t.temp_filepath))
 
 
 if __name__ == "__main__":

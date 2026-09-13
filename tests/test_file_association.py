@@ -98,5 +98,33 @@ class TestTriggerSystemDialog(unittest.TestCase):
             self.assertEqual(shell.ShellExecuteW.call_args.args[1], "openas")
 
 
+class TestFrozenDetection(unittest.TestCase):
+    def test_not_frozen_in_source_run(self):
+        self.assertFalse(file_association._is_frozen())
+
+    def test_nuitka_compiled_marker_counts_as_frozen(self):
+        # Nuitka 不設 sys.frozen，只注入 __compiled__；須能正確辨識
+        file_association.__compiled__ = True
+        try:
+            self.assertTrue(file_association._is_frozen())
+        finally:
+            del file_association.__compiled__
+
+
+class TestFrozenCommand(unittest.TestCase):
+    def test_frozen_command_points_at_real_exe(self):
+        # 打包版：sys.executable 會是 dist\python.exe，真正 exe 在 argv[0]，
+        # 命令必須指向 argv[0]，且不得含 .py 腳本或 python.exe。
+        with mock.patch.object(file_association, "_is_frozen", return_value=True), \
+             mock.patch.object(file_association.sys, "argv",
+                               [r"D:\app\MultiSocksDownloader.exe"]), \
+             mock.patch.object(file_association.sys, "executable",
+                               r"D:\app\python.exe"):
+            cmd = file_association.executable_command()
+        self.assertEqual(cmd, '"D:\\app\\MultiSocksDownloader.exe" "%1"')
+        self.assertNotIn(".py", cmd)
+        self.assertNotIn("python.exe", cmd)
+
+
 if __name__ == "__main__":
     unittest.main()

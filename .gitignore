@@ -35,3 +35,15 @@ ffmpeg/
 
 # ZCode 本地 session 資料
 .zcode/
+
+# extractor_maker 本地設定（含 LLM API key，不入版控）
+tools/extractor_maker/config.json
+
+# extractor_maker 產出的獨立 resolver 腳本（本機開發用，不入版控）
+resolvers/
+
+# 自訂 yt-dlp 外掛放置目錄（本機開發用，整個目錄不入版控）
+yt_dlp_plugins/
+
+# Nuitka 編譯崩潰傾印（本機建置產物，不入版控）
+nuitka-crash-report.xml

@@ -17,7 +17,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from ftp_downloader import SocksFTP, parse_ftp_url
 from bt_downloader import BTTask, DHTService, DHTGovernor, source_kind, bt_info_hash
 import stream_resolver
-from stream_resolver import YtDlpStreamResolver, build_native_format_selector
+from stream_resolver import (YtDlpStreamResolver, build_native_format_selector,
+                             build_socks_proxy_url)
 
 logger = logging.getLogger('downloader')
 
@@ -31,6 +32,19 @@ MAX_BLOCKS = 4096
 # 隱藏，run 不需太大；過大的 run 會在 worker 數多時讓 run 數少於 worker 數，
 # 導致分攤不均、預取失效、完成時 worker 驟減造成速率斷崖。64 MiB 為平衡值。
 TARGET_RUN_BYTES = 64 * 1024 * 1024
+
+# HTTP 分段引擎的卡死防護（BT 引擎有 _stall_rescue，這裡補上對應機制）。
+# worker 在區段失敗後會自行退場；若無人補位，剩餘區塊就永遠沒人下載，
+# 任務會無聲卡在 downloading（進度凍結、不報錯也不重試），故需要看門狗。
+LINE_FAIL_THRESHOLD = 3           # 同一線路連續失敗達此次數即暫時隔離
+LINE_QUARANTINE_SECONDS = 60.0    # 線路隔離時間（秒），期滿自動恢復使用
+FAIL_RETRY_BACKOFF = (0.3, 1.0)   # 失敗後退場前的隨機退避（秒），避免緊密重試
+WATCHDOG_INTERVAL = 2.0           # 看門狗掃描間隔（秒）
+TASK_STALL_TIMEOUT = 60.0         # 全任務連續無進度達此秒數視為停滯一輪
+MAX_STALL_ROUNDS = 3              # 連續停滯達此輪數即判定失敗，讓使用者可重試
+
+# 哨兵：代表「沒有任何可用線路」。None 是合法線路（直連），不能拿來當哨兵。
+_NO_LINE = object()
 
 
 class _NativeStopped(Exception):
@@ -47,6 +61,44 @@ def format_size(size_bytes):
         value /= 1024
         i += 1
     return f"{value:.2f} {names[i]}"
+
+
+# 伺服器端腳本／下載端點常見的副檔名：這類路徑的 basename 通常不是真實檔名，
+# 只是端點名稱（例如 getfile.jsp、download.php）。真名往往藏在 302 轉址後的網址。
+_ENDPOINT_EXTS = {
+    'jsp', 'jspx', 'php', 'php3', 'php4', 'php5', 'phtml',
+    'asp', 'aspx', 'cgi', 'pl', 'do', 'action', 'json', 'html', 'htm',
+}
+
+
+def _filename_from_url(url):
+    """取出網址路徑的 basename（忽略 query），無效網址回空字串。"""
+    if not url:
+        return ''
+    try:
+        return os.path.basename(unquote(urlparse(url).path))
+    except Exception:
+        return ''
+
+
+def _looks_like_endpoint(name):
+    """判斷 basename 是否像下載端點而非真實檔名（無副檔名或為腳本副檔名）。"""
+    base = (name or '').rsplit('/', 1)[-1]
+    if '.' not in base:
+        return True
+    return base.rsplit('.', 1)[-1].lower() in _ENDPOINT_EXTS
+
+
+def _better_filename(current, candidate):
+    """在 current 像端點、而 candidate 像真實檔名時改用 candidate，否則保留原值。
+
+    用於伺服器未提供 Content-Disposition 時，改由跟隨轉址後的最終網址推導檔名。
+    """
+    if not candidate or _looks_like_endpoint(candidate):
+        return current
+    if not current or _looks_like_endpoint(current):
+        return candidate
+    return current
 
 
 def probe_url_metadata(url, proxies=None, headers=None, timeout=(3, 5)):
@@ -104,6 +156,10 @@ def probe_url_metadata(url, proxies=None, headers=None, timeout=(3, 5)):
             else:
                 size = int(r.headers.get('content-length', 0) or 0)
             filename = DownloadTask._filename_from_headers(r.headers)
+            if not filename:
+                # 伺服器未提供 Content-Disposition（例如 302 轉址到 S3/CDN 且不帶
+                # 該標頭）時，改用跟隨轉址後的最終網址推導檔名。
+                filename = _better_filename(None, _filename_from_url(r.url))
             r.close()
             return {'filename': filename, 'size': size}
         except Exception:
@@ -209,12 +265,19 @@ class DownloadTask:
     CHUNK_SIZE = 64 * 1024
     CHUNK_SIZE_LARGE = 256 * 1024
     CHUNK_SIZE_XLARGE = 1024 * 1024
+    # 線路停滯判定：在 STALL_WINDOW 秒的滾動窗內收到的位元組少於
+    # STALL_MIN_BYTES，即視為該線路卡住（慢速滴流），主動中斷本次 run
+    # 交由其他線路接手。設有全域限速時不啟用，避免低速但正常的下載被誤判。
+    STALL_WINDOW = 30.0
+    STALL_MIN_BYTES = 8 * 1024
+    # 單線模式失敗重試的退避基準（秒）：base * 2^(n-1)，上限 10 秒。
+    RETRY_BACKOFF = 1.0
 
     def __init__(self, url, save_dir, filename=None, proxies=None,
                  chunks_per_part=100, threads_per_proxy=3, headers=None,
                  rate_limiter=None, resolve_stream=False, stream_resolver=None,
                  stream_max_height=None, stream_max_fps=None,
-                 stream_audio_only=False):
+                 stream_audio_only=False, stream_format_id=None):
         self.url = url
         self.save_dir = save_dir
 
@@ -253,6 +316,10 @@ class DownloadTask:
         self._stream_max_height = stream_max_height
         self._stream_max_fps = stream_max_fps
         self._stream_audio_only = bool(stream_audio_only)
+        # 指定要下載的來源/集數（yt-dlp format_id，如 s3e05）。空字串＝不指定，
+        # 走通用 bestvideo+bestaudio 選擇。用於一劇一網址、切來源/集數不改網址
+        # 的站（由解析器提供 s<來源>e<集> 形式的 formats）。
+        self._stream_format_id = stream_format_id or ''
         self.chunk_size = self.CHUNK_SIZE
 
         self.filename = filename
@@ -303,6 +370,12 @@ class DownloadTask:
 
         self._workers = []
         self._completion_thread = None
+        # HTTP 分段引擎看門狗狀態：目標 worker 數、線路輪派索引、線路健康度。
+        self._target_workers = 0
+        self._spawn_index = 0
+        self._lines = []
+        self._line_fail = {}                 # line_key -> 連續失敗次數
+        self._line_quarantine_until = {}     # line_key -> 隔離到期（monotonic）
 
         self._speed_history = deque(maxlen=30)
         self._last_time = time.time()
@@ -409,6 +482,55 @@ class DownloadTask:
             return 'direct'
         return f"proxy:{line.get('host')}:{line.get('port')}"
 
+    def _line_available(self, line, now):
+        """該線路目前是否可用（未被暫時隔離）。"""
+        with self._lock:
+            until = self._line_quarantine_until.get(self._line_key(line), 0.0)
+        return now >= until
+
+    def _next_line(self, now):
+        """輪詢挑一條未隔離的線路；全部都在隔離中則回傳 _NO_LINE。"""
+        lines = self._lines or [None]
+        for _ in range(len(lines)):
+            line = lines[self._spawn_index % len(lines)]
+            self._spawn_index += 1
+            if self._line_available(line, now):
+                return line
+        return _NO_LINE
+
+    def _note_line_failure(self, proxy):
+        """記錄線路失敗；連續失敗達門檻即暫時隔離。
+
+        沒有這層隔離時，一條壞線會不斷被重新派工、反覆失敗同一批區塊，
+        最終把無辜區塊的重試次數推到 MAX_RETRIES 而讓整個任務失敗——即使
+        其他線路都正常。
+        """
+        key = self._line_key(proxy)
+        with self._lock:
+            n = self._line_fail.get(key, 0) + 1
+            if n >= LINE_FAIL_THRESHOLD:
+                self._line_fail[key] = 0
+                self._line_quarantine_until[key] = (
+                    time.monotonic() + LINE_QUARANTINE_SECONDS)
+                logger.warning(
+                    "event=line_quarantined task_id=%s line=%s failures=%s "
+                    "cooldown=%.0fs", self.task_id, key, n,
+                    LINE_QUARANTINE_SECONDS)
+            else:
+                self._line_fail[key] = n
+
+    def _note_line_success(self, proxy):
+        """線路成功：清掉連續失敗計數與隔離狀態。"""
+        key = self._line_key(proxy)
+        with self._lock:
+            self._line_fail.pop(key, None)
+            self._line_quarantine_until.pop(key, None)
+
+    def _stall_check_enabled(self):
+        """是否啟用線路停滯判定。設有全域限速時停用，避免低速但正常的下載
+        （每個 worker 分到的頻寬本來就少）被誤判為卡住。"""
+        return self.rate_limiter is None or self.rate_limiter.get_rate() <= 0
+
     # ------------------------------------------------------------------ #
     # 進度單一資料源：bitmap，每一位元代表一個區塊，1=已完成（且已 fsync 落盤）。
     # ------------------------------------------------------------------ #
@@ -421,6 +543,9 @@ class DownloadTask:
         start, end = self._block_bounds(idx)
         self.bitmap[idx >> 3] |= (1 << (idx & 7))
         self._completed_bytes += (end - start)
+        # 區塊已完成，清掉它的重試計數：讓「先在壞線上失敗、之後在好線上成功」
+        # 的區塊不會把累計失敗帶到 fatal 而誤殺整個任務。
+        self._block_retries.pop(idx, None)
 
     def _block_bounds(self, idx):
         start = idx * self.block_size
@@ -518,6 +643,7 @@ class DownloadTask:
                         'stream_max_height': self._stream_max_height,
                         'stream_max_fps': self._stream_max_fps,
                         'stream_audio_only': self._stream_audio_only,
+                        'stream_format_id': self._stream_format_id,
                     }
 
                 tmp = f"{self.progress_filepath}.tmp"
@@ -553,6 +679,8 @@ class DownloadTask:
             self._stream_max_height = data.get('stream_max_height')
             self._stream_max_fps = data.get('stream_max_fps')
             self._stream_audio_only = data.get('stream_audio_only', False)
+            self._stream_format_id = (data.get('stream_format_id')
+                                      or self._stream_format_id)
 
             # 舊格式（segments）不支援，視為新下載
             if 'bitmap' not in data:
@@ -645,6 +773,11 @@ class DownloadTask:
             self._compute_chunk_size()
 
             hname = self._filename_from_headers(info['headers'])
+            if not hname:
+                # 無 Content-Disposition 時，改用轉址後最終網址推導檔名：
+                # 例如 getfile.jsp 302 到 postgresql-18.6-3-windows-x64.exe。
+                hname = _better_filename(
+                    self.filename, _filename_from_url(info.get('resolved_url')))
             if hname:
                 self.filename = hname
                 self.filepath = os.path.join(self.save_dir, self.filename)
@@ -707,11 +840,16 @@ class DownloadTask:
             return True
         # 把瀏覽器送來的 Cookie/User-Agent 一起帶給 resolver：需登入的影片少了
         # Cookie 時 extract_info 會直接回 None。
+        # 解析也帶上代理（socks5h＝遠端 DNS）：本機 DNS 若把影音站台以 RPZ
+        # 封鎖/導向廣告頁，Python 直連會拿到自簽憑證而 SSL 失敗；走代理可繞過。
+        resolve_proxy = build_socks_proxy_url(
+            self.proxies[0] if self.proxies else None)
         result = self._stream_resolver.resolve(
             self.url, headers=self.headers,
             max_height=self._stream_max_height,
             max_fps=self._stream_max_fps,
-            audio_only=self._stream_audio_only)
+            audio_only=self._stream_audio_only,
+            proxy=resolve_proxy)
         if not result.ok:
             self.error_reason = result.error_kind or 'stream_resolve_failed'
             logger.error("event=resolve_failed task_id=%s url=%s reason=%s error=%s",
@@ -1019,6 +1157,10 @@ class DownloadTask:
             state = self._request_run(run[0], run[1], session, stop, proxy)
             while not stop.is_set():
                 if state in ('done', 'fail'):
+                    if state == 'fail' and not stop.is_set():
+                        # 失敗退避：worker 退場後由看門狗補位；退避可避免瞬斷
+                        # 的線路被反覆補位時緊密重試，瞬間把區塊重試次數推滿。
+                        time.sleep(random.uniform(*FAIL_RETRY_BACKOFF))
                     break
                 if state == 'fallback':
                     self._fallback_event.set()
@@ -1046,6 +1188,8 @@ class DownloadTask:
                     with self._lock:
                         for b in range(start_idx, end_idx + 1):
                             self._active_blocks.discard(b)
+                if result == 'ok':
+                    self._note_line_success(proxy)
                 try:
                     session.close()
                 except Exception:
@@ -1105,7 +1249,7 @@ class DownloadTask:
                             timeout=(15, 60), allow_redirects=True)
         except Exception as e:
             self._handle_run_failure(
-                start_idx, end_idx, start_idx, f"連接失敗: {e}", stop)
+                start_idx, end_idx, start_idx, f"連接失敗: {e}", stop, proxy)
             return 'fail'
 
         if r.status_code == 206:
@@ -1120,7 +1264,8 @@ class DownloadTask:
         if r.status_code == 416:
             r.close()
             self._handle_run_failure(
-                start_idx, end_idx, start_idx, "HTTP 416：範圍請求被拒絕", stop)
+                start_idx, end_idx, start_idx, "HTTP 416：範圍請求被拒絕",
+                stop, proxy, line_fault=False)
             return 'fail'
         r.close()
         # 403/401 可能是簽名 URL 已過期：清掉快取後用原始 URL 重解析一次。
@@ -1128,7 +1273,8 @@ class DownloadTask:
             self._resolved_url = None
             return self._request_run(start_idx, end_idx, session, stop, proxy)
         self._handle_run_failure(
-            start_idx, end_idx, start_idx, f"HTTP {r.status_code}", stop)
+            start_idx, end_idx, start_idx, f"HTTP {r.status_code}",
+            stop, proxy, line_fault=False)
         return 'fail'
 
     def _prefetch_run(self, start_idx, end_idx, proxy, stop, box):
@@ -1145,6 +1291,10 @@ class DownloadTask:
         key = self._line_key(proxy)
         pos = req_start
         cur_idx = start_idx
+        # 停滯偵測窗：窗內收到的位元組過少即判定這條線卡住（例如慢速滴流），
+        # 主動中斷本次 run、釋放認領交由其他線路接手，而不是無限期佔著區塊。
+        win_start = time.monotonic()
+        win_bytes = 0
         try:
             with open(self.temp_filepath, 'r+b') as f:
                 f.seek(req_start)
@@ -1161,6 +1311,7 @@ class DownloadTask:
                         self.rate_limiter.acquire(len(data))
                     f.write(data)
                     pos += len(data)
+                    win_bytes += len(data)
                     with self._lock:
                         self._line_bytes[key] = self._line_bytes.get(key, 0) + len(data)
                         # 邊跨過區塊邊界就標記該區塊完成，直到停在目前這個未完區塊
@@ -1174,6 +1325,17 @@ class DownloadTask:
                             else:
                                 self._partial[cur_idx] = pos - bstart
                                 break
+                    if self._stall_check_enabled():
+                        now = time.monotonic()
+                        if now - win_start >= self.STALL_WINDOW:
+                            if win_bytes < self.STALL_MIN_BYTES:
+                                r.close()
+                                return self._handle_run_failure(
+                                    start_idx, end_idx, cur_idx,
+                                    f"線路停滯: {win_bytes} bytes/"
+                                    f"{now - win_start:.0f}s", stop, proxy)
+                            win_start = now
+                            win_bytes = 0
                 r.close()
                 f.flush()
             # 不再逐片 fsync：落盤統一由 save_progress()（每 5 秒）與
@@ -1185,14 +1347,14 @@ class DownloadTask:
                 return 'ok'
             return self._handle_run_failure(
                 start_idx, end_idx, cur_idx,
-                f"區段下載不完整: {pos - req_start}/{need}", stop)
+                f"區段下載不完整: {pos - req_start}/{need}", stop, proxy)
         except Exception as e:
             try:
                 r.close()
             except Exception:
                 pass
             return self._handle_run_failure(
-                start_idx, end_idx, cur_idx, f"寫入失敗: {e}", stop)
+                start_idx, end_idx, cur_idx, f"寫入失敗: {e}", stop, proxy)
 
     def _handle_run_fallback(self, start_idx, end_idx):
         """伺服器忽略 Range（回 200）：釋放本段認領，交由呼叫端切換單線模式。"""
@@ -1202,16 +1364,24 @@ class DownloadTask:
                     self._clear_block_claimed(b)
         return 'fallback'
 
-    def _handle_run_failure(self, start_idx, end_idx, failed_idx, reason, stop):
-        """段下載失敗：釋放尚未完成區塊的認領，並對失敗所在區塊計一次重試。"""
+    def _handle_run_failure(self, start_idx, end_idx, failed_idx, reason, stop,
+                            proxy=None, line_fault=True):
+        """段下載失敗：釋放尚未完成區塊的認領，並對失敗所在區塊計一次重試。
+
+        line_fault=False 表示失敗與線路無關（例如伺服器回 4xx/5xx、416），
+        不列入線路健康計數，避免把正常線路誤判成壞線而隔離。
+        """
         with self._lock:
             for b in range(start_idx, end_idx + 1):
                 if not self._is_block_done(b):
                     self._clear_block_claimed(b)
+        if line_fault:
+            self._note_line_failure(proxy)
         if stop.is_set():
             return 'fail'
-        retries = self._block_retries.get(failed_idx, 0) + 1
-        self._block_retries[failed_idx] = retries
+        with self._lock:
+            retries = self._block_retries.get(failed_idx, 0) + 1
+            self._block_retries[failed_idx] = retries
         logger.warning("區段 %s-%s 失敗於區塊 %s: %s (重試 %s/%s)",
                        start_idx, end_idx, failed_idx, reason, retries, self.MAX_RETRIES)
         if retries >= self.MAX_RETRIES:
@@ -1225,8 +1395,9 @@ class DownloadTask:
     def _handle_block_failure(self, idx, reason, stop):
         if stop.is_set():
             return 'fail'
-        retries = self._block_retries.get(idx, 0) + 1
-        self._block_retries[idx] = retries
+        with self._lock:
+            retries = self._block_retries.get(idx, 0) + 1
+            self._block_retries[idx] = retries
         logger.warning("區塊 %s %s (重試 %s/%s)", idx, reason, retries, self.MAX_RETRIES)
         if retries >= self.MAX_RETRIES:
             self.error_message = f"區塊 {idx} 下載失敗: {reason}"
@@ -1242,25 +1413,62 @@ class DownloadTask:
             return self._popcount() == self.block_count
 
     def _single_worker(self, proxy, stop):
+        """單線模式（伺服器不支援 Range）：整檔下載，失敗自動重試。
+
+        單線模式無法續傳，每次重試都從頭寫入暫存檔；重試上限沿用
+        MAX_RETRIES，並以指數退避避免對故障線路緊密重試。只有成功才收尾，
+        失敗保留 error 狀態（不再把半成品誤標為完成）。
+        """
+        succeeded = False
+        attempt = 0
+        while not stop.is_set() and attempt < self.MAX_RETRIES:
+            attempt += 1
+            if self._single_attempt(proxy, stop):
+                succeeded = True
+                break
+            if stop.is_set():
+                break
+            delay = min(10.0, self.RETRY_BACKOFF * (2 ** (attempt - 1)))
+            logger.warning("event=single_retry task_id=%s attempt=%s/%s "
+                           "delay=%.1fs error=%s",
+                           self.task_id, attempt, self.MAX_RETRIES, delay,
+                           self.error_message)
+            if stop.wait(delay):
+                break
+        if succeeded:
+            # 只有仍是當前世代（stop 未被新 start() 取代）才允許完成收尾，
+            # 避免暫停/恢復後舊 worker 誤把新世代的下載標記為完成。
+            if stop is self._stop:
+                self.complete_download()
+        elif not stop.is_set():
+            self._set_status('error', reason='single_failed')
+
+    def _single_attempt(self, proxy, stop):
+        """單線模式的一次完整嘗試；成功回 True，失敗回 False 並設 error_message。"""
         session = self._make_session(proxy)
+        r = None
         try:
             headers = self._request_headers()
-            r = session.get(self._resolved_url or self.url, headers=headers, stream=True,
-                            timeout=(15, 60), allow_redirects=True)
+            r = session.get(self._resolved_url or self.url, headers=headers,
+                            stream=True, timeout=(15, 60), allow_redirects=True)
             if r.status_code != 200:
-                self._set_status('error', reason='http_status')
                 self.error_message = f"HTTP {r.status_code}"
                 r.close()
-                return
+                return False
             cl = r.headers.get('content-length')
-            if cl:
-                self.total_size = int(cl)
+            with self._lock:
+                if cl:
+                    self.total_size = int(cl)
+                # 每次重試都從頭寫入，位元組計數歸零避免進度虛胖。
+                self.downloaded_size = 0
             bytes_since_fsync = 0
             key = self._line_key(proxy)
+            win_start = time.monotonic()
+            win_bytes = 0
             with open(self.temp_filepath, 'wb') as f:
                 for chunk in r.iter_content(self.chunk_size):
                     if stop.is_set():
-                        break
+                        return False
                     if not chunk:
                         continue
                     if self.rate_limiter is not None:
@@ -1270,26 +1478,39 @@ class DownloadTask:
                         self.downloaded_size += len(chunk)
                         self._line_bytes[key] = self._line_bytes.get(key, 0) + len(chunk)
                     bytes_since_fsync += len(chunk)
+                    win_bytes += len(chunk)
                     if bytes_since_fsync >= 8 * 1024 * 1024:
                         f.flush()
                         os.fsync(f.fileno())
                         bytes_since_fsync = 0
+                    if self._stall_check_enabled():
+                        now = time.monotonic()
+                        if now - win_start >= self.STALL_WINDOW:
+                            if win_bytes < self.STALL_MIN_BYTES:
+                                self.error_message = (
+                                    f"傳輸停滯: {win_bytes} bytes/"
+                                    f"{now - win_start:.0f}s")
+                                r.close()
+                                return False
+                            win_start = now
+                            win_bytes = 0
             r.close()
+            return True
         except Exception as e:
-            if not stop.is_set():
-                self._set_status('error', reason='single_worker_exception')
-                self.error_message = str(e)
-                logger.error("event=single_worker_failed task_id=%s error=%s",
-                             self.task_id, e)
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            self.error_message = str(e)
+            logger.error("event=single_attempt_failed task_id=%s error=%s",
+                         self.task_id, e)
+            return False
         finally:
             try:
                 session.close()
             except Exception:
                 pass
-        # 只有仍是當前世代（stop 未被新 start() 取代）才允許完成收尾，
-        # 避免暫停/恢復後舊 worker 誤把新世代的下載標記為完成。
-        if stop is self._stop:
-            self.complete_download()
 
     def _native_worker(self, stop):
         """DASH/HLS 串流的原生下載：整段交給 yt-dlp（單一 SOCKS5 代理 + ffmpeg 合併）。
@@ -1333,10 +1554,15 @@ class DownloadTask:
                         self.total_size = int(total)
                     self._single_mode = True
 
-        fmt = build_native_format_selector(
-            max_height=self._stream_max_height,
-            max_fps=self._stream_max_fps,
-            audio_only=self._stream_audio_only)
+        if self._stream_format_id:
+            # 使用者指定了來源/集數（如 s3e05）：直接用該 format_id，不再套用
+            # 通用 bestvideo+bestaudio 選擇器。
+            fmt = self._stream_format_id
+        else:
+            fmt = build_native_format_selector(
+                max_height=self._stream_max_height,
+                max_fps=self._stream_max_fps,
+                audio_only=self._stream_audio_only)
         opts = {
             'format': fmt,
             'merge_output_format': 'm4a' if self._stream_audio_only else 'mp4',
@@ -1565,6 +1791,81 @@ class DownloadTask:
         if stop is self._stop:
             self.complete_download()
 
+    def _spawn_http_workers(self, stop, count):
+        """建立 count 個 HTTP worker，線路依序輪流分配（供啟動與看門狗補開）。"""
+        lines = self._build_lines() or [None]
+        for _ in range(count):
+            line = self._next_line(time.monotonic())
+            if line is _NO_LINE:
+                # 所有線路都在隔離中：不派工，等隔離期滿由看門狗再試。
+                return
+            t = threading.Thread(target=self._worker, args=(line, stop), daemon=True)
+            self._workers.append(t)
+            self.threads.append(t)
+            t.start()
+
+    def _maintain_workers(self, stop):
+        """回收已結束的 worker；若一個都不剩且仍有未完成區塊，補開新 worker。
+
+        回傳 True 表示這次有補開。補開前先清空認領位，清掉可能由已退場
+        worker 或孤兒預取執行緒殘留的認領，讓新 worker 能重新認領區塊。
+        """
+        alive = [t for t in self._workers if t.is_alive()]
+        if len(alive) != len(self._workers):
+            self._workers = alive
+            self.threads = [t for t in self.threads if t.is_alive()]
+        if alive:
+            return False
+        self._reset_claims()
+        self._spawn_http_workers(stop, self._target_workers)
+        logger.warning("event=workers_respawned task_id=%s count=%s",
+                       self.task_id, self._target_workers)
+        return True
+
+    def _supervisor_loop(self, stop):
+        """HTTP 分段引擎的看門狗。
+
+        worker 連續失敗後會退場；若全部 worker 都結束而仍有未完成區塊，
+        就再也沒人會下載，任務會永遠停在 downloading（進度凍結、不報錯也
+        不重試）。此迴圈定期把 worker 補回目標數，並在整條任務連續多輪
+        完全沒有位元組進展時判定停滯失敗，讓使用者能重試而不是無聲卡住。
+        """
+        last_save = time.time()
+        last_progress = self._downloaded()
+        last_change = time.time()
+        stall_rounds = 0
+        while not stop.is_set() and self.status == 'downloading':
+            time.sleep(0.5)
+            if self._all_blocks_done():
+                break
+            now = time.time()
+            if now - last_save >= 5:
+                self.save_progress()
+                last_save = now
+            self._maintain_workers(stop)
+            cur = self._downloaded()
+            if cur > last_progress:
+                last_progress = cur
+                last_change = now
+                stall_rounds = 0
+                continue
+            if now - last_change < TASK_STALL_TIMEOUT:
+                continue
+            stall_rounds += 1
+            last_change = now
+            logger.warning(
+                "event=task_stall task_id=%s round=%s/%s downloaded=%s/%s",
+                self.task_id, stall_rounds, MAX_STALL_ROUNDS, cur,
+                self.total_size)
+            if stall_rounds >= MAX_STALL_ROUNDS:
+                self.error_message = f"下載停滯：連續 {stall_rounds} 輪無進度"
+                self._fatal = True
+                self._set_status('error', reason='stalled')
+                stop.set()
+                break
+        if stop is self._stop:
+            self.complete_download()
+
     # ------------------------------------------------------------------ #
     # lifecycle
     # ------------------------------------------------------------------ #
@@ -1614,24 +1915,22 @@ class DownloadTask:
         self._reset_claims()
         self._workers = []
         self.threads = []
-        lines = self._build_lines()
+        self._lines = self._build_lines()
+        self._spawn_index = 0
+        self._line_fail = {}
+        self._line_quarantine_until = {}
         # 工作者數不應超過剩餘區塊數，避免空轉的線程
-        max_workers = self.block_count if self.block_count > 0 else len(lines) * self.threads_per_proxy
-        spawned = 0
-        for line in lines:
-            for _ in range(self.threads_per_proxy):
-                if spawned >= max_workers:
-                    break
-                t = threading.Thread(target=self._worker, args=(line, stop), daemon=True)
-                self._workers.append(t)
-                self.threads.append(t)
-                t.start()
-                spawned += 1
-            if spawned >= max_workers:
-                break
+        max_workers = len(self._lines) * self.threads_per_proxy
+        if self.block_count > 0:
+            max_workers = min(max_workers, self.block_count)
+        self._target_workers = max(1, max_workers)
+        # 起始即補滿 worker；之後 worker 失敗退場時由看門狗補位。
+        self._spawn_http_workers(stop, self._target_workers)
 
+        # 看門狗：定期存進度、補開已結束的 worker，並在全任務長期零進度時
+        # 判定停滯失敗。沒有它，worker 全數退場後任務會無聲卡在 downloading。
         self._completion_thread = threading.Thread(
-            target=self._completion_loop, args=(stop,), daemon=True)
+            target=self._supervisor_loop, args=(stop,), daemon=True)
         self.threads.append(self._completion_thread)
         self._completion_thread.start()
         return True
@@ -1732,12 +2031,11 @@ class DownloadTask:
             return
         succeeded = False
         try:
-            if self.status == 'completed':
-                return
-            if self._stop.is_set() and self.status != 'downloading':
+            # 只有「下載中」才允許收尾：避免 error 狀態的半成品被 rename 成
+            # 完成檔（單線模式失敗時曾發生此誤標）。
+            if self.status != 'downloading':
                 return
             self.end_time = time.time()
-            self._set_status('completed')
             try:
                 # 落盤最後一批資料：移除逐片 fsync 後，完成時必須確保 temp 檔內容
                 # 已寫入磁碟，否則 os.replace 只改檔名、資料可能仍留在 OS 快取。
@@ -1753,6 +2051,12 @@ class DownloadTask:
                 self._set_status('error', reason='complete_exception')
                 self.error_message = f"完成下載時出錯: {e}"
                 logger.exception("完成下載時出錯: task_id=%s", self.task_id)
+            # 檔案確實就位後才標記完成：狀態是外部（UI、測試、on_complete）
+            # 判斷完成的依據。先標記再 rename 會讓觀察者在檔案還沒出現時就
+            # 看到「已完成」；程序結束時 daemon 收尾執行緒甚至會被直接砍掉，
+            # 導致檔案永遠沒被 rename（FTP 整合測試即因此失敗）。
+            if succeeded:
+                self._set_status('completed')
         finally:
             self._completion_lock.release()
         if succeeded and self.on_complete is not None:
@@ -2184,7 +2488,8 @@ class DownloadManager:
                  headers=None, line=None, selected_files=None,
                  seed_hours=None, upload_rate_limit=None, resolve_stream=False,
                  stream_resolver=None, stream_max_height=None,
-                 stream_max_fps=None, stream_audio_only=False):
+                 stream_max_fps=None, stream_audio_only=False,
+                 stream_format_id=None):
         # BT 來源（magnet 連結或 .torrent 檔路徑）走獨立任務類別
         if source_kind(url) is not None:
             return self._add_bt_task(url, filename, save_dir, line=line,
@@ -2230,6 +2535,7 @@ class DownloadManager:
             stream_max_height=stream_max_height,
             stream_max_fps=stream_max_fps,
             stream_audio_only=stream_audio_only,
+            stream_format_id=stream_format_id,
         )
         task.on_complete = self._on_download_completed
         with self._lock:
@@ -2492,6 +2798,7 @@ class DownloadManager:
                         stream_max_height=data.get('stream_max_height'),
                         stream_max_fps=data.get('stream_max_fps'),
                         stream_audio_only=data.get('stream_audio_only', False),
+                        stream_format_id=data.get('stream_format_id'),
                     )
                     if not task.load_progress():
                         skipped += 1

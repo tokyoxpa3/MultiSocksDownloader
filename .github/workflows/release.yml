@@ -43,6 +43,15 @@ jobs:
           Copy-Item -Force install_extension.bat MultiSocksDownloader.dist\
           Copy-Item -Force open_extensions.ps1 MultiSocksDownloader.dist\
 
+      - name: Bundle yt-dlp plugins
+        shell: pwsh
+        run: |
+          if (Test-Path yt_dlp_plugins) {
+            Copy-Item -Recurse -Force yt_dlp_plugins MultiSocksDownloader.dist\yt_dlp_plugins
+          } else {
+            Write-Host "yt_dlp_plugins/ not present (git-ignored local dir); skipping bundle"
+          }
+
       - name: Bundle ffmpeg
         shell: pwsh
         run: |

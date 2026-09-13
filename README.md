@@ -47,7 +47,10 @@
 - **多線程分片**：檔案切成多個區塊（bitmap 追蹤），每個代理以多條線程同時抓取不同區塊。
 - **斷點續傳**：進度以 `.progress` 檔持久化，關閉程式後重啟可自動恢復未完成的任務。
 - **BT 下載（magnet/.torrent）**：支援磁力連結與 `.torrent` 檔，以 libtorrent 為引擎；公開種子支援多線路聚合下載（多個 session 各綁定直連或 SOCKS5 代理、分片下載），private（PT）種子與選擇性下載（僅勾選部分檔案）維持單線路。
-- **串流解析下載（YouTube 等影音網站）**：貼上網址會自動偵測是否為影片/音訊頁面，偵測到就自動用 yt-dlp 解析成單檔直連 URL，交給現有的多代理分段引擎續傳；DASH/HLS 分段串流改走 yt-dlp 原生下載，並以內建 ffmpeg 合併視訊+音訊為 MP4，且自動帶出畫質（最高 4K）與 FPS 上限可選。DRM 加密串流會自動略過，不會試圖破解。
+- **串流解析下載（YouTube 等影音網站）**：貼上網址會自動偵測是否為影片/音訊頁面，偵測到就自動用 yt-dlp 解析成單檔直連 URL，交給現有的多代理分段引擎續傳；DASH/HLS 分段串流改走 yt-dlp 原生下載，並以內建 ffmpeg 合併視訊+音訊為 MP4，且自動帶出畫質（最高 4K）與 FPS 上限可選。DRM 加密串流會自動略過，不會試圖破解。解析時一併走 SOCKS5 代理（`socks5h`＝遠端 DNS），可繞過本機 DNS 對影音站台的封鎖/汙染。
+- **來源／集數選擇**：針對「一劇一網址、切換來源/集數不改網址」的站台，解析後在對話框多出「來源 / 集數」下拉，檔名自動帶上 `[s<來源>e<集>]` 標籤，避免多集互相覆蓋（需對應站台的 yt-dlp 外掛，外掛檔本身不進版控）。
+- **下載穩定度防護**：HTTP 分段引擎新增線路健康度管理——同一線路連續失敗達門檻會暫時隔離（60 秒），慢速滴流的卡死線路會被停滯看門狗主動中斷並交由其他線路接手，全任務連續無進度達上限即判定失敗可重試；單線模式（伺服器不支援 Range）失敗會指數退避自動重試，不再把半成品誤標為完成。
+- **開機自動啟動**：設定頁可勾選「開機時自動啟動」，登錄到目前使用者的啟動項目（HKCU，無需管理員權限），停用時只移除本程式寫入的值。
 - **Chrome 擴充功能**：攔截瀏覽器下載事件，自動把連結送進本程式（見 `chrome_extension/`）。
 - **區塊進度視覺**：磁碟叢集風格的區塊圖，即時顯示各分段下載狀態。
 
@@ -62,11 +65,14 @@
 - `bt_downloader.py` — BT 下載（libtorrent，多 session 多線路聚合）
 - `ftp_downloader.py` — FTP 下載（SOCKS5 控制/資料通道）
 - `ui.py` — PySide6 圖形介面
+- `startup.py` — Windows 開機自動啟動（HKCU Run 機碼）
 - `http_server.py` — 接收 Chrome 擴充功能請求的本機 HTTP 伺服器
 - `logging_setup.py` — 全專案唯一的 logging 設定入口（`setup_logging(debug)`）
 - `fetch_ffmpeg.py` — 建置/發佈時下載 LGPL 版 ffmpeg 並打包（供串流視訊+音訊合併使用）
 - `MultiSocksDownloader.py` — 程式入口
 - `repro.py` — 無 GUI 的 headless 複現工具（`add_task → start_task` 全鏈路）
+- `yt_dlp_plugins/` — 自訂 yt-dlp 外掛（extractor）放置目錄（本機開發用，整個目錄不進版控）；本機建置時若存在，會隨主程式打包、放在 exe 旁自動載入
+- `tools/extractor_maker/` — 開發工具：給定陌生網站 URL，用 Playwright 攔截請求 → LLM 生成 yt-dlp extractor/resolver
 - `chrome_extension/` — Chrome 擴充功能（Manifest V3）
 
 ## 安裝
