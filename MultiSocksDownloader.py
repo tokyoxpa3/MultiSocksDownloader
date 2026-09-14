@@ -16,6 +16,7 @@ from downloader import DownloadManager
 from app_icon import load_app_icon
 import version
 from logging_setup import setup_logging
+import i18n
 
 logger = logging.getLogger('main')
 
@@ -141,6 +142,9 @@ if __name__ == "__main__":
     # 啟動 HTTP 伺服器
     http_server = HttpServer(download_manager)
     server_started = http_server.start()
+
+    # 套用使用者選擇的介面語系（必須在建立任何視窗之前載入）
+    i18n.i18n.load(getattr(download_manager, "language", i18n.DEFAULT_LANG))
 
     # 創建主窗口，傳入已有的下載管理器
     window = MainWindow(download_manager)

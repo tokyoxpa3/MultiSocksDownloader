@@ -29,8 +29,13 @@ import file_association
 import startup
 import version
 import updater
+import i18n
 
 logger = logging.getLogger('ui')
+
+# 在建立任何視窗元件之前先修補 Qt 的文字 setter 與帶文字的建構子，
+# 之後所有介面字串都會自動查 i18n 對照表（查不到則顯示原文）。
+i18n.install_qt_translation(globals())
 
 # 格式化時間顯示
 def format_time(seconds):
@@ -1665,8 +1670,10 @@ class MainWindow(QMainWindow):
         settings_scroll.setWidget(settings_container)
         settings_outer_layout.addWidget(settings_scroll)
 
-        # 預設儲存目錄：路徑可能很長，獨立成一個整列欄位置於最上方。
-        dir_form = QFormLayout()
+        # 預設儲存目錄：路徑可能很長，獨立成一個整列欄位，並用群組框框起來，
+        # 與下方「下載預設值」「其他」兩欄視覺一致。
+        dir_group = QGroupBox("儲存位置")
+        dir_form = QFormLayout(dir_group)
         self.dir_input = QLineEdit()
         self.dir_input.setReadOnly(True)
         dir_button = QPushButton("瀏覽...")
@@ -1675,7 +1682,7 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(self.dir_input)
         dir_row.addWidget(dir_button)
         dir_form.addRow("預設儲存目錄:", dir_row)
-        settings_layout.addLayout(dir_form)
+        settings_layout.addWidget(dir_group)
 
         # 下方分左右兩欄：左為「下載預設值」，右為「其他」。
         cols_row = QHBoxLayout()
@@ -1830,6 +1837,19 @@ class MainWindow(QMainWindow):
         self.update_status_label.setWordWrap(True)
         misc_layout.addWidget(self.update_status_label)
 
+        # 語言選擇：切換後寫入設定，並詢問是否立即重新啟動以套用。
+        lang_row = QHBoxLayout()
+        lang_row.addWidget(QLabel("語言:"))
+        self.language_combo = QComboBox()
+        for _code, _name in i18n.i18n.available():
+            self.language_combo.addItem(_name, _code)
+        _idx = self.language_combo.findData(i18n.i18n.lang)
+        if _idx >= 0:
+            self.language_combo.setCurrentIndex(_idx)
+        self.language_combo.currentIndexChanged.connect(self.on_language_changed)
+        lang_row.addWidget(self.language_combo, 1)
+        misc_layout.addLayout(lang_row)
+
         cols_row.addWidget(misc_group, 1)
 
         settings_layout.addLayout(cols_row)
@@ -1847,6 +1867,27 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(main_widget)
         self.setAcceptDrops(True)
+
+    def on_language_changed(self, index):
+        """切換介面語系：寫入設定並即時重譯整個介面，不需重新啟動。"""
+        code = self.language_combo.itemData(index)
+        if not code or code == self.download_manager.language:
+            return
+        self.download_manager.language = code
+        self.download_manager.save_config()
+        i18n.i18n.load(code)
+        self.retranslate_ui()
+
+    def retranslate_ui(self):
+        """以目前語系重新套用介面文字。
+
+        靜態文字由 i18n 的登記表負責重套；表格內容是執行期才產生的，得重新
+        自資料建一次才會跟上新語系（任務列表每 0.5 秒由監控執行緒重建，會
+        自行跟上，故不在此處理）。
+        """
+        i18n.retranslate()
+        self.load_socks_proxies()
+        self.load_history()
 
     def select_save_dir(self):
         dir_path = QFileDialog.getExistingDirectory(self, "選擇保存目錄", self.dir_input.text())

@@ -47,3 +47,6 @@ yt_dlp_plugins/
 
 # Nuitka 編譯崩潰傾印（本機建置產物，不入版控）
 nuitka-crash-report.xml
+
+# i18n 翻譯作業暫存
+.i18n_tmp/

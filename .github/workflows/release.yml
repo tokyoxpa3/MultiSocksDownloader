@@ -12,6 +12,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # 需要完整歷史與 tag 才能產生更新說明
 
       - uses: actions/setup-python@v5
         with:
@@ -52,6 +54,11 @@ jobs:
             Write-Host "yt_dlp_plugins/ not present (git-ignored local dir); skipping bundle"
           }
 
+      - name: Bundle locale files
+        shell: pwsh
+        run: |
+          Copy-Item -Recurse -Force locale MultiSocksDownloader.dist\locale
+
       - name: Bundle ffmpeg
         shell: pwsh
         run: |
@@ -73,9 +80,71 @@ jobs:
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           "$hash  $zip" | Set-Content SHA256SUMS.txt -Encoding ascii
 
+      - name: Generate release notes from commit log
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 明確以 UTF-8 解讀外部命令（git log）輸出，避免中文 commit 訊息亂碼
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $OutputEncoding = [System.Text.Encoding]::UTF8
+          $tag = $env:GITHUB_REF_NAME
+
+          # 上一個可達的 tag；沒有就退回第一個 commit
+          $prev = (git describe --tags --abbrev=0 "${tag}^" 2>$null)
+          if ($LASTEXITCODE -ne 0 -or -not $prev) {
+            $prev = (git rev-list --max-parents=0 HEAD | Select-Object -Last 1)
+          }
+          Write-Host "Generating release notes for ${prev}..${tag}"
+
+          $subjects = git log "${prev}..${tag}" --no-merges --pretty=format:%s
+
+          # 分類規則：先比對 conventional-commit 前綴，再退回中文動詞開頭的舊式訊息
+          $rules = [ordered]@{
+            '新功能'    = '^(?:feat)(?:\(.+\))?[:：]\s*(.+)$'
+            '修正'      = '^(?:fix)(?:\(.+\))?[:：]\s*(.+)$'
+            '效能'      = '^(?:perf)(?:\(.+\))?[:：]\s*(.+)$'
+            '重構'      = '^(?:refactor)(?:\(.+\))?[:：]\s*(.+)$'
+            '文件'      = '^(?:docs)(?:\(.+\))?[:：]\s*(.+)$'
+            '測試'      = '^(?:tests?)(?:\(.+\))?[:：]\s*(.+)$'
+            '建置 / CI' = '^(?:ci|build)(?:\(.+\))?[:：]\s*(.+)$'
+          }
+          $categories = [ordered]@{}
+          foreach ($name in @($rules.Keys) + @('其他')) {
+            $categories[$name] = New-Object System.Collections.ArrayList
+          }
+
+          foreach ($subject in $subjects) {
+            if ([string]::IsNullOrWhiteSpace($subject)) { continue }
+            $text = $subject -replace '[，,、]?\s*發佈\s*v?\d+\.\d+(?:\.\d+)?\s*$', ''
+            $category = '其他'
+            foreach ($key in $rules.Keys) {
+              if ($text -match $rules[$key]) { $category = $key; $text = $Matches[1]; break }
+            }
+            if ($category -eq '其他') {
+              if     ($text -match '^(?:新增|加入|支援)') { $category = '新功能' }
+              elseif ($text -match '^(?:修復|修正|解決|避免)') { $category = '修正' }
+              elseif ($text -match '^(?:文件|README|更新文件)') { $category = '文件' }
+            }
+            [void]$categories[$category].Add("- $text")
+          }
+
+          $lines = New-Object System.Collections.ArrayList
+          foreach ($key in $categories.Keys) {
+            if ($categories[$key].Count -eq 0) { continue }
+            [void]$lines.Add("## $key")
+            [void]$lines.Add("")
+            foreach ($line in $categories[$key]) { [void]$lines.Add($line) }
+            [void]$lines.Add("")
+          }
+          [void]$lines.Add("**Full Changelog**: https://github.com/${env:GITHUB_REPOSITORY}/compare/${prev}...${tag}")
+
+          $lines -join "`n" | Set-Content -Path RELEASE_NOTES.md -Encoding utf8
+          Get-Content RELEASE_NOTES.md
+
       - name: Create GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create $env:GITHUB_REF_NAME $env:zip SHA256SUMS.txt --generate-notes
+          gh release create $env:GITHUB_REF_NAME $env:zip SHA256SUMS.txt `
+            --title $env:GITHUB_REF_NAME --notes-file RELEASE_NOTES.md

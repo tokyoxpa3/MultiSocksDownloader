@@ -19,6 +19,7 @@ from bt_downloader import BTTask, DHTService, DHTGovernor, source_kind, bt_info_
 import stream_resolver
 from stream_resolver import (YtDlpStreamResolver, build_native_format_selector,
                              build_socks_proxy_url)
+import i18n
 
 logger = logging.getLogger('downloader')
 
@@ -2146,6 +2147,8 @@ class DownloadManager:
         self.rate_limiter = RateLimiter()
         self.custom_headers = {}
         self.auto_check_update = True  # 啟動時是否自動檢查更新
+        self.language = i18n.DEFAULT_LANG  # 介面語系（locale/<code>.json）
+        self._language_saved = False       # 設定檔是否已記錄語系（用來判斷首次啟動）
 
         self.history = []          # 歷史下載紀錄：list of dict
         self.next_history_id = 1
@@ -2160,6 +2163,11 @@ class DownloadManager:
         self.dht_service = DHTService()
 
         self.load_config()
+
+        if not self._language_saved:
+            # 首次啟動（設定檔尚無語系）：跟隨系統語系並立刻寫回，之後即記憶使用者選擇。
+            self.language = i18n.detect_system_lang()
+            self.save_config()
 
         if self.bt_dht_autotune:
             self.dht_governor = DHTGovernor(self._dht_demand, self._apply_dht_policy)
@@ -2250,6 +2258,9 @@ class DownloadManager:
                 self.custom_headers = config['custom_headers']
             if 'auto_check_update' in config:
                 self.auto_check_update = bool(config['auto_check_update'])
+            if 'language' in config and config['language'] in i18n.SUPPORTED_LANGS:
+                self.language = config['language']
+                self._language_saved = True
             if 'history' in config and isinstance(config['history'], list):
                 self.history = config['history']
             if 'next_history_id' in config:
@@ -2275,6 +2286,7 @@ class DownloadManager:
                 'bt_dht_autotune': self.bt_dht_autotune,
                 'custom_headers': self.custom_headers,
                 'auto_check_update': self.auto_check_update,
+                'language': self.language,
                 'history': self.history,
                 'next_history_id': self.next_history_id,
             }

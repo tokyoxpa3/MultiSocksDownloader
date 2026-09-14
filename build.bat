@@ -17,3 +17,8 @@ if exist "yt_dlp_plugins" (
 ) else (
     echo 略過 yt-dlp 外掛（本機無 yt_dlp_plugins 目錄）
 )
+REM 打包語系檔（locale\*.json），供 i18n 於執行檔旁讀取
+if exist "locale" (
+    xcopy /E /I /Y "locale" "MultiSocksDownloader.dist\locale" >nul
+    echo 語系檔已打包到 MultiSocksDownloader.dist\locale\
+)

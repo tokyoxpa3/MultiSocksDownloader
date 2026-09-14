@@ -53,6 +53,24 @@
 - **開機自動啟動**：設定頁可勾選「開機時自動啟動」，登錄到目前使用者的啟動項目（HKCU，無需管理員權限），停用時只移除本程式寫入的值。
 - **Chrome 擴充功能**：攔截瀏覽器下載事件，自動把連結送進本程式（見 `chrome_extension/`）。
 - **區塊進度視覺**：磁碟叢集風格的區塊圖，即時顯示各分段下載狀態。
+- **多國語系**：內建 17 種語言的介面翻譯（正體中文、简体中文、English、日本語、한국어、Español、Português (BR)、Français、Deutsch、Русский、Italiano、Tiếng Việt、ไทย、Bahasa Indonesia、Türkçe、Polski、Nederlands），可於「設置 → 語言」切換並即時套用；首次啟動會自動跟隨系統語系。
+
+## 多國語系
+
+介面支援 17 種語言，於「設置 → 語言」切換，選好立即套用，不需重新啟動：
+
+繁體中文、简体中文、English、日本語、한국어、Español、Português (BR)、
+Français、Deutsch、Русский、Italiano、Tiếng Việt、ไทย、Bahasa Indonesia、
+Türkçe、Polski、Nederlands
+
+首次啟動時會跟隨系統語系（優先取 Qt `QLocale`，取不到再退回 Python `locale`），
+並把結果寫入設定檔；之後一律以使用者在設定頁的選擇為準，不再變動。系統語系
+不在支援清單內時退回英文，避免非中文使用者看到中文原文。
+
+語系檔位於 `locale/<語系代碼>.json`，以「原始中文字串」為 key；查不到的字串會
+直接顯示原文，因此可漸進式補翻譯。要新增或修改翻譯，請見
+[`locale/README.md`](locale/README.md)。未列在表中的動態字串（含 `{}` 佔位符）
+以樣板比對方式代換。
 
 ## 畫面
 
@@ -65,6 +83,8 @@
 - `bt_downloader.py` — BT 下載（libtorrent，多 session 多線路聚合）
 - `ftp_downloader.py` — FTP 下載（SOCKS5 控制/資料通道）
 - `ui.py` — PySide6 圖形介面
+- `i18n.py` — 多國語系（locale 載入、Qt 文字自動翻譯與就地重譯、系統語系偵測、語系清單）
+- `locale/` — 各語系 JSON 對照表（17 種語言）
 - `startup.py` — Windows 開機自動啟動（HKCU Run 機碼）
 - `http_server.py` — 接收 Chrome 擴充功能請求的本機 HTTP 伺服器
 - `logging_setup.py` — 全專案唯一的 logging 設定入口（`setup_logging(debug)`）
@@ -154,6 +174,7 @@ nuitka --standalone --windows-console-mode=disable --enable-plugin=pyside6 Multi
 - `speed_limit`：全局限速（bytes/sec，0 為不限速）
 - `custom_headers`：自訂請求標頭
 - `history`：歷史下載紀錄
+- `language`：介面語系代碼（首次啟動依系統語系寫入，之後可於設定頁切換）
 
 ## HTTP API
 
