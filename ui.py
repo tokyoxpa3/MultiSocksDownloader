@@ -1326,6 +1326,7 @@ class MainWindow(QMainWindow):
     # 自動更新結果信號：由背景執行緒發射，跨執行緒排入 UI 執行緒
     update_check_done = Signal(object)       # ("error", msg) 或 ("ok", info|None)
     update_stage_done = Signal(bool, str)    # (success, error_message)
+    update_progress = Signal(object)         # dict(downloaded, total, speed, threads)
 
     def __init__(self, download_manager=None):
         super().__init__()
@@ -1424,6 +1425,7 @@ class MainWindow(QMainWindow):
         # 自動更新：背景執行緒結果排入 UI 執行緒
         self.update_check_done.connect(self._on_update_check_done)
         self.update_stage_done.connect(self._on_update_stage_done)
+        self.update_progress.connect(self._on_update_progress)
 
         # 啟動時自動檢查更新（若使用者已啟用）
         self.maybe_auto_check_update()
@@ -3243,11 +3245,29 @@ class MainWindow(QMainWindow):
     def _stage_worker(self, info):
         try:
             paths = updater.pending_paths()
-            updater.stage_update(info, paths["new"])
+            updater.stage_update(info, paths["new"],
+                                 progress_cb=self.update_progress.emit,
+                                 log_cb=self._on_update_log)
         except Exception as e:
             self.update_stage_done.emit(False, str(e))
             return
         self.update_stage_done.emit(True, "")
+
+    def _on_update_log(self, msg):
+        """下載引擎的選路/換線訊息；由背景執行緒直接呼叫，只寫 logger 不碰 UI。"""
+        logger.info("更新: %s", msg)
+
+    def _on_update_progress(self, info):
+        """更新下載進度（跨執行緒排入 UI 執行緒）。"""
+        if not info:
+            return
+        total = int(info.get("total") or 0)
+        done = int(info.get("downloaded") or 0)
+        speed = float(info.get("speed") or 0)
+        pct = int(done * 100 / total) if total > 0 else 0
+        self.update_status_label.setText(
+            "下載更新中... {}/{}（{}%） {}/s".format(
+                format_size(done), format_size(total), pct, format_size(speed)))
 
     def _on_update_stage_done(self, success, err):
         if not success:
