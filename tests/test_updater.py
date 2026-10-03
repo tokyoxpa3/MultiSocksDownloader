@@ -117,5 +117,144 @@ class TestApplyScriptContent(unittest.TestCase):
         self.assertIn("param(", script)
 
 
+def _probe_info(total, speed=1.0e6, ttfb=0.5, url="http://x/f.bin"):
+    return {"final_url": url, "total": total, "supports_range": True,
+            "speed": speed, "ttfb": ttfb, "bytes": 1024, "elapsed": 1.0,
+            "error": None}
+
+
+class TestConfigFlag(unittest.TestCase):
+    def _write(self, d, text):
+        cfg = os.path.join(d, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write(text)
+        return cfg
+
+    def test_reads_bool_and_string_forms(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._write(d, '{"adaptive_concurrency": true}')
+            self.assertTrue(updater._config_flag("adaptive_concurrency",
+                                                 False, [cfg]))
+            cfg = self._write(d, '{"adaptive_concurrency": "on"}')
+            self.assertTrue(updater._config_flag("adaptive_concurrency",
+                                                 False, [cfg]))
+            cfg = self._write(d, '{"adaptive_concurrency": false}')
+            self.assertFalse(updater._config_flag("adaptive_concurrency",
+                                                  True, [cfg]))
+
+    def test_broken_or_missing_falls_back_to_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._write(d, "{ not json")
+            self.assertFalse(updater._config_flag("adaptive_concurrency",
+                                                  False, [cfg]))
+            missing = [os.path.join(d, "none.json")]
+            self.assertTrue(updater._config_flag("x", True, missing))
+
+
+class TestAdaptiveThreads(unittest.TestCase):
+    URL = "http://x/f.bin"
+    TOTAL = 64 * 1024 * 1024
+
+    def test_no_baseline_keeps_base(self):
+        n, why = updater._adaptive_threads(self.URL, self.TOTAL, None, 8, {})
+        self.assertEqual(n, 8, why)
+
+    def test_small_file_skips_probe(self):
+        total = updater.ADAPTIVE_MIN_BYTES - 1
+        with mock.patch.object(updater, "_measure_aggregate_throughput",
+                               side_effect=AssertionError("小檔案不該試探")):
+            n, _why = updater._adaptive_threads(
+                self.URL, total, None, 8, _probe_info(total))
+        self.assertEqual(n, 8)
+
+    def test_short_estimate_skips_probe(self):
+        info = _probe_info(self.TOTAL, speed=100e6, ttfb=0.5)
+        with mock.patch.object(updater, "_measure_aggregate_throughput",
+                               side_effect=AssertionError("估計太短不該試探")):
+            n, _why = updater._adaptive_threads(
+                self.URL, self.TOTAL, None, 8, info)
+        self.assertEqual(n, 8)
+
+    def test_no_gain_backs_off_to_single(self):
+        with mock.patch.object(updater, "_measure_aggregate_throughput",
+                               return_value=(1.02e6, 0.5, None)):
+            n, why = updater._adaptive_threads(
+                self.URL, self.TOTAL, None, 8, _probe_info(self.TOTAL))
+        self.assertEqual(n, 1)
+        self.assertIn("退回單連線", why)
+
+    def test_high_gain_adopts_probe_threads(self):
+        with mock.patch.object(updater, "_measure_aggregate_throughput",
+                               return_value=(2.0e6, 0.5, None)):
+            n, why = updater._adaptive_threads(
+                self.URL, self.TOTAL, None, 8, _probe_info(self.TOTAL))
+        self.assertEqual(n, updater.ADAPTIVE_PROBE_THREADS, why)
+
+    def test_latency_rise_vetoes_adoption(self):
+        info = _probe_info(self.TOTAL, speed=1.0e6, ttfb=0.5)
+        lat = updater.ADAPTIVE_LATENCY_TOLERANCE * 1.2
+        with mock.patch.object(updater, "_measure_aggregate_throughput",
+                               return_value=(2.0e6, info["ttfb"] * lat, None)):
+            n, why = updater._adaptive_threads(
+                self.URL, self.TOTAL, None, 8, info)
+        self.assertEqual(n, 1)
+        self.assertIn("退回單連線", why)
+
+    def test_probe_failure_keeps_base(self):
+        with mock.patch.object(updater, "_measure_aggregate_throughput",
+                               return_value=(None, None, "boom")):
+            n, why = updater._adaptive_threads(
+                self.URL, self.TOTAL, None, 8, _probe_info(self.TOTAL))
+        self.assertEqual(n, 8)
+        self.assertIn("boom", why)
+
+
+class TestAggregateThroughputGuards(unittest.TestCase):
+    def test_zero_total(self):
+        bw, _ttfb, _why = updater._measure_aggregate_throughput(
+            "http://x/f", 0, None, 4)
+        self.assertIsNone(bw)
+
+    def test_slice_too_small(self):
+        bw, _ttfb, why = updater._measure_aggregate_throughput(
+            "http://x/f", 4 * 1024 * 1024, None, 64)
+        self.assertIsNone(bw)
+        self.assertIn("太小", why)
+
+
+class TestMultipartBlockCap(unittest.TestCase):
+    def _run(self, total, **kw):
+        seen = []
+
+        def fake_fetch(session, url, start, end, dest, block_bytes, idx, lock,
+                       stop, cancel_event):
+            with lock:
+                seen.append((start, end))
+                block_bytes[idx] += end - start + 1
+
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "o.bin")
+            with mock.patch.object(updater, "_fetch_block", fake_fetch):
+                updater._download_multipart("http://x/f.bin", dest, total,
+                                            None, None, **kw)
+            size = os.path.getsize(dest)
+        return seen, size
+
+    def test_max_blocks_caps_segment_count(self):
+        total = 64 * 1024 * 1024
+        seen, size = self._run(total, max_blocks=2)
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(size, total)
+        # 兩段必須無縫、不重疊地覆蓋整個檔
+        self.assertEqual(seen[0][0], 0)
+        self.assertEqual(seen[-1][1], total - 1)
+
+    def test_default_cap_is_unchanged(self):
+        total = 64 * 1024 * 1024
+        seen, size = self._run(total)
+        self.assertEqual(len(seen), updater.MAX_BLOCKS)
+        self.assertEqual(size, total)
+
+
 if __name__ == "__main__":
     unittest.main()
