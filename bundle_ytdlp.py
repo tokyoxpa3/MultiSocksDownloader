@@ -36,6 +36,15 @@ import os
 import shutil
 import sys
 
+# CI（GitHub Actions）的 stdout 可能是 cp1252，print 中文會拋 UnicodeEncodeError
+# 讓整個步驟以非 0 結束；強制以 UTF-8 輸出，讓訊息在 CI 與本地都能正常列印。
+# 同樣的處理見 fetch_ffmpeg.py（該檔在 9a087cc 已修過同一個問題）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 DEFAULT_DIST = "MultiSocksDownloader.dist"
 PACKAGE_NAME = "yt_dlp"
 
