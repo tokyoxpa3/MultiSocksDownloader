@@ -33,10 +33,29 @@ jobs:
                 ('APP_VERSION = "' + $v + '"')
           Set-Content version.py -Value $raw -NoNewline -Encoding utf8
 
-      - name: Build standalone exe (Nuitka)
+      - name: Build standalone exe (Nuitka, yt-dlp excluded on purpose)
         shell: cmd
         run: |
-          nuitka --standalone --windows-console-mode=disable --windows-icon-from-ico=app_icon.ico --enable-plugin=pyside6 --include-package=libtorrent --include-package=yt_dlp --nofollow-import-to=yt_dlp.extractor.lazy_extractors --assume-yes-for-downloads MultiSocksDownloader.py
+          nuitka --standalone --windows-console-mode=disable --windows-icon-from-ico=app_icon.ico --enable-plugin=pyside6 --include-package=libtorrent --nofollow-import-to=yt_dlp --no-deployment-flag=excluded-module-usage --include-module=getpass --include-module=optparse --include-module=hashlib --include-package=http --include-package=xml --include-module=hmac --include-module=secrets --include-package=ctypes --include-module=uuid --assume-yes-for-downloads MultiSocksDownloader.py
+          REM --nofollow-import-to=yt_dlp keeps Nuitka from compiling 1045 modules (92% of
+          REM the build, 971 of them extractors). --no-deployment-flag=excluded-module-usage
+          REM is required, otherwise Nuitka blocks the runtime import outright. Nuitka no
+          REM longer analyses yt-dlp's imports, so the stdlib modules it needs are listed
+          REM explicitly above. Keep this list in sync with build.bat.
+
+      - name: Bundle external yt-dlp (sourceless .pyc, not Nuitka-compiled)
+        shell: pwsh
+        run: |
+          python bundle_ytdlp.py
+          # --include-package=ctypes drags in ctypes' own test suite; those .pyd files are
+          # never imported at runtime, so drop them to keep the distribution tidy.
+          @('_ctypes_test.pyd','_testbuffer.pyd','_testcapi.pyd','_testinternalcapi.pyd') |
+            ForEach-Object {
+              Remove-Item "MultiSocksDownloader.dist\$_" -Force -ErrorAction SilentlyContinue
+            }
+          if (Test-Path 'MultiSocksDownloader.dist\ctypes\test') {
+            Remove-Item 'MultiSocksDownloader.dist\ctypes\test' -Recurse -Force
+          }
 
       - name: Include Chrome extension installer
         shell: pwsh

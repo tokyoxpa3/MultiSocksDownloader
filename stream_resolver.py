@@ -24,11 +24,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from urllib.parse import quote
 
-# 強制走非 lazy 的 extractor 載入路徑：lazy_extractors.py 是 yt-dlp 安裝時
-# 生成的單一巨型模組，Nuitka 打包會讓 MSVC 編譯器 heap 溢位（C1002），
-# 故建置時以 --nofollow-import-to 排除，執行期改由 _extractors 匯入各獨立
-# extractor 模組。
-os.environ.setdefault('YTDLP_NO_LAZY_EXTRACTORS', '1')
+# 這裡原本強制設定 YTDLP_NO_LAZY_EXTRACTORS=1，因為 lazy_extractors.py 是
+# yt-dlp 安裝時生成的單一巨型模組，交給 Nuitka 編譯會讓 MSVC heap 溢位（C1002）。
+# 現在 yt-dlp 已改為「不經 Nuitka 編譯、以純 Python 放在執行檔旁」
+# （見 bundle_ytdlp.py 與 build.bat），該理由已不存在，故改用 yt-dlp 預設的
+# lazy 載入——實測含全部 extractor 的匯入成本由 0.93s 降到 0.42s。
+# 若個別 extractor 出現異常，仍可自行設 YTDLP_NO_LAZY_EXTRACTORS=1 退回舊行為。
 
 
 def _ensure_plugin_path():
@@ -38,6 +39,11 @@ def _ensure_plugin_path():
     yt_dlp_plugins；Nuitka 打包後執行檔旁的外掛目錄則不保證在 sys.path
     （sys.executable 在打包後會指向內建 python.exe），故明確把程式所在
     目錄插到最前面。重複呼叫無副作用。
+
+    這裡同時也是「打包後匯入外部 yt_dlp 套件」的關鍵：yt-dlp 本身不再編進
+    exe，而是以純 Python 放在執行檔旁（見 bundle_ytdlp.py），必須靠這段把
+    程式目錄插進 sys.path 才匯入得到。因此本函式必須在下方 import yt_dlp
+    之前呼叫。
     """
     dirs = [os.path.dirname(os.path.abspath(__file__))]
     argv0 = sys.argv[0] if sys.argv else ''
