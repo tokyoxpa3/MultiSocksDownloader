@@ -26,12 +26,21 @@ _single_instance_mutex = None
 # 單一實例 IPC 服務名稱：第二個實例用它把檔案參數轉送給第一個實例
 _IPC_SERVER_NAME = "MultiSocksDownloader_IPC"
 
+# LLM 端到端測試介面預設連接埠（需以 --test-api 明確開啟，只綁 127.0.0.1）
+DEFAULT_TEST_API_PORT = 8766
 
-def _ensure_single_instance():
+# 接收 Chrome 擴充程式下載請求的預設連接埠（擴充端寫死此埠，勿任意變更）
+DEFAULT_HTTP_PORT = 8765
+
+
+def _ensure_single_instance(suffix=""):
     """確保同時只有一個程式實例在執行。
 
     回傳 True 表示本實例為主要實例；False 表示已有其他實例在執行，
     呼叫端應把參數轉送給主要實例後結束。
+
+    suffix 供端到端測試使用：測試實例帶上自己的後綴，就能與正式實例並行執行，
+    不會互相搶佔單一實例鎖與 IPC 通道。
     """
     if sys.platform != "win32":
         return True
@@ -44,7 +53,7 @@ def _ensure_single_instance():
 
     global _single_instance_mutex
     _single_instance_mutex = create_mutex(
-        None, False, "MultiSocksDownloader_SingleInstance_Mutex"
+        None, False, "MultiSocksDownloader_SingleInstance_Mutex" + suffix
     )
     return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
 
@@ -65,13 +74,13 @@ def _parse_input_sources(args):
     return sources
 
 
-def _forward_to_primary(args):
+def _forward_to_primary(args, server_name=None):
     """次要實例：把命令列中的下載來源（.torrent / magnet / URL）透過本地 socket 轉送給主要實例。"""
     sources = _parse_input_sources(args)
     if not sources:
         return
     socket = QLocalSocket()
-    socket.connectToServer(_IPC_SERVER_NAME)
+    socket.connectToServer(server_name or _IPC_SERVER_NAME)
     if not socket.waitForConnected(2000):
         return  # 主要實例尚未就緒，放棄本次轉送
     payload = "\n".join(sources).encode("utf-8")
@@ -86,6 +95,32 @@ if __name__ == "__main__":
     argv = sys.argv[1:]
     debug = '--debug' in argv
     argv = [a for a in argv if a != '--debug']
+
+    # LLM 端到端測試介面：--test-api [--test-api-port N]。
+    # 預設關閉，開啟後僅在本機 127.0.0.1 提供可點擊真實視窗的控制 API。
+    test_api_port = None
+    if '--test-api' in argv:
+        argv.remove('--test-api')
+        test_api_port = DEFAULT_TEST_API_PORT
+    if '--test-api-port' in argv:
+        idx = argv.index('--test-api-port')
+        try:
+            test_api_port = int(argv[idx + 1])
+        except (IndexError, ValueError):
+            test_api_port = DEFAULT_TEST_API_PORT
+        del argv[idx:idx + 2]
+
+    # --http-port N：覆寫接收 Chrome 下載請求的連接埠。正式環境固定 8765；
+    # 端到端測試用獨立連接埠，才能與使用者正在跑的實例並存。
+    http_port = DEFAULT_HTTP_PORT
+    if '--http-port' in argv:
+        idx = argv.index('--http-port')
+        try:
+            http_port = int(argv[idx + 1])
+        except (IndexError, ValueError):
+            http_port = DEFAULT_HTTP_PORT
+        del argv[idx:idx + 2]
+
     setup_logging(debug)
 
     # 一眼可辨執行來源與版本：source=直接跑原始碼，frozen=Nuitka 打包的 exe。
@@ -104,15 +139,18 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    is_primary = _ensure_single_instance()
+    # 測試實例使用獨立的單一實例鎖與 IPC 通道，可與正式實例並行而不互相干擾
+    instance_suffix = f"_test{test_api_port}" if test_api_port else ""
+
+    is_primary = _ensure_single_instance(instance_suffix)
     if not is_primary:
         # 已有實例在執行：把開啟的 .torrent 檔轉送給它後結束
-        _forward_to_primary(argv)
+        _forward_to_primary(argv, _IPC_SERVER_NAME + instance_suffix)
         sys.exit(0)
 
     # 盡早啟動 IPC 伺服器，避免第二個實例轉送時伺服器尚未就緒
     ipc_server = QLocalServer()
-    ipc_server.listen(_IPC_SERVER_NAME)
+    ipc_server.listen(_IPC_SERVER_NAME + instance_suffix)
 
     # 待處理路徑：啟動參數 + 啟動期間/事件迴圈內轉送進來的路徑
     pending_paths = list(argv)
@@ -140,7 +178,7 @@ if __name__ == "__main__":
     download_manager = DownloadManager()
 
     # 啟動 HTTP 伺服器
-    http_server = HttpServer(download_manager)
+    http_server = HttpServer(download_manager, port=http_port)
     server_started = http_server.start()
 
     # 套用使用者選擇的介面語系（必須在建立任何視窗之前載入）
@@ -172,8 +210,23 @@ if __name__ == "__main__":
 
     window.show()
 
+    # LLM 端到端測試介面：需明確以 --test-api 開啟，只綁 127.0.0.1。
+    # 提供「像真人一樣點擊真實視窗」的能力，供自動化測試重現使用者操作路徑。
+    test_api = None
+    if test_api_port:
+        from test_api import TestApiServer
+        test_api = TestApiServer(window, download_manager, port=test_api_port)
+        if test_api.start():
+            logger.warning(
+                "event=test_api_enabled port=%s（僅供自動化測試，勿在正式環境開啟）",
+                test_api_port)
+        else:
+            test_api = None
+
     # 應用結束時關閉 HTTP 伺服器，並釋放常駐 DHT session
     app.aboutToQuit.connect(http_server.stop)
     app.aboutToQuit.connect(download_manager.shutdown_dht)
+    if test_api is not None:
+        app.aboutToQuit.connect(test_api.stop)
 
     sys.exit(app.exec())

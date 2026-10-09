@@ -1,0 +1,10 @@
+# Windows 批次檔一律用 CRLF。
+#
+# cmd.exe 解析 goto/label 與多行 ( ) 區塊時，純 LF 會出錯，而 build.bat 是
+# 唯一的打包入口。這裡明確鎖定換行格式，避免 clone 到 autocrlf=false 的機器
+# 之後又壞掉。
+#
+# 另外提醒：build.bat 的內容必須維持純 ASCII（見檔案內的說明），
+# 這點無法用 gitattributes 強制，只能靠註解提醒。
+*.bat text eol=crlf
+*.cmd text eol=crlf

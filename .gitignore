@@ -50,3 +50,10 @@ nuitka-crash-report.xml
 
 # i18n 翻譯作業暫存
 .i18n_tmp/
+
+# 本機 AI 協作 session 資料（含對話記憶與快取，不屬專案內容）
+.workbuddy-ai/
+
+# 一次性驗證／算圖腳本（用後即刪，不進版控）
+.demo_render.py
+.exp25_msd_adaptive_verify.py
