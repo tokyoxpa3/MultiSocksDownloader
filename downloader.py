@@ -2119,6 +2119,11 @@ class DownloadTask:
         }
 
 
+# 「進行中」的任務狀態：尚未進入終態（已完成／失敗／取消）。
+# 同一 URL 若已有此類任務，就視為重複、不再重複加入；終態任務則允許重新下載。
+ACTIVE_TASK_STATUSES = ('initialized', 'downloading', 'paused', 'seeding')
+
+
 class DownloadManager:
     def __init__(self):
         self.tasks = {}
@@ -2153,7 +2158,10 @@ class DownloadManager:
         self.history = []          # 歷史下載紀錄：list of dict
         self.next_history_id = 1
 
-        self.config_dir = os.path.join(os.path.expanduser("~"), ".multi_socks_downloader")
+        # 設定檔目錄可用 MSD_CONFIG_DIR 覆寫：端到端測試要能跑在完全獨立的環境，
+        # 不能動到使用者的正式設定與下載目錄。
+        self.config_dir = (os.environ.get('MSD_CONFIG_DIR')
+                           or os.path.join(os.path.expanduser("~"), ".multi_socks_downloader"))
         self.config_file = os.path.join(self.config_dir, "config.json")
         os.makedirs(self.config_dir, exist_ok=True)
 
@@ -2495,6 +2503,20 @@ class DownloadManager:
     # ------------------------------------------------------------------ #
     # task management
     # ------------------------------------------------------------------ #
+    def find_active_task_by_url(self, url):
+        """回傳同 URL 且仍在進行中的任務；沒有則回傳 None。
+
+        「進行中」＝狀態屬於 ACTIVE_TASK_STATUSES。已完成／失敗／取消的任務不算，
+        因此之後仍可重新下載同一個 URL。
+        """
+        if not url:
+            return None
+        with self._lock:
+            task = self.tasks.get(url)
+        if task is not None and getattr(task, 'status', None) in ACTIVE_TASK_STATUSES:
+            return task
+        return None
+
     def add_task(self, url, filename=None, save_dir=None,
                  use_proxy=True, chunks_per_part=None, threads_per_proxy=None,
                  headers=None, line=None, selected_files=None,

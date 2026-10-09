@@ -203,17 +203,83 @@ function shouldIntercept(downloadItem) {
   return true;
 }
 
+// 本次 service worker 啟動的時間。用來辨識「瀏覽器啟動時重播的歷史下載」：
+// Chromium 在載入下載歷史時，會對每一筆歷史項目再發一次建立通知
+// （見 chromium/src content/public/browser/download_manager.h 對
+//  Observer::OnDownloadCreated 的註解 —— "This method may be called an arbitrary
+//  number of times, e.g. when loading history on startup."）。
+// chrome.downloads.onCreated 就架在這個通知之上，所以 Chrome 完全關閉再開啟時，
+// 每一筆舊紀錄都會各觸發一次。真正的「新下載」其 startTime 必然接近現在。
+const WORKER_START_MS = Date.now();
+// 容許誤差：涵蓋 worker 啟動與事件送達之間的毫秒級延遲，以及剛關閉又立刻重啟的情況。
+const HISTORY_REPLAY_GRACE_MS = 5000;
+
+// 本 session 內已轉送過的 download id。存在 chrome.storage.session（瀏覽器關閉即清除），
+// 只用來避免「同一次下載」因 worker 被回收重啟而被重複轉送。
+// 刻意「不以 URL 為鍵」：之後再下載同一個 URL 會是新的 download id，仍可正常轉送。
+const forwardedIds = new Set();
+
+function loadForwardedIds() {
+  try {
+    chrome.storage.session.get(['forwardedDownloadIds'], (r) => {
+      if (r && Array.isArray(r.forwardedDownloadIds)) {
+        r.forwardedDownloadIds.forEach((id) => forwardedIds.add(id));
+      }
+    });
+  } catch (e) {
+    // 舊版 Chrome 沒有 storage.session：退化成純記憶體去重即可，不影響主要功能。
+  }
+}
+loadForwardedIds();
+
+function rememberForwarded(id) {
+  if (id === undefined || id === null) {
+    return;
+  }
+  forwardedIds.add(id);
+  try {
+    chrome.storage.session.set({ forwardedDownloadIds: Array.from(forwardedIds) });
+  } catch (e) {
+    // 同上：無 storage.session 時僅保留記憶體版本。
+  }
+}
+
+// 判斷這個 onCreated 是否為「瀏覽器啟動時重播的歷史項目」。
+// 歷史項目的 startTime 遠早於本次 worker 啟動時間；新下載則幾乎等於現在。
+function isHistoryReplay(downloadItem) {
+  const startedMs = Date.parse(downloadItem.startTime || '');
+  if (!Number.isFinite(startedMs)) {
+    return false;
+  }
+  return startedMs < WORKER_START_MS - HISTORY_REPLAY_GRACE_MS;
+}
+
 // 監聽下載開始事件：只負責把原始 URL 轉送給本機應用。
 // 取消原始下載、阻止另存新檔視窗改由 onDeterminingFilename 同步處理，因為
 // onCreated 階段的 cancel 在 service worker 冷啟動（閒置數分鐘被回收後）時，
 // 會因 worker 重新載入的延遲而慢於 Chrome 的「確定檔名」階段，導致停頓後
 // 第一次下載仍彈出另存視窗。
 chrome.downloads.onCreated.addListener(function(downloadItem) {
+  // 過濾瀏覽器啟動時重播的歷史下載，否則每一筆舊紀錄都會被當成新下載轉送，
+  // 讓本機應用連環彈出「新增下載」對話框。
+  if (isHistoryReplay(downloadItem)) {
+    console.log("忽略瀏覽器啟動時重播的歷史下載:", downloadItem.id, downloadItem.url);
+    return;
+  }
+
+  // 同一次下載只轉送一次（worker 被回收重啟後仍有效）。
+  if (forwardedIds.has(downloadItem.id)) {
+    console.log("此下載已轉送過，跳過:", downloadItem.id);
+    return;
+  }
+
   console.log("監測到下載開始:", downloadItem);
 
   if (!shouldIntercept(downloadItem)) {
     return;
   }
+
+  rememberForwarded(downloadItem.id);
 
   // 直接送原始 URL 給本機應用。重導向、Content-Disposition 檔名、Range 支援偵測
   // 與 Cookie 重放，統一交由應用端的 DownloadTask 用 requests 處理；擴充端不對目標
@@ -229,6 +295,14 @@ chrome.downloads.onCreated.addListener(function(downloadItem) {
 // 先前的 suggest({cancel:true}) 會被 Chrome 忽略、等於空建議，又走回預設流程。
 // 正確做法是先 cancel 原始下載，再給一個明確檔名（uniquify）以免另存視窗跳出。
 chrome.downloads.onDeterminingFilename.addListener(function(downloadItem, suggest) {
+  if (isHistoryReplay(downloadItem)) {
+    // 瀏覽器啟動時重播／被 Chrome 恢復的舊下載：我們沒有轉送它，就也不能取消它，
+    // 否則使用者的續傳會被我方靜默中斷。直接交還瀏覽器原生流程。
+    console.log("歷史下載重播，不攔截、交還原生流程:", downloadItem.id, downloadItem.url);
+    suggest();
+    return;
+  }
+
   if (!shouldIntercept(downloadItem)) {
     // 放行：交還瀏覽器原生流程。
     suggest();

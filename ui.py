@@ -1936,26 +1936,50 @@ class MainWindow(QMainWindow):
         由 download_requested 信號觸發（已排入 UI 執行緒）。儲存路徑預設為全域
         儲存目錄，使用者可改到任意位置、也可改存檔名稱；取消則不建立任何任務。
         """
+        url = request.get('url', '')
+        if not url:
+            return
+
+        # 同一個 URL 若已在任務列表（進行中／暫停／初始化／做種中），直接略過：
+        # 不搶焦點、不開對話框。這裡用狀態列提示而非彈窗——一次可能湧入多筆重複
+        # 請求，逐筆彈窗會變成視窗風暴。
+        if self._skip_duplicate_url(url):
+            return
+
         # 攔截到 Chrome 下載：先把主視窗帶到前景並切到下載管理分頁，否則對話框
         # 可能被埋在瀏覽器後面，或主視窗縮到系統匣時根本看不到。
         self.bring_to_front()
         self._switch_to_download_tab()
 
-        url = request.get('url', '')
-        if not url:
-            return
-
         # 已有一個「新增下載」視窗開啟時，先排入佇列，待目前視窗關閉後再依序處理，
-        # 避免同時跳出多個視窗互相遮蔽。
+        # 避免同時跳出多個視窗互相遮蔽。同一 URL 不重複排隊。
         if self._add_dialog_open:
-            self._pending_download_requests.append(request)
+            if not any(r.get('url') == url for r in self._pending_download_requests):
+                self._pending_download_requests.append(request)
             return
 
         self._process_remote_download_request(request)
 
+    def _skip_duplicate_url(self, url):
+        """若 url 已有進行中的任務，記一筆訊息並回傳 True（呼叫端應略過此請求）。
+
+        已完成／失敗／取消的任務不算重複，之後仍可重新下載同一個 URL。
+        """
+        existing = self.download_manager.find_active_task_by_url(url)
+        if existing is None:
+            return False
+        logger.info("略過重複的下載請求（已在任務列表）: url=%s task_id=%s",
+                    url, getattr(existing, 'task_id', '?'))
+        self.statusBar().showMessage(
+            f"此連結已在任務列表中，已略過：{existing.filename}", 4000)
+        return True
+
     def _process_remote_download_request(self, request):
         """開啟「新增下載」對話框處理單一遠端下載請求（URL 鎖住）。"""
         url = request.get('url', '')
+        # 排隊期間狀態可能已改變（使用者先前的對話框按了確認），開窗前一併複查。
+        if self._skip_duplicate_url(url):
+            return
         filename = request.get('filename')
         headers = request.get('headers')
         chunks_per_part = request.get('chunks_per_part', 0)
@@ -2046,7 +2070,16 @@ class MainWindow(QMainWindow):
             return False
 
         added = 0
+        skipped = []
         for url in urls:
+            # 已在任務列表（進行中／暫停／初始化／做種中）的連結不重複加入；
+            # 已完成／失敗的任務仍允許重新下載同一個 URL。
+            existing = self.download_manager.find_active_task_by_url(url)
+            if existing is not None:
+                skipped.append(existing.filename or url)
+                logger.info("略過已在任務列表的連結: url=%s task_id=%s",
+                            url, getattr(existing, 'task_id', '?'))
+                continue
             try:
                 # add_task 只做簿記、不碰網路，可在 UI 執行緒安全執行
                 task_id = self.download_manager.add_task(
@@ -2079,6 +2112,12 @@ class MainWindow(QMainWindow):
                 logger.exception("下載任務添加失敗: %s", e)
                 if not silent:
                     QMessageBox.critical(self, "錯誤", f"添加下載任務失敗:\n{e}\n\nURL: {url}")
+        # 使用者主動新增時才提示；剪貼簿／IPC／啟動參數等 silent 路徑只寫 log。
+        if skipped and not silent:
+            listing = "\n".join(f"• {name}" for name in skipped)
+            QMessageBox.information(
+                self, "已在下載列表",
+                f"以下連結已在任務列表中，未重複加入：\n\n{listing}")
         return added > 0
 
     def _add_bt_interactive(self, source):

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "多代理下載器",
-  "version": "1.2",
+  "version": "1.3",
   "description": "將下載請求發送到多代理下載器應用程式",
   "permissions": [
     "contextMenus",
