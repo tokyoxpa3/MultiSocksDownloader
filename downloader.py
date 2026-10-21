@@ -242,8 +242,13 @@ class RateLimiter:
         with self._lock:
             return self._rate
 
-    def acquire(self, n):
-        """寫入前呼叫，n 為本次要寫入的位元組數。限速時會適度休眠。"""
+    def acquire(self, n, stop=None):
+        """寫入前呼叫，n 為本次要寫入的位元組數。限速時會適度休眠。
+
+        stop 是選用的 threading.Event：暫停／取消時用它取代 time.sleep，可立刻
+        喚醒。限速很低而 chunk 較大時單次等待會很久（1 MiB chunk @ 64 KiB/s 就是
+        16 秒），純 sleep 會讓「暫停」按下去十幾秒沒反應，使用者只會覺得程式卡死。
+        """
         if n <= 0:
             return
         with self._lock:
@@ -260,7 +265,10 @@ class RateLimiter:
             missing = n - self._tokens
             self._tokens = 0.0
             sleep_for = missing / self._rate
-        time.sleep(sleep_for)
+        if stop is not None:
+            stop.wait(sleep_for)
+        else:
+            time.sleep(sleep_for)
 
 
 class DownloadTask:
@@ -357,6 +365,9 @@ class DownloadTask:
         # 跳轉後的最終 CDN 簽名 URL 快取：後續 run 直接打它、跳過每次的 302 跳轉，
         # 避免每個 64 MiB run 都重新付一次 HuggingFace 簽章/跳轉延遲。
         self._resolved_url = None
+        # _resolved_url 是否由 yt-dlp 解析而來（而非單純的 302 跳轉結果）。
+        # 只有解析來的直連在過期時不能退回 self.url（那會抓回網頁 HTML）。
+        self._stream_resolved = False
 
         self._lock = threading.Lock()
         self._save_lock = threading.Lock()
@@ -711,11 +722,53 @@ class DownloadTask:
                 if 0 <= int(k) < self.block_count and int(v) > 0
             }
 
+            if not self._resume_data_usable():
+                self._discard_broken_resume()
+                return False
+
             self.status = 'paused'
             return True
         except Exception as e:
             logger.warning("載入進度失敗: %s", e)
             return False
+
+    def _resume_data_usable(self):
+        """檢查 .progress 的 bitmap 是否還有資料可以對應。
+
+        bitmap 記的是「哪些區塊已經寫進 .downloading」，唯一依據就是那個資料檔。
+        檔案被外部刪掉（清理工具、防毒隔離、使用者手動刪）或被截短之後，bitmap
+        就變成謊言：續傳只補剩下的區塊，完成時 rename 出一份大小正確、前半段卻
+        全是零的檔案，狀態還顯示「已完成」——使用者要打開檔案才會發現損壞。
+        """
+        if self._single_mode or self.block_count == 0 or self.total_size <= 0:
+            # 單線模式每次都重寫整檔，bitmap 不參與續傳
+            return True
+        try:
+            return os.path.getsize(self.temp_filepath) == self.total_size
+        except OSError:
+            return False
+
+    def _discard_broken_resume(self):
+        """丟掉失去依據的續傳狀態，讓 prepare() 改走全新下載。
+
+        殘缺的 .downloading 一併移除：它已經沒有可用資料，留著只會讓
+        _ensure_unique_filepath() 誤判檔名被佔用，把新下載存成 xxx_1。
+        """
+        for path in (self.temp_filepath, self.progress_filepath):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError as e:
+                logger.warning("清除失效的續傳檔失敗 %s: %s", path, e)
+        self.bitmap = bytearray()
+        self.block_count = 0
+        self.block_size = 0
+        self._partial = {}
+        self._completed_bytes = 0
+        self.downloaded_size = 0
+        logger.warning(
+            "event=resume_discarded task_id=%s url=%s reason=temp_missing_or_truncated",
+            self.task_id, self.url)
 
     # ------------------------------------------------------------------ #
     # prepare + probe
@@ -823,6 +876,7 @@ class DownloadTask:
             return False
         self.url = urlunparse(parts._replace(scheme='https'))
         self._resolved_url = None
+        self._stream_resolved = False
         return True
 
     def _maybe_resolve_stream(self):
@@ -883,6 +937,10 @@ class DownloadTask:
         title = result.title
         ext = result.ext
         self._resolved_url = direct_url
+        # 標記這個直連是「解析」來的（不是單純的 302 跳轉）。兩者過期時的處理
+        # 完全不同：302 可以退回原始網址重新跳轉，解析出來的簽名 URL 退回網頁
+        # 網址只會拿到 HTML（200），被當成檔案內容寫進暫存檔。
+        self._stream_resolved = True
         if result.headers:
             # 解析標頭不覆蓋使用者自訂的同一標頭。
             merged = dict(result.headers)
@@ -1303,6 +1361,15 @@ class DownloadTask:
         # 403/401 可能是簽名 URL 已過期：清掉快取後用原始 URL 重解析一次。
         if self._resolved_url and r.status_code in (401, 403):
             self._resolved_url = None
+            if self._stream_resolved:
+                # 解析出來的直連過期了，退回網頁網址只會拿到 200 + HTML，被當成
+                # 檔案內容寫進暫存檔（大小不符最後仍會失敗，但白跑三輪重試）。
+                # 直接判定失敗，使用者按重試時 prepare() 會重新解析拿新簽名。
+                self._handle_run_failure(
+                    start_idx, end_idx, start_idx,
+                    '串流直連已過期，請重試以重新解析', stop, proxy,
+                    line_fault=False)
+                return 'fail'
             return self._request_run(start_idx, end_idx, session, stop, proxy)
         self._handle_run_failure(
             start_idx, end_idx, start_idx, f"HTTP {r.status_code}",
@@ -1340,7 +1407,7 @@ class DownloadTask:
                         break
                     data = chunk[:remaining]
                     if self.rate_limiter is not None:
-                        self.rate_limiter.acquire(len(data))
+                        self.rate_limiter.acquire(len(data), stop)
                     f.write(data)
                     pos += len(data)
                     win_bytes += len(data)
@@ -1415,10 +1482,12 @@ class DownloadTask:
             for b in range(start_idx, end_idx + 1):
                 if not self._is_block_done(b):
                     self._clear_block_claimed(b)
-        if line_fault:
-            self._note_line_failure(proxy)
+        # 暫停／取消造成的「失敗」不是線路的錯：這裡若照樣記失敗，暫停三次就會
+        # 把一條正常線路關進隔離區 60 秒，恢復後明明有網路卻完全沒有進度。
         if stop.is_set():
             return 'fail'
+        if line_fault:
+            self._note_line_failure(proxy)
         with self._lock:
             retries = self._block_retries.get(failed_idx, 0) + 1
             self._block_retries[failed_idx] = retries
@@ -1512,7 +1581,7 @@ class DownloadTask:
                     if not chunk:
                         continue
                     if self.rate_limiter is not None:
-                        self.rate_limiter.acquire(len(chunk))
+                        self.rate_limiter.acquire(len(chunk), stop)
                     f.write(chunk)
                     with self._lock:
                         self.downloaded_size += len(chunk)
@@ -1724,7 +1793,7 @@ class DownloadTask:
                         if not chunk:
                             break
                         if self.rate_limiter is not None:
-                            self.rate_limiter.acquire(len(chunk))
+                            self.rate_limiter.acquire(len(chunk), stop)
                         f.write(chunk)
                         pos += len(chunk)
                         remaining -= len(chunk)
@@ -1793,7 +1862,7 @@ class DownloadTask:
                     if stop.is_set():
                         raise _Stopped()
                     if self.rate_limiter is not None:
-                        self.rate_limiter.acquire(len(chunk))
+                        self.rate_limiter.acquire(len(chunk), stop)
                     f.write(chunk)
                     with self._lock:
                         self.downloaded_size += len(chunk)
@@ -2136,7 +2205,14 @@ class DownloadTask:
                 states.append({'frac': frac, 'active': i in active})
             return states
 
-    def get_progress(self):
+    def get_progress(self, detail=True):
+        """組出 UI／API 需要的進度快照。
+
+        detail=False 時略過區塊明細：那是最貴的一段（每個區塊一個 dict，最多
+        MAX_BLOCKS=4096 個），而 Chrome 擴充端每秒輪詢 /tasks 只用到檔名、
+        百分比與速度。讓輪詢帶著整份區塊表走，等於每秒替幾千個 dict 做一次
+        白工配置與垃圾回收。
+        """
         downloaded = self._downloaded()
         total = self.total_size
         percentage = (downloaded / total * 100) if total > 0 else 0.0
@@ -2160,7 +2236,7 @@ class DownloadTask:
             'elapsed_time': elapsed,
             'thread_count': max(1, len(self._workers or [])),
             'block_count': self.block_count,
-            'blocks': self._get_blocks_state(),
+            'blocks': self._get_blocks_state() if detail else [],
             'line_bytes': line_bytes,
             'line_labels': line_labels,
         }
@@ -2647,6 +2723,12 @@ class DownloadManager:
 
     def _on_download_completed(self, task):
         """一般下載任務完成後的回呼：若下載的是 .torrent 檔，自動接續建立並啟動 BT 任務。"""
+        # 任務數變少，全域額度要重新分配。否則兩個任務各分到一半頻寬時，其中一個
+        # 完成後剩下的仍被鎖在舊份額，白白浪費一半可用頻寬直到使用者改設定。
+        try:
+            self._apply_speed_limit()
+        except Exception as e:
+            logger.debug("任務完成後重算限速失敗: %s", e)
         if not task.is_completed():
             return
         path = getattr(task, 'filepath', '')
@@ -2719,6 +2801,8 @@ class DownloadManager:
                       proxy_max_connections=self.bt_proxy_max_connections,
                       force_tcp=self.bt_force_tcp,
                       listen_port=self.bt_listen_port)
+        # 與 HTTP 任務共用同一條完成回呼：任務數變少時重算全域限速
+        task.on_complete = self._on_download_completed
         with self._lock:
             task_id = self.next_id
             self.next_id += 1
@@ -2782,13 +2866,33 @@ class DownloadManager:
             self._apply_speed_limit()
         return result
 
+    def forget_task(self, task_id):
+        """把任務從管理器忘掉（不 cancel、不改狀態、不動檔案）。
+
+        已完成任務的檔案是成品，不能走 cancel_task（那會把狀態改成 canceled 並
+        刪掉 .downloading）。但也不能一直留在 task_ids：每輪進度輪詢都會替它
+        重建整份區塊表，下載過越多檔案、UI 越慢。
+        """
+        with self._lock:
+            task = self.task_ids.pop(task_id, None)
+            if task is not None:
+                for key, value in list(self.tasks.items()):
+                    if value is task:
+                        self.tasks.pop(key, None)
+                        break
+        return task is not None
+
     def get_task_progress(self, task_id):
         task = self.task_ids.get(task_id)
         if not task:
             return None
         return task.get_progress()
 
-    def get_all_tasks(self):
+    def get_all_tasks(self, detail=True):
+        """回傳所有任務的進度快照。
+
+        detail=False 供 HTTP /tasks 這類高頻輪詢使用（見 DownloadTask.get_progress）。
+        """
         with self._lock:
             items = list(self.task_ids.items())
         return [
@@ -2797,7 +2901,7 @@ class DownloadManager:
                 'url': task.url,
                 'filename': task.filename,
                 'status': task.status,
-                'progress': task.get_progress(),
+                'progress': task.get_progress(detail=detail),
             }
             for tid, task in items
         ]
@@ -3006,6 +3110,7 @@ class DownloadManager:
                     # 舊版留下的哨兵值（如 'nohash'），無法靠 source 的 info hash 推導。
                     task._work_root = os.path.dirname(task_json)
                     task.status = 'paused'
+                    task.on_complete = self._on_download_completed
                     with self._lock:
                         task_id = self.next_id
                         self.next_id += 1

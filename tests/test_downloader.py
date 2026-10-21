@@ -114,6 +114,10 @@ class TestProgressPersistence(unittest.TestCase):
         t._single_mode = False
         t.supports_range = True
         t.proxies = [{"host": "127.0.0.1", "port": 1080}]
+        # 真實流程裡存進度時資料檔一定存在（save_progress 會先 flush 它）。
+        # 少了它，load_progress() 會判定續傳狀態失去依據而拒絕載入
+        # （見 _resume_data_usable：避免 .downloading 被清掉後拼出全零檔案）。
+        t._ensure_temp_file()
         return t
 
     def test_roundtrip(self):
@@ -254,6 +258,8 @@ class TestPartialPersistence(unittest.TestCase):
         t._single_mode = False
         t.supports_range = True
         t.proxies = []
+        # 同上：續傳狀態必須有實際的資料檔才有意義
+        t._ensure_temp_file()
         return t
 
     def test_partial_roundtrip(self):

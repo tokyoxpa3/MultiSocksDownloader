@@ -52,7 +52,8 @@ class DownloadRequestHandler(BaseHTTPRequestHandler):
             # 用 get_all_tasks() 取得快照，不要直接迭代 task_ids：這個處理程序跑在
             # HTTP 執行緒，UI 同時新增/刪除任務時會拋 RuntimeError（dictionary
             # changed size during iteration），擴充端輪詢就會收到 500。
-            for item in self.download_manager.get_all_tasks():
+            # detail=False：輪詢只要檔名與百分比，不必替每個任務生成整份區塊表。
+            for item in self.download_manager.get_all_tasks(detail=False):
                 p = item['progress']
                 tasks.append({
                     'id': item['id'],

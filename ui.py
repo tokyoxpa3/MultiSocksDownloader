@@ -2451,6 +2451,11 @@ class MainWindow(QMainWindow):
                         else:
                             self._notify_completed("")
                     self.task_table.removeRow(row)
+                    # 列移除後就從任務表忘掉它。留著的話，每一輪進度輪詢（0.5 秒）
+                    # 仍會替這個早就結束的任務重建整份區塊表（最多 4096 個 dict），
+                    # 下載越多累積越慢；檔案是成品，不能走 cancel（那會改狀態、
+                    # 刪暫存），只要從字典移除即可。
+                    self.download_manager.forget_task(task_id)
                     break
 
                 # 若為目前選中的任務，即時刷新區塊視覺
@@ -2821,7 +2826,11 @@ class MainWindow(QMainWindow):
                         self.task_table.removeRow(row)
                         break
                 cleared += 1
-        self.statusBar().showMessage(f"已清除 {cleared} 個已完成任務", 2000)
+        if cleared:
+            self.statusBar().showMessage(f"已清除 {cleared} 個已完成任務", 2000)
+        else:
+            # 任務完成時就會從列表移除並 forget_task，這裡通常已無對象可清。
+            self.statusBar().showMessage("沒有需要清除的已完成任務", 2000)
 
     def open_folder(self, filepath):
         import subprocess
