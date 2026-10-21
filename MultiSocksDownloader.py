@@ -7,7 +7,9 @@ import os
 import sys
 import ctypes
 import logging
+import threading
 
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from ui import QApplication, MainWindow
@@ -15,6 +17,8 @@ from http_server import HttpServer
 from downloader import DownloadManager
 from app_icon import load_app_icon
 import version
+import netredirector_guard
+import runtime_env
 from logging_setup import setup_logging
 import i18n
 
@@ -90,6 +94,50 @@ def _forward_to_primary(args, server_name=None):
     socket.disconnectFromServer()
 
 
+class _StatusNotifier(QObject):
+    """把背景執行緒的訊息送回 UI 執行緒的狀態列。
+
+    Qt 的 signal emit 跨執行緒時會自動排入 receiver 所在執行緒的佇列，
+    因此背景執行緒可以安全地呼叫 emit。
+    """
+    message = Signal(str)
+
+
+def _start_netredirector_guard(window):
+    """背景向 NetRedirector 請求直連；成功加入時在狀態列提示一次。
+
+    這是純加分功能：任何失敗（沒裝 NetRedirector、連不上、逾時）都只記一筆
+    debug 記錄，不影響程式啟動，也不重試或輪詢（見 netredirector_guard.py）。
+    """
+    notifier = _StatusNotifier()
+    notifier.message.connect(lambda msg: window.statusBar().showMessage(msg, 6000))
+    # 持有參考，避免背景執行緒尚未 emit 前就被回收
+    window._nr_guard_notifier = notifier
+
+    def work():
+        try:
+            result = netredirector_guard.ensure_direct()
+        except Exception:  # noqa: BLE001 — 加分功能不得影響主程式
+            logger.exception("NetRedirector 直連檢查失敗")
+            return
+        status = result.get("status")
+        if status == "added":
+            target = result.get("target", "")
+            logger.info("已加入 NetRedirector 直連清單: %s", target)
+            notifier.message.emit(
+                f"已將本程式加入 NetRedirector 直連清單（{target}）")
+        elif status == "existed":
+            logger.debug("NetRedirector 直連清單已包含本程式")
+        elif status == "skipped" and result.get("reason") == "dev_mode":
+            logger.info("開發模式（原始碼）略過 NetRedirector 直連設定")
+            notifier.message.emit("開發模式（原始碼執行）略過 NetRedirector 直連設定")
+        else:
+            logger.debug("略過 NetRedirector 直連檢查: %s", result.get("reason"))
+
+    threading.Thread(
+        target=work, daemon=True, name="NetRedirectorGuard").start()
+
+
 if __name__ == "__main__":
     # 過濾並解析 --debug 旗標：verbose 輸出統一由此處開關，不靠散落的 print。
     argv = sys.argv[1:]
@@ -124,7 +172,9 @@ if __name__ == "__main__":
     setup_logging(debug)
 
     # 一眼可辨執行來源與版本：source=直接跑原始碼，frozen=Nuitka 打包的 exe。
-    is_frozen = bool(getattr(sys, 'frozen', False))
+    # 判斷集中在 runtime_env（涵蓋 Nuitka 的 __compiled__）；直接看 sys.frozen
+    # 會把打包版記成 source，讓排查日誌時誤判。
+    is_frozen = runtime_env.is_frozen()
     logger.info("event=startup version=%s source=%s debug=%s",
                 version.APP_VERSION, 'frozen' if is_frozen else 'source', debug)
 
@@ -209,6 +259,11 @@ if __name__ == "__main__":
     flush_pending()
 
     window.show()
+
+    # 啟動時向 NetRedirector 請求加入直連清單（若使用者有在用）。放背景
+    # 執行緒：連不上時的逾時不該拖慢啟動。
+    if getattr(download_manager, "netredirector_guard", False):
+        _start_netredirector_guard(window)
 
     # LLM 端到端測試介面：需明確以 --test-api 開啟，只綁 127.0.0.1。
     # 提供「像真人一樣點擊真實視窗」的能力，供自動化測試重現使用者操作路徑。

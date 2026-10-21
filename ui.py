@@ -29,6 +29,7 @@ import file_association
 import startup
 import version
 import updater
+import runtime_env
 import i18n
 
 logger = logging.getLogger('ui')
@@ -1415,6 +1416,12 @@ class MainWindow(QMainWindow):
         self.auto_check_update_checkbox.setChecked(bool(self.download_manager.auto_check_update))
         self.auto_check_update_checkbox.blockSignals(False)
 
+        # 載入「啟動時加入 NetRedirector 直連清單」狀態
+        self.netredirector_guard_checkbox.blockSignals(True)
+        self.netredirector_guard_checkbox.setChecked(
+            bool(self.download_manager.netredirector_guard))
+        self.netredirector_guard_checkbox.blockSignals(False)
+
         self.monitor_thread = MonitorThread(self.download_manager)
         self.monitor_thread.tasks_updated.connect(self.on_tasks_updated)
         self.monitor_thread.start()
@@ -1830,6 +1837,15 @@ class MainWindow(QMainWindow):
         self.auto_check_update_checkbox.setToolTip("開啟後，每次啟動會於背景檢查是否有新版本")
         self.auto_check_update_checkbox.toggled.connect(self.on_auto_check_update_changed)
         misc_layout.addWidget(self.auto_check_update_checkbox)
+
+        self.netredirector_guard_checkbox = QCheckBox("啟動時加入 NetRedirector 直連清單")
+        self.netredirector_guard_checkbox.setToolTip(
+            "若你有使用 NetRedirector 做流量轉送，勾選後本程式啟動時會自動把自己加入"
+            "其直連清單，避免通往 SOCKS5 代理的連線被再轉一次而失效。"
+            "沒在用 NetRedirector 時不會有任何影響。")
+        self.netredirector_guard_checkbox.toggled.connect(
+            self.on_netredirector_guard_changed)
+        misc_layout.addWidget(self.netredirector_guard_checkbox)
 
         self.update_check_button = QPushButton("立即檢查更新")
         self.update_check_button.clicked.connect(self.on_check_update_clicked)
@@ -3178,13 +3194,18 @@ class MainWindow(QMainWindow):
         """啟動時若使用者啟用「自動檢查更新」，於背景檢查一次。"""
         if not self.download_manager.auto_check_update:
             return
-        if not updater.is_frozen():
+        if not runtime_env.is_frozen():
             return  # 原始碼執行時沒有 .dist 可替換，略過
         threading.Thread(target=self._do_check_update, daemon=True).start()
 
     def on_auto_check_update_changed(self, checked):
         """切換「啟動時自動檢查更新」並儲存。"""
         self.download_manager.auto_check_update = checked
+        self.download_manager.save_config()
+
+    def on_netredirector_guard_changed(self, checked):
+        """切換「啟動時加入 NetRedirector 直連清單」並儲存。"""
+        self.download_manager.netredirector_guard = checked
         self.download_manager.save_config()
 
     def on_reset_preferences(self):
@@ -3240,12 +3261,15 @@ class MainWindow(QMainWindow):
         self.auto_check_update_checkbox.blockSignals(True)
         self.auto_check_update_checkbox.setChecked(True)
         self.auto_check_update_checkbox.blockSignals(False)
+        self.netredirector_guard_checkbox.blockSignals(True)
+        self.netredirector_guard_checkbox.setChecked(True)
+        self.netredirector_guard_checkbox.blockSignals(False)
 
         self.statusBar().showMessage("已還原預設設定", 3000)
 
     def on_check_update_clicked(self):
         """使用者手動觸發「立即檢查更新」。"""
-        if not updater.is_frozen():
+        if not runtime_env.is_frozen():
             self.update_status_label.setText("開發模式下不支援自動更新")
             return
         self.update_check_button.setEnabled(False)

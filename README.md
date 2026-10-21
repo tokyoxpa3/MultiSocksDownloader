@@ -5,7 +5,15 @@
 > ## ⚠️ 搭配 NetRedirector（PPPoE 本地網路）必讀
 >
 > 若你使用 [**NetRedirector**](https://github.com/tokyoxpa3/NetRedirector) 做流量轉送、並以 **PPPoE 本地網路**運作，
-> **務必把 `MultiSocksDownloader.exe` 加入 NetRedirector 的直連清單（Direct / Bypass）**。
+> 本程式必須被 NetRedirector 設為**直連（Direct / Bypass）**。
+>
+> **從本版起會自動處理**：本程式啟動時若偵測到 NetRedirector 正在執行，會自動把
+> 自己加入其直連清單（可在 設定 → 其他 → 「啟動時加入 NetRedirector 直連清單」
+> 關閉）。反過來，若 NetRedirector 比本程式晚啟動，它也會在啟動時自動補上，
+> 兩邊互補，誰先誰後都不會漏。
+>
+> 若你的 NetRedirector 版本較舊、不支援本機控制 API，請手動把
+> `MultiSocksDownloader.exe` 加入直連清單。
 >
 > 否則本程式通往 SOCKS5 代理的連線會被 NetRedirector 再次轉送，
 > 導致**多代理聚合失效、速度變慢，甚至完全無法連線**。
