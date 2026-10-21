@@ -57,3 +57,6 @@ nuitka-crash-report.xml
 # 一次性驗證／算圖腳本（用後即刪，不進版控）
 .demo_render.py
 .exp25_msd_adaptive_verify.py
+
+# 介面優化概念 Demo（純本機預覽，不進版控）
+demo_msd_ui.py
