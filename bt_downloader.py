@@ -72,9 +72,9 @@ BT_STALL_MIN_RATE = 1024
 BT_RESCUE_COOLDOWN = 60.0
 # 任務層級放棄判定（秒）：連續這麼久「一個位元組都沒拿到」就判定 swarm 已無來源、
 # 把任務標成 error（可按重試）。卡死救援只處理「部分線路」卡住，全部線路都沒 peer
-# 時過去會永遠停在 downloading。30 分鐘遠長於任何 tracker announce 間隔與 hash
-# 校驗時間，不會誤殺慢速但活著的種子。
-BT_GIVE_UP_SECONDS = 30 * 60
+# 時過去會永遠停在 downloading。10 分鐘已遠長於一般 tracker announce 間隔，也長於
+# 大部分 piece 在低速 swarm 下的取得時間；再久只會讓使用者盯著 0% 乾等。
+BT_GIVE_UP_SECONDS = 10 * 60
 
 # HTTP/HTTPS tracker 後備清單：DHT 與 UDP tracker 在部分環境（5G 行動網路、
 # SOCKS5 代理）被封，這些 TCP tracker 可作為 metadata / peer 來源的後備。
@@ -671,6 +671,9 @@ class BTTask:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._coordinator = None
+        # 完成回呼（由 DownloadManager 注入）：與 HTTP 任務介面一致，讓上層在同一個
+        # 地方做「任務結束後重算全域限速」之類的收尾，不必為 BT 另開一條路徑。
+        self.on_complete = None
 
         self._ti = None
         self._info_hash_hex = None
@@ -1413,6 +1416,13 @@ class BTTask:
         self.status = 'downloading'
         self.error_message = ''
         self.start_time = time.time()
+        # 先收掉上一輪的協調執行緒，再開新的。retry() 會對 error 任務再呼叫 start()，
+        # 而「放棄」只是把 handle 暫停、協調迴圈仍在跑；若這裡直接 clear() 又起一條，
+        # 就會有兩條迴圈同時 post_torrent_updates、互相覆寫 _total_done 與狀態。
+        old = self._coordinator
+        if old is not None and old.is_alive() and old is not threading.current_thread():
+            self._stop.set()
+            old.join(timeout=2.0)
         self._stop.clear()
         self._download_completed_at = None
         self._seed_deadline = None
@@ -1562,6 +1572,20 @@ class BTTask:
         self.status = 'initialized'
         return self.start()
 
+    def _notify_complete(self):
+        """通知上層「檔案已校驗通過、handle 已釋放」的完成事件。
+
+        HTTP 任務有 on_complete，BT 過去沒有，於是上層的收尾（例如任務數變少後
+        重算全域限速）永遠不會為 BT 觸發：兩個任務各分到一半額度，BT 那個跑完後
+        剩下的仍被鎖在半速。
+        """
+        if self.on_complete is None:
+            return
+        try:
+            self.on_complete(self)
+        except Exception as e:
+            logger.warning('BT 完成回呼失敗: %s', e)
+
     def cancel(self):
         self._stop.set()
         if self._coordinator is not None and self._coordinator is not threading.current_thread():
@@ -1601,18 +1625,21 @@ class BTTask:
         self._save_state()
         self._fan_out()
 
-    def _check_give_up(self, total_done):
+    def _check_give_up(self, total_done, total_download=0):
         """長時間完全沒有進度時主動放棄（HTTP 有停滯判定，BT 過去會永遠掛著）。
 
-        只看「位元組有沒有增加」而不是速率：慢速 swarm 也可能只有幾 KB/s，用速率
-        會誤殺；但連續 30 分鐘一個位元組都沒拿到，實務上就是已經沒有可用來源。
+        進度指標取「已驗證位元組」與「已接收位元組」的較大者。只看 done 會誤殺
+        慢速 swarm：piece 常有 4 MiB，若速率只有幾十 KiB/s，十幾分鐘都湊不滿
+        一個 piece，done 完全不動但資料其實一直在進來。total_download 只要有
+        payload 進帳就會增加，剛好補上這個盲點。
         放棄時保留 .bt_tmp 與已下載資料，使用者按「重試」可從原進度繼續。
         """
         if self.status != 'downloading':
             return
         now = time.time()
-        if self._give_up_done is None or total_done > self._give_up_done:
-            self._give_up_done = total_done
+        progress_bytes = max(total_done, total_download)
+        if self._give_up_done is None or progress_bytes > self._give_up_done:
+            self._give_up_done = progress_bytes
             self._give_up_since = now
             return
         if self._give_up_since is None:
@@ -1662,7 +1689,11 @@ class BTTask:
                 # 過去只對「按下暫停當下已存在的 handle」呼叫 pause()，若 magnet 在暫停
                 # 之後才收到 metadata，_fan_out() 會新建未暫停的 session，於是畫面顯示
                 # 「已暫停」卻繼續下載（實測暫停後仍從 0% 長到 21%）。
-                if self.status == 'paused':
+                if self.status in ('paused', 'error'):
+                    # 暫停與「主動放棄」（error）都該停下來。error 過去仍每 0.5 秒
+                    # 跑完整聚合：對上萬個 piece 重建 merged_done / pieces_frac，
+                    # 任務卻早已沒在動，白白吃 CPU 直到使用者清掉它。
+                    # retry() 會把 status 改回 downloading，迴圈自然恢復。
                     with self._lock:
                         self._last_speed = 0
                         self._last_upload = 0
@@ -1685,6 +1716,7 @@ class BTTask:
                 total_done = 0
                 total_rate = 0
                 total_upload = 0
+                total_download = 0
                 line_done = {}
                 num_pieces = self._num_pieces
                 merged_done = [False] * num_pieces
@@ -1705,6 +1737,7 @@ class BTTask:
                     total_done += done
                     total_rate += st.download_rate
                     total_upload += getattr(st, 'upload_rate', 0)
+                    total_download += getattr(st, 'total_download', 0)
                     line_done[line.key] = line_done.get(line.key, 0) + done
                     line_progress[line_idx] = (done, st.download_rate)
                     # st.pieces 是「每 piece 一個 0/1」的 list（libtorrent 的 bitfield
@@ -1789,7 +1822,7 @@ class BTTask:
 
                 # 任務層級的放棄判定：swarm 真的沒來源時，過去會永遠停在 downloading
                 # （HTTP 有停滯判定會報錯，BT 沒有）。
-                self._check_give_up(total_done)
+                self._check_give_up(total_done, total_download)
 
                 # 完成偵測：一律以 libtorrent 的「verified」狀態為準。st.pieces 是
                 # have 位元圖，hash 校驗尚未通過時就可能置位（甚至校驗失敗、待重下
@@ -1830,6 +1863,7 @@ class BTTask:
                                 line.remove()
                             self._active_lines = []
                             self._cleanup_work()
+                            self._notify_complete()
                             return
 
                 if self.status == 'seeding' and self._seed_deadline is not None \
@@ -1840,6 +1874,7 @@ class BTTask:
                         line.remove()
                     self._active_lines = []
                     self._cleanup_work()
+                    self._notify_complete()
                     return
 
             except Exception as e:
@@ -1930,14 +1965,16 @@ class BTTask:
             states.append({'frac': frac, 'active': active})
         return states
 
-    def get_progress(self):
+    def get_progress(self, detail=True):
+        """detail=False 時略過 piece 明細：/tasks 這種每秒輪詢只要百分比，
+        而 _compute_piece_states() 要逐 piece 掃過整個種子（動輒上萬塊）。"""
         with self._lock:
             total = self._total_size
             done = self._total_done
             speed = self._last_speed
             upload_speed = self._last_upload
             line_done = dict(self._line_done)
-            states = self._compute_piece_states()
+            states = self._compute_piece_states() if detail else []
 
         pct = (done / total * 100) if total > 0 else 0.0
         elapsed = 0
@@ -1964,8 +2001,8 @@ class BTTask:
             'waiting_metadata': (self.kind == 'magnet' and self._ti is None),
             'elapsed_time': elapsed,
             'thread_count': max(1, len(self._lines)),
-            'block_count': len(states),
-            'blocks': _downsample_blocks(states),
+            'block_count': len(states) if detail else self._num_pieces,
+            'blocks': _downsample_blocks(states) if detail else [],
             'line_bytes': line_bytes,
             'line_labels': dict(self._line_labels),
             'is_private': self.is_private,
