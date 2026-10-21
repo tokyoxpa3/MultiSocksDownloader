@@ -6,31 +6,36 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import startup
+import runtime_env
 
 
 class TestFrozenDetection(unittest.TestCase):
-    def test_not_frozen_in_source_run(self):
-        # 測試環境本身即原始碼執行，不應被判定為打包版
-        self.assertFalse(startup._is_frozen())
+    """偵測邏輯已集中到 runtime_env（見 tests/test_runtime_env.py）。
 
-    def test_nuitka_compiled_marker_counts_as_frozen(self):
-        # Nuitka 不設 sys.frozen，只注入 __compiled__；須能正確辨識
-        startup.__compiled__ = True
-        try:
-            self.assertTrue(startup._is_frozen())
-        finally:
-            del startup.__compiled__
+    這裡只驗證 startup 確實走那份共用判斷，而不是自己另寫一份。
+    """
+
+    def test_not_frozen_in_source_run(self):
+        # 測試環境本身即原始碼執行，命令應指向入口腳本
+        self.assertIn("MultiSocksDownloader.py", startup.executable_command())
+
+    def test_frozen_detected_through_runtime_env(self):
+        with mock.patch.object(runtime_env, "is_frozen", return_value=True), \
+             mock.patch.object(runtime_env, "frozen_exe_path",
+                               return_value=r"D:\app\MultiSocksDownloader.exe"):
+            self.assertEqual(startup.executable_command(),
+                             '"D:\\app\\MultiSocksDownloader.exe"')
 
 
 class TestExecutableCommand(unittest.TestCase):
     def test_source_command_targets_entry_script(self):
-        with mock.patch.object(startup, "_is_frozen", return_value=False):
+        with mock.patch.object(runtime_env, "is_frozen", return_value=False):
             cmd = startup.executable_command()
         self.assertIn("MultiSocksDownloader.py", cmd)
         self.assertNotIn("%1", cmd)  # 開機啟動不帶檔案參數
 
     def test_source_command_quotes_paths(self):
-        with mock.patch.object(startup, "_is_frozen", return_value=False):
+        with mock.patch.object(runtime_env, "is_frozen", return_value=False):
             cmd = startup.executable_command()
         self.assertTrue(cmd.startswith('"'))
         self.assertTrue(cmd.count('"') >= 4)
@@ -38,10 +43,10 @@ class TestExecutableCommand(unittest.TestCase):
     def test_frozen_command_points_at_real_exe(self):
         # 打包版：sys.executable 會是 dist\python.exe，真正 exe 在 argv[0]，
         # 命令必須指向 argv[0]，且不得含 .py 腳本或 python.exe。
-        with mock.patch.object(startup, "_is_frozen", return_value=True), \
-             mock.patch.object(startup.sys, "argv",
+        with mock.patch.object(runtime_env, "is_frozen", return_value=True), \
+             mock.patch.object(runtime_env.sys, "argv",
                                [r"D:\app\MultiSocksDownloader.exe"]), \
-             mock.patch.object(startup.sys, "executable",
+             mock.patch.object(runtime_env.sys, "executable",
                                r"D:\app\python.exe"):
             cmd = startup.executable_command()
         self.assertEqual(cmd, '"D:\\app\\MultiSocksDownloader.exe"')

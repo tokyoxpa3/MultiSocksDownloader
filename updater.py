@@ -3,8 +3,8 @@
 本模組把 docs/auto-update.md 的用戶端流程與踩坑紀錄落成可測試的函式，
 重點對應關係：
 
-- ``is_frozen()``          → 坑 1（Nuitka 不設 sys.frozen）
-- ``frozen_exe_path()``    → 坑 2（Nuitka 的 sys.executable 指向內建 python.exe）
+- ``runtime_env.is_frozen()``      → 坑 1（Nuitka 不設 sys.frozen）
+- ``runtime_env.frozen_exe_path()`` → 坑 2（Nuitka 的 sys.executable 指向內建 python.exe）
 - ``apply_script_content()``  → 坑 3/4/5/6/8（PS 5.1 的 Start-Process、編碼、
                               日誌路徑、Start-Job、正確程序名）
 - ``_extract_zip()``       → zip-slip 防護
@@ -27,6 +27,7 @@ from urllib.parse import quote
 
 import requests
 
+import runtime_env
 import version
 
 # ---------------------------------------------------------------------- #
@@ -59,6 +60,14 @@ USER_AGENT = "MultiSocksDownloader-Updater"
 # --- 代理 / 智能分流 ---
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".multi_socks_downloader")
 PROXY_CONFIG_FILENAME = "config.json"
+# 不指定代理那條候選路徑的顯示名稱。刻意不叫「直連」：不指定代理只代表
+# 「這條請求沒帶 proxy=」，不代表真的走了實體線。本程式自己就會向
+# NetRedirector 的本機控制 API 請求把自己加入直連清單（見
+# netredirector_guard.py），正好說明這台機器上經常有攔截器在轉發流量；
+# 若它的規則涵蓋本程式（例如全域 `* -> PROXY`），這條路徑同樣會被攔下來
+# 轉到同一個代理。叫「直連」會讓使用者誤判（NR 端 2026-10-03 實測：兩條路
+# 的出口 IP 完全相同，證明它們其實是同一條 5G 行動網路）。
+DIRECT_LABEL = "系統路由（未指定代理）"
 PROXY_PROBE_TIMEOUT = 6               # 等第一個位元組的逾時（秒）
 PROXY_PROBE_SECONDS = 1.5             # 首個位元組之後，最多量這麼久的吞吐
 PROXY_PROBE_MAX_BYTES = 8 * 1024 * 1024   # 量測視窗的位元組上限
@@ -86,33 +95,11 @@ ADAPTIVE_MIN_BYTES = 16 * 1024 * 1024   # 檔案太小也不值得分段試探
 # ---------------------------------------------------------------------- #
 # 凍結偵測與執行檔路徑
 # ---------------------------------------------------------------------- #
-def is_frozen():
-    """回傳目前是否為打包後的獨立執行檔（涵蓋 PyInstaller / Nuitka）。"""
-    if getattr(sys, "frozen", False):          # PyInstaller / cx_Freeze
-        return True
-    if hasattr(sys, "_MEIPASS"):               # PyInstaller onefile
-        return True
-    if globals().get("__compiled__", False):   # Nuitka 注入的模組全域變數
-        return True
-    return False
-
-
-def frozen_exe_path():
-    """取得真正執行中的 exe 路徑。
-
-    Nuitka standalone 會把 ``sys.executable`` 設成 dist 內建的 python.exe，
-    而不是真正的程式 exe；用 ``sys.argv[0]`` 才能拿到對的路徑。
-    """
-    argv0 = sys.argv[0] if sys.argv else ""
-    p = os.path.abspath(argv0) if argv0 else ""
-    if p and p.lower().endswith(".exe"):
-        return p
-    return os.path.abspath(sys.executable)
-
-
+# 判斷邏輯集中在 runtime_env（坑 1／坑 2 的說明見該模組）。這裡只留本模組
+# 專屬的路徑推導，避免又出現第五份複製。
 def current_dist_dir():
     """回傳執行檔所在的資料夾（打包後即 .dist 目錄）。"""
-    return os.path.dirname(frozen_exe_path())
+    return os.path.dirname(runtime_env.frozen_exe_path())
 
 
 # ---------------------------------------------------------------------- #
@@ -578,16 +565,20 @@ def _adaptive_threads(final_url, total, proxy_url, base_threads, probe_info):
                .format(k, gain, lat))
 
 
-def _rank_download_paths(url, use_proxy=True):
+def _rank_download_paths(url, use_proxy=True, log_cb=None):
     """並行量測直連與各代理，回傳由快到慢的
     ``[(proxy_url, speed, label, info)]``。``info`` 是該路徑的探針細節
     （含 ``final_url`` / ``total`` / ``supports_range``），讓下載階段可以
     直接沿用這次探針，不必為了拿這三個值再付一次 TTFB。
 
     防呆保證：
-    - 沒有設定代理時直接回 ``[(None, 0.0, "直連", {})]``，不增加任何延遲。
-    - 個別路徑量測失敗只會少一個候選。
+    - 沒有設定代理時直接回 ``[(None, 0.0, DIRECT_LABEL, {})]``，不增加任何延遲。
+    - 個別路徑量測失敗 (連不上、不支援、逾時) 只會少一個候選。
     - 直連永遠保留且保底排在最後，代理全掛時行為與原本完全相同。
+
+    ``log_cb`` 收到字串訊息，內容是**量測失敗的路徑與原因**。失敗一律只
+    「少一個候選」，因此若不主動發聲，「代理一直沒被選上」就分不出是代理
+    掛了、還是程式根本沒把 SOCKS 送出去。
     """
     proxies = []
     if use_proxy:
@@ -596,19 +587,22 @@ def _rank_download_paths(url, use_proxy=True):
         except Exception:  # noqa: BLE001
             proxies = []
     if not proxies:
-        return [(None, 0.0, "直連", {})]
+        return [(None, 0.0, DIRECT_LABEL, {})]
 
     candidates = [(p["url"], p["name"]) for p in proxies]
-    candidates.append((None, "直連"))
+    candidates.append((None, DIRECT_LABEL))
 
     results = {}
+    failures = {}
     lock = threading.Lock()
 
     def probe(proxy_url, label):
         speed, info = _measure_path_detailed(url, proxy_url)
-        if speed is not None:
-            with lock:
+        with lock:
+            if speed is not None:
                 results[proxy_url] = (speed, label, info)
+            else:
+                failures[label] = info
 
     threads = [threading.Thread(target=probe, args=(u, n), daemon=True)
                for u, n in candidates]
@@ -620,11 +614,32 @@ def _rank_download_paths(url, use_proxy=True):
 
     with lock:
         ranked = [(u, s, n, i) for u, (s, n, i) in results.items()]
+        missed = dict(failures)
+    # 逾時沒跑完的候選也要講清楚，否則它會靜默地以 0 分墊底，
+    # 看起來像「這條路很慢」，實際上是「根本沒量到」。
+    for proxy_url, label in candidates:
+        if proxy_url not in results and label not in missed:
+            missed[label] = {
+                "error": "量測未在 {:.0f} 秒內完成".format(PROXY_PROBE_TOTAL_TIMEOUT),
+                "ttfb": None,
+            }
+    if log_cb is not None and missed:
+        # 失敗要發聲：舊版把原因全吞掉，於是「代理一直沒被選上」看不出來是
+        # 代理掛了、還是程式根本沒把 SOCKS 送出去。
+        for label, info in sorted(missed.items()):
+            try:
+                log_cb("路徑「{}」量測失敗: {}（TTFB {}）".format(
+                    label, info.get("error") or "無資料",
+                    "{:.0f} ms".format(info["ttfb"] * 1e3)
+                    if info.get("ttfb") else "未取得"))
+            except Exception:  # noqa: BLE001 — 記錄不應影響選路
+                pass
+
     ranked.sort(key=lambda item: -item[1])
     if not ranked:
-        return [(None, 0.0, "直連", {})]
+        return [(None, 0.0, DIRECT_LABEL, {})]
     if not any(u is None for u, _s, _n, _i in ranked):
-        ranked.append((None, 0.0, "直連", {}))
+        ranked.append((None, 0.0, DIRECT_LABEL, {}))
     return ranked
 
 
@@ -1093,7 +1108,7 @@ def download_file(url, dest, progress_cb=None, cancel_event=None,
     if cancel_event is not None and cancel_event.is_set():
         raise UpdateCancelled()
 
-    ranked = _rank_download_paths(url, use_proxy=use_proxy)
+    ranked = _rank_download_paths(url, use_proxy=use_proxy, log_cb=log_cb)
 
     last_error = None
     for proxy_url, speed, label, probe_info in ranked:
@@ -1246,7 +1261,7 @@ def pending_paths():
         "dist": dist,
         "new": dist + ".new",
         "old": dist + ".old",
-        "exe": frozen_exe_path(),
+        "exe": runtime_env.frozen_exe_path(),
         "install_dir": install_dir,
         "script": os.path.join(install_dir, "apply_update.ps1"),
         "log": os.path.join(install_dir, "update_apply.log"),

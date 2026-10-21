@@ -19,6 +19,8 @@ import time
 import tempfile
 import threading
 
+import runtime_env
+
 if sys.platform == "win32":
     import ctypes
     import winreg
@@ -44,46 +46,14 @@ def _fileexts_key(*parts):
     return "\\".join((_FILEEXTS_ROOT,) + tuple(parts))
 
 
-def _is_frozen():
-    """是否為打包後的獨立執行檔（涵蓋 PyInstaller / Nuitka）。
-
-    Nuitka 預設不設定 sys.frozen，只注入 __compiled__ 全域變數，因此不能
-    只檢查 sys.frozen，否則打包版會被誤判為原始碼模式、寫出指向 dist 內
-    python.exe 與 .py 腳本的錯誤命令（開機啟動的 startup.py 同源同修）。
-    """
-    if getattr(sys, "frozen", False):          # PyInstaller / cx_Freeze
-        return True
-    if hasattr(sys, "_MEIPASS"):               # PyInstaller onefile
-        return True
-    if globals().get("__compiled__", False):   # Nuitka 注入的模組全域變數
-        return True
-    return False
-
-
-def _frozen_exe_path():
-    """取得真正執行中的程式 exe 路徑。
-
-    Nuitka standalone 會把 sys.executable 設成 dist 內建的 python.exe
-    （甚至是不存在的路徑），真正的程式 exe 要用 sys.argv[0] 才拿得到。
-    """
-    argv0 = sys.argv[0] if sys.argv else ""
-    p = os.path.abspath(argv0) if argv0 else ""
-    if p and p.lower().endswith(".exe"):
-        return p
-    exe = sys.executable or ""
-    if exe.lower().endswith(".exe"):
-        return os.path.abspath(exe)
-    return p
-
-
 def executable_command():
     """回傳檔案關聯使用的開啟命令（含 "%1" 佔位符）。
 
     打包後的獨立執行檔直接呼叫自己；原始碼執行時改用無視窗的 pythonw.exe
     執行入口腳本 MultiSocksDownloader.py，避免雙擊 .torrent 時閃出命令列視窗。
     """
-    if _is_frozen():
-        return '"{}" "%1"'.format(_frozen_exe_path())
+    if runtime_env.is_frozen():
+        return '"{}" "%1"'.format(runtime_env.frozen_exe_path())
     exe_dir = os.path.dirname(os.path.abspath(sys.executable))
     pythonw = os.path.join(exe_dir, "pythonw.exe")
     exe = pythonw if os.path.isfile(pythonw) else sys.executable
@@ -98,8 +68,8 @@ def icon_source():
 
     打包後圖示內嵌於執行檔（index 0）；原始碼執行時指向專案內的 app_icon.ico。
     """
-    if _is_frozen():
-        return '"{}",0'.format(sys.executable)
+    if runtime_env.is_frozen():
+        return '"{}",0'.format(runtime_env.frozen_exe_path())
     ico = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "app_icon.ico"
     )

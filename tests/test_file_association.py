@@ -6,6 +6,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import file_association
+import runtime_env
 
 
 class TestExecutableCommand(unittest.TestCase):
@@ -99,31 +100,43 @@ class TestTriggerSystemDialog(unittest.TestCase):
 
 
 class TestFrozenDetection(unittest.TestCase):
-    def test_not_frozen_in_source_run(self):
-        self.assertFalse(file_association._is_frozen())
+    """偵測邏輯已集中到 runtime_env（見 tests/test_runtime_env.py）。
 
-    def test_nuitka_compiled_marker_counts_as_frozen(self):
-        # Nuitka 不設 sys.frozen，只注入 __compiled__；須能正確辨識
-        file_association.__compiled__ = True
-        try:
-            self.assertTrue(file_association._is_frozen())
-        finally:
-            del file_association.__compiled__
+    這裡只驗證 file_association 確實走那份共用判斷。
+    """
+
+    def test_not_frozen_in_source_run(self):
+        self.assertIn("MultiSocksDownloader.py", file_association.executable_command())
+
+    def test_frozen_detected_through_runtime_env(self):
+        with mock.patch.object(runtime_env, "is_frozen", return_value=True), \
+             mock.patch.object(runtime_env, "frozen_exe_path",
+                               return_value=r"D:\app\MultiSocksDownloader.exe"):
+            self.assertEqual(file_association.executable_command(),
+                             '"D:\\app\\MultiSocksDownloader.exe" "%1"')
 
 
 class TestFrozenCommand(unittest.TestCase):
     def test_frozen_command_points_at_real_exe(self):
         # 打包版：sys.executable 會是 dist\python.exe，真正 exe 在 argv[0]，
         # 命令必須指向 argv[0]，且不得含 .py 腳本或 python.exe。
-        with mock.patch.object(file_association, "_is_frozen", return_value=True), \
-             mock.patch.object(file_association.sys, "argv",
+        with mock.patch.object(runtime_env, "is_frozen", return_value=True), \
+             mock.patch.object(runtime_env.sys, "argv",
                                [r"D:\app\MultiSocksDownloader.exe"]), \
-             mock.patch.object(file_association.sys, "executable",
+             mock.patch.object(runtime_env.sys, "executable",
                                r"D:\app\python.exe"):
             cmd = file_association.executable_command()
         self.assertEqual(cmd, '"D:\\app\\MultiSocksDownloader.exe" "%1"')
         self.assertNotIn(".py", cmd)
         self.assertNotIn("python.exe", cmd)
+
+    def test_frozen_icon_points_at_real_exe(self):
+        # 打包版圖示內嵌於執行檔；用 sys.executable 會指到不存在的 dist\python.exe
+        with mock.patch.object(runtime_env, "is_frozen", return_value=True), \
+             mock.patch.object(runtime_env, "frozen_exe_path",
+                               return_value=r"D:\app\MultiSocksDownloader.exe"):
+            self.assertEqual(file_association.icon_source(),
+                             '"D:\\app\\MultiSocksDownloader.exe",0')
 
 
 if __name__ == "__main__":

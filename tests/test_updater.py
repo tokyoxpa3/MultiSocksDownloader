@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import unittest
 import hashlib
 import tempfile
@@ -9,6 +10,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import updater
+import runtime_env
 
 
 class TestIsNewer(unittest.TestCase):
@@ -92,14 +94,24 @@ class TestExtractZip(unittest.TestCase):
 
 
 class TestFrozenExePath(unittest.TestCase):
+    """路徑推導已集中到 runtime_env（見 tests/test_runtime_env.py）。
+
+    這裡只驗證 updater 的 .dist 推導跟著那份共用判斷走。
+    """
+
     def test_prefers_argv0_exe(self):
-        with mock.patch.object(updater.sys, "argv", ["C:\\app\\MultiSocksDownloader.exe"]):
-            self.assertTrue(updater.frozen_exe_path().endswith("MultiSocksDownloader.exe"))
+        with mock.patch.object(runtime_env.sys, "argv",
+                               ["C:\\app\\MultiSocksDownloader.exe"]):
+            self.assertTrue(
+                runtime_env.frozen_exe_path().endswith("MultiSocksDownloader.exe"))
+            self.assertEqual(updater.current_dist_dir(), "C:\\app")
 
     def test_falls_back_to_executable(self):
-        with mock.patch.object(updater.sys, "argv", ["C:\\app\\MultiSocksDownloader.py"]), \
-             mock.patch.object(updater.sys, "executable", "C:\\Python\\python.exe"):
-            self.assertTrue(updater.frozen_exe_path().endswith("python.exe"))
+        with mock.patch.object(runtime_env.sys, "argv",
+                               ["C:\\app\\MultiSocksDownloader.py"]), \
+             mock.patch.object(runtime_env.sys, "executable",
+                               "C:\\Python\\python.exe"):
+            self.assertTrue(runtime_env.frozen_exe_path().endswith("python.exe"))
 
 
 class TestApplyScriptContent(unittest.TestCase):
@@ -254,6 +266,135 @@ class TestMultipartBlockCap(unittest.TestCase):
         seen, size = self._run(total)
         self.assertEqual(len(seen), updater.MAX_BLOCKS)
         self.assertEqual(size, total)
+
+
+class TestRankDownloadPaths(unittest.TestCase):
+    """D5（失敗靜默）與 D6（標籤說謊）的回歸測試。
+
+    這個函式過去**完全沒有測試**，正是 D5 得以長期隱形的原因：所有失敗
+    都被默默折成「少一個候選」，沒有任何斷言會注意到。
+    """
+    URL = "http://x/f.bin"
+
+    def _run(self, probes, log_cb=None, proxies=None):
+        """跑 _rank_download_paths，以假的探針取代真實網路。
+
+        probes: {proxy_url: (speed|None, info)}；None 這條代表系統路由候選。
+        """
+        if proxies is None:
+            proxies = [{"name": "P1", "url": "socks5h://a:1"},
+                       {"name": "P2", "url": "socks5h://b:2"}]
+
+        def fake_measure(url, proxy_url, **kw):
+            return probes[proxy_url]
+
+        with mock.patch.object(updater, "load_proxy_urls",
+                               return_value=proxies), \
+             mock.patch.object(updater, "_measure_path_detailed",
+                               side_effect=fake_measure):
+            return updater._rank_download_paths(self.URL, log_cb=log_cb)
+
+    def test_direct_label_is_not_called_zhi_lian(self):
+        """D6：保底路徑的標籤不能是「直連」（它可能被引擎攔走）。"""
+        ranked = self._run({
+            "socks5h://a:1": (None, {"error": "x", "ttfb": None}),
+            "socks5h://b:2": (None, {"error": "y", "ttfb": None}),
+            None: (0.0, _probe_info(100, speed=0.0)),
+        })
+        _u, _s, label, _i = ranked[-1]
+        self.assertEqual(label, updater.DIRECT_LABEL)
+        self.assertEqual(updater.DIRECT_LABEL, "系統路由（未指定代理）")
+        self.assertNotEqual(label, "直連")
+
+    def test_no_proxy_uses_direct_label(self):
+        """D6：沒有設定代理時也走 DIRECT_LABEL，不留舊字面值。"""
+        with mock.patch.object(updater, "load_proxy_urls", return_value=[]):
+            ranked = updater._rank_download_paths(self.URL)
+        self.assertEqual(ranked, [(None, 0.0, updater.DIRECT_LABEL, {})])
+
+    def test_failed_path_is_reported_with_reason(self):
+        """D5：量測失敗必須發出訊息，並帶上原因與 TTFB。"""
+        logs = []
+        self._run({
+            "socks5h://a:1": (None, {"error": "HTTP 503", "ttfb": 0.42}),
+            "socks5h://b:2": (2.0e6, _probe_info(100, speed=2.0e6)),
+            None: (1.0e6, _probe_info(100, speed=1.0e6)),
+        }, log_cb=logs.append)
+
+        self.assertEqual(len(logs), 1, logs)
+        self.assertIn("P1", logs[0])
+        self.assertIn("HTTP 503", logs[0])
+        self.assertIn("420 ms", logs[0])
+
+    def test_timeout_is_reported_not_silently_zero(self):
+        """D5：逾時沒跑完的候選不能靜默地以 0 分墊底。
+
+        這裡讓「系統路由」那條永遠不回來（模擬逾時），它既不在 results
+        也不在 failures，必須由補漏邏輯補上「量測未在 N 秒內完成」。
+        """
+        logs = []
+
+        def fake_measure(url, proxy_url, **kw):
+            if proxy_url is None:
+                time.sleep(updater.PROXY_PROBE_TOTAL_TIMEOUT + 5)
+                return (0.0, _probe_info(100, speed=0.0))
+            return (3.0e6, _probe_info(100, speed=3.0e6))
+
+        with mock.patch.object(updater, "load_proxy_urls",
+                               return_value=[{"name": "P1",
+                                              "url": "socks5h://a:1"}]), \
+             mock.patch.object(updater, "_measure_path_detailed",
+                               side_effect=fake_measure), \
+             mock.patch.object(updater, "PROXY_PROBE_TOTAL_TIMEOUT", 0.2):
+            ranked = updater._rank_download_paths(self.URL,
+                                                  log_cb=logs.append)
+
+        self.assertTrue(any("量測未在" in m for m in logs), logs)
+        # 逾時那條仍要保底存在，行為與舊版一致
+        self.assertTrue(any(u is None for u, _s, _n, _i in ranked))
+
+    def test_log_cb_absence_is_safe(self):
+        """D5：沒有 log_cb 時不得拋錯（向後相容）。"""
+        ranked = self._run({
+            "socks5h://a:1": (None, {"error": "boom", "ttfb": None}),
+            "socks5h://b:2": (None, {"error": "boom", "ttfb": None}),
+            None: (1.0e6, _probe_info(100, speed=1.0e6)),
+        })
+        self.assertEqual(ranked, [(None, 1.0e6, updater.DIRECT_LABEL,
+                                   _probe_info(100, speed=1.0e6))])
+
+    def test_log_cb_exception_does_not_break_ranking(self):
+        """D5：記錄本身失敗不應影響選路結果。"""
+        def bad_log(_msg):
+            raise RuntimeError("logging is broken")
+
+        ranked = self._run({
+            "socks5h://a:1": (None, {"error": "boom", "ttfb": None}),
+            "socks5h://b:2": (2.0e6, _probe_info(100, speed=2.0e6)),
+            None: (1.0e6, _probe_info(100, speed=1.0e6)),
+        }, log_cb=bad_log)
+        self.assertEqual(ranked[0][1], 2.0e6)
+
+    def test_sorted_fastest_first_and_direct_kept_last(self):
+        """排序語意不變：快到慢，且未指定代理那條保底在最後。"""
+        ranked = self._run({
+            "socks5h://a:1": (5.0e6, _probe_info(100, speed=5.0e6)),
+            "socks5h://b:2": (2.0e6, _probe_info(100, speed=2.0e6)),
+            None: (1.0e6, _probe_info(100, speed=1.0e6)),
+        })
+        self.assertEqual([r[1] for r in ranked], [5.0e6, 2.0e6, 1.0e6])
+        self.assertIsNone(ranked[-1][0])
+
+    def test_all_proxies_fail_still_returns_direct_fallback(self):
+        """代理全掛時只剩保底那條，且理由是「沒有代理」而非「有代理」。"""
+        ranked = self._run({
+            "socks5h://a:1": (None, {"error": "x", "ttfb": None}),
+            "socks5h://b:2": (None, {"error": "y", "ttfb": None}),
+            None: (0.0, _probe_info(100, speed=0.0)),
+        })
+        self.assertEqual(len(ranked), 1)
+        self.assertIsNone(ranked[0][0])
+        self.assertEqual(ranked[0][2], updater.DIRECT_LABEL)
 
 
 if __name__ == "__main__":
