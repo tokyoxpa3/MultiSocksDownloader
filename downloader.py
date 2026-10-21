@@ -20,6 +20,7 @@ import stream_resolver
 from stream_resolver import (YtDlpStreamResolver, build_native_format_selector,
                              build_socks_proxy_url)
 import i18n
+import runtime_env
 
 logger = logging.getLogger('downloader')
 
@@ -33,6 +34,10 @@ MAX_BLOCKS = 4096
 # 隱藏，run 不需太大；過大的 run 會在 worker 數多時讓 run 數少於 worker 數，
 # 導致分攤不均、預取失效、完成時 worker 驟減造成速率斷崖。64 MiB 為平衡值。
 TARGET_RUN_BYTES = 64 * 1024 * 1024
+
+# config.json 的寫入鎖：save_config() 會被 UI、HTTP 與代理測試執行緒同時呼叫，
+# 兩個執行緒同時寫同一個檔案會互相截斷，留下半截 JSON。
+_CONFIG_SAVE_LOCK = threading.Lock()
 
 # HTTP 分段引擎的卡死防護（BT 引擎有 _stall_rescue，這裡補上對應機制）。
 # worker 在區段失敗後會自行退場；若無人補位，剩餘區塊就永遠沒人下載，
@@ -200,16 +205,13 @@ def _find_ffmpeg():
     """定位 ffmpeg 執行檔，供原生下載合併視訊+音訊。
 
     打包後優先找執行檔旁的 ffmpeg\\ffmpeg.exe（或同層 ffmpeg.exe），
-    其次退回系統 PATH。Nuitka standalone 的 sys.executable 指向內建
-    python.exe，故凍結路徑要用 sys.argv[0]，與 updater.frozen_exe_path() 同因。
+    其次退回系統 PATH。執行檔路徑由 runtime_env 推導（Nuitka standalone 的
+    sys.executable 指向內建 python.exe，不能拿來當基準）。
     """
     import shutil
     base_dirs = []
-    if getattr(sys, 'frozen', False) or globals().get('__compiled__', False):
-        argv0 = sys.argv[0] if sys.argv else ''
-        p = os.path.abspath(argv0) if argv0 else ''
-        if p.lower().endswith('.exe'):
-            base_dirs.append(os.path.dirname(p))
+    if runtime_env.is_frozen():
+        base_dirs.append(os.path.dirname(runtime_env.frozen_exe_path()))
     # 原始碼執行（python MultiSocksDownloader.py）時也找 __file__ 所在專案
     # 根目錄下的 ffmpeg，避免明明有 ffmpeg\ffmpeg.exe 卻因不在 PATH 而找不到。
     base_dirs.append(os.path.dirname(os.path.abspath(__file__)))
@@ -349,6 +351,9 @@ class DownloadTask:
 
         self.supports_range = False
         self._single_mode = False
+        # 分段階段若伺服器忽略 Range 改回 200，改由單一 worker 從頭串流整檔；
+        # 此旗標確保只有一個 worker 接手（見 _request_run）。
+        self._single_stream = False
         # 跳轉後的最終 CDN 簽名 URL 快取：後續 run 直接打它、跳過每次的 302 跳轉，
         # 避免每個 64 MiB run 都重新付一次 HuggingFace 簽章/跳轉延遲。
         self._resolved_url = None
@@ -785,7 +790,7 @@ class DownloadTask:
                 self.temp_filepath = f"{self.filepath}.downloading"
                 self.progress_filepath = f"{self.filepath}.progress"
 
-            self._ensure_unique_filepath()
+            self._ensure_unique_filepath(reserve=True)
 
             if self.supports_range and self.total_size > 0:
                 self._build_blocks()
@@ -1067,21 +1072,40 @@ class DownloadTask:
         except Exception as e:
             logger.warning("建立暫存檔失敗: %s", e)
 
-    def _ensure_unique_filepath(self):
-        if not os.path.exists(self.filepath):
-            return
+    def _ensure_unique_filepath(self, reserve=False):
+        """挑一個沒被佔用的目標檔名。
+
+        reserve=True 時額外用 O_CREAT|O_EXCL 原子建立 .downloading 佔位檔。
+        只檢查成品檔是否存在會有 TOCTOU 競態：兩個同名任務同時 prepare() 都看不到
+        成品，於是共用同一個 .downloading 互相覆寫，最後兩邊都回報「已完成」，但
+        檔案只剩其中一份的內容（實測 3 MB 兩份不同內容 → 落盤只有 A）。
+        原生（yt-dlp）模式不可佔位，否則會留下空檔並在收尾時覆蓋掉真正的成品。
+        """
         base, ext = os.path.splitext(self.filename)
-        counter = 1
+        counter = 0
         while True:
-            new_name = f"{base}_{counter}{ext}"
-            new_path = os.path.join(self.save_dir, new_name)
-            if not os.path.exists(new_path):
-                self.filename = new_name
-                self.filepath = new_path
-                self.temp_filepath = f"{self.filepath}.downloading"
-                self.progress_filepath = f"{self.filepath}.progress"
-                return
-            counter += 1
+            name = self.filename if counter == 0 else f"{base}_{counter}{ext}"
+            path = os.path.join(self.save_dir, name)
+            tmp = f"{path}.downloading"
+            if os.path.exists(path):
+                counter += 1
+                continue
+            if reserve:
+                try:
+                    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+                    os.close(fd)
+                except FileExistsError:
+                    # 已被其他任務佔用，或上次中斷留下的孤兒檔：換下一個名字，
+                    # 不去動它（可能是別人正在寫的檔案）。
+                    counter += 1
+                    continue
+                except OSError:
+                    pass  # 無法建立佔位（權限等）：退回舊行為，讓後續流程自行報錯
+            self.filename = name
+            self.filepath = path
+            self.temp_filepath = tmp
+            self.progress_filepath = f"{path}.progress"
+            return
 
     def _rebuild_pool(self):
         with self._pool_lock:
@@ -1259,9 +1283,16 @@ class DownloadTask:
                 self._resolved_url = r.url
             return ('stream', start_idx, end_idx, req_start, end, r)
         if r.status_code == 200:
+            # 伺服器忽略 Range（回 200 全檔）。過去這裡只發一個沒有任何人讀取的
+            # _fallback_event 就讓 worker 退場，於是看門狗不斷補位、worker 又不斷
+            # 退場，任務永遠停在 0%，要等 3 輪停滯判定（約 3 分鐘）才報錯。
+            # 改為由第一個拿到 200 的 worker 直接從 byte 0 串流整檔，跨越區塊邊界
+            # 時逐塊標記完成；其他 worker 手上的 206 區段資料相同，重疊無害。
+            if self._begin_single_stream():
+                return ('stream', 0, self.block_count - 1, 0, self.total_size - 1, r)
             r.close()
             self._handle_run_fallback(start_idx, end_idx)
-            return 'fallback'
+            return 'done'
         if r.status_code == 416:
             r.close()
             self._handle_run_failure(
@@ -1356,6 +1387,14 @@ class DownloadTask:
                 pass
             return self._handle_run_failure(
                 start_idx, end_idx, cur_idx, f"寫入失敗: {e}", stop, proxy)
+
+    def _begin_single_stream(self):
+        """嘗試取得「整檔單流」的資格；只有第一個呼叫者會成功。"""
+        with self._lock:
+            if self._single_stream:
+                return False
+            self._single_stream = True
+            return True
 
     def _handle_run_fallback(self, start_idx, end_idx):
         """伺服器忽略 Range（回 200）：釋放本段認領，交由呼叫端切換單線模式。"""
@@ -1890,6 +1929,7 @@ class DownloadTask:
         stop = self._stop
         self._completed.clear()
         self._fallback_event.clear()
+        self._single_stream = False
         self._resumed_size = self._downloaded()
         self.start_time = time.time()
         self._last_time = time.time()
@@ -1980,9 +2020,14 @@ class DownloadTask:
             return False
         self._stop.set()
         self._set_status('paused')
+        # 只給總計 0.3 秒的收尾預算：worker 若正卡在 socket read（timeout 60 秒），
+        # 逐個 join(1.0) 會讓 UI 執行緒凍結「存活 worker 數」秒（實測 2 個 worker
+        # 就是 2.02 秒；預設 3 線 × 6 執行緒可達十幾秒）。worker 會在收到下一個
+        # chunk 時自行退出，最多少存一點進度。
+        deadline = time.monotonic() + 0.3
         for t in self._workers:
             if t.is_alive():
-                t.join(timeout=1.0)
+                t.join(timeout=max(0.0, deadline - time.monotonic()))
         # 原生下載不走 .progress 續傳（由 yt-dlp .part 接手），勿寫出誤導的進度檔
         if not self._native_mode:
             self.save_progress()
@@ -2007,9 +2052,11 @@ class DownloadTask:
     def cancel(self):
         self._stop.set()
         self._set_status('canceled')
+        # 與 pause() 同理：逐個 join(1) 會讓 UI 凍結與存活執行緒數成正比的時間。
+        deadline = time.monotonic() + 0.5
         for t in self.threads:
             if t is not threading.current_thread() and t.is_alive():
-                t.join(timeout=1)
+                t.join(timeout=max(0.0, deadline - time.monotonic()))
         for p in (self.temp_filepath, self.progress_filepath):
             try:
                 if os.path.exists(p):
@@ -2152,6 +2199,8 @@ class DownloadManager:
         self.rate_limiter = RateLimiter()
         self.custom_headers = {}
         self.auto_check_update = True  # 啟動時是否自動檢查更新
+        # 啟動時向 NetRedirector 請求把自己加入直連清單（見 netredirector_guard.py）
+        self.netredirector_guard = True
         self.language = i18n.DEFAULT_LANG  # 介面語系（locale/<code>.json）
         self._language_saved = False       # 設定檔是否已記錄語系（用來判斷首次啟動）
 
@@ -2266,6 +2315,8 @@ class DownloadManager:
                 self.custom_headers = config['custom_headers']
             if 'auto_check_update' in config:
                 self.auto_check_update = bool(config['auto_check_update'])
+            if 'netredirector_guard' in config:
+                self.netredirector_guard = bool(config['netredirector_guard'])
             if 'language' in config and config['language'] in i18n.SUPPORTED_LANGS:
                 self.language = config['language']
                 self._language_saved = True
@@ -2294,12 +2345,23 @@ class DownloadManager:
                 'bt_dht_autotune': self.bt_dht_autotune,
                 'custom_headers': self.custom_headers,
                 'auto_check_update': self.auto_check_update,
+                'netredirector_guard': self.netredirector_guard,
                 'language': self.language,
                 'history': self.history,
                 'next_history_id': self.next_history_id,
             }
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(config, f, ensure_ascii=False)
+            # 原子寫入：先寫 .tmp、fsync，再 os.replace。
+            # 過去直接以 'w' 開 config.json 邊序列化邊寫，只要中途失敗（磁碟滿、
+            # 行程被砍、json.dump 因併發修改而拋錯），檔案就留下半截內容；下次啟動
+            # load_config 解析失敗，整份設定（含 SOCKS5 代理清單與下載歷史）全部
+            # 退回預設值且不會有任何提示。
+            with _CONFIG_SAVE_LOCK:
+                tmp = self.config_file + '.tmp'
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.config_file)
         except Exception as e:
             logger.warning("儲存設定失敗: %s", e)
 
@@ -2326,6 +2388,7 @@ class DownloadManager:
         self.set_bt_listen_port(6881)
         self.set_custom_headers({})
         self.auto_check_update = True
+        self.netredirector_guard = True
 
         self.save_config()
 
@@ -2674,6 +2737,7 @@ class DownloadManager:
         if getattr(task, 'status', None) in ('downloading', 'seeding'):
             return True
         result = task.start()
+        self._apply_speed_limit()
         logger.info("event=start_task_result task_id=%s ok=%s status=%s error=%s",
                     task_id, result, task.status, task.error_message)
         return result
@@ -2682,19 +2746,29 @@ class DownloadManager:
         task = self.task_ids.get(task_id)
         if not task:
             return False
-        return task.pause()
+        ok = task.pause()
+        if ok:
+            # 暫停的任務不再佔額度，剩下的任務要立刻分到更多
+            self._apply_speed_limit()
+        return ok
 
     def resume_task(self, task_id):
         task = self.task_ids.get(task_id)
         if not task:
             return False
-        return task.resume()
+        ok = task.resume()
+        if ok:
+            self._apply_speed_limit()
+        return ok
 
     def retry_task(self, task_id):
         task = self.task_ids.get(task_id)
         if not task:
             return False
-        return task.retry()
+        ok = task.retry()
+        if ok:
+            self._apply_speed_limit()
+        return ok
 
     def cancel_task(self, task_id):
         task = self.task_ids.get(task_id)
@@ -2705,6 +2779,7 @@ class DownloadManager:
             with self._lock:
                 self.tasks.pop(task.url, None)
                 self.task_ids.pop(task_id, None)
+            self._apply_speed_limit()
         return result
 
     def get_task_progress(self, task_id):
@@ -2730,7 +2805,37 @@ class DownloadManager:
     def set_speed_limit(self, speed_limit):
         """設定全局限速（bytes/sec），0 表示不限速。"""
         self.speed_limit = max(0, int(speed_limit))
-        self.rate_limiter.set_rate(self.speed_limit)
+        self._apply_speed_limit()
+
+    def _apply_speed_limit(self):
+        """把全域下載額度分配到各任務。
+
+        HTTP 任務透過共用的 RateLimiter 節流，只要設定「HTTP 任務的總配額」即可；
+        BT 的資料由 libtorrent 直接寫盤，應用層攔不到，只能逐任務設 download_limit，
+        所以按「每個活躍任務一份」均分全域額度。這樣 HTTP 與 BT 混合時兩邊總和
+        才不會超過使用者設的上限（過去 BT 完全不受全域限速約束）。
+        """
+        limit = self.speed_limit
+        with self._lock:
+            tasks = list(self.task_ids.values())
+        active = [t for t in tasks if getattr(t, 'status', None) == 'downloading']
+        bt_tasks = [t for t in active if isinstance(t, BTTask)]
+        http_count = len(active) - len(bt_tasks)
+        if limit <= 0:
+            self.rate_limiter.set_rate(0)
+            for t in bt_tasks:
+                t.set_download_limit(0)
+            return
+        total = len(active)
+        if total == 0:
+            # 沒有任務在跑：先保留完整額度，下一個任務加入時會重算
+            self.rate_limiter.set_rate(limit)
+            return
+        share = limit / float(total)
+        # HTTP 任務共用同一個桶，桶的速率要乘上任務數才是它們的總額度
+        self.rate_limiter.set_rate(share * http_count if http_count else 0)
+        for t in bt_tasks:
+            t.set_download_limit(int(share))
 
     def get_speed_limit(self):
         return self.speed_limit
@@ -2893,6 +2998,9 @@ class DownloadManager:
                         proxy_max_connections=self.bt_proxy_max_connections,
                         force_tcp=self.bt_force_tcp,
                         listen_port=self.bt_listen_port,
+                        # 沿用上次解析出的落盤根名：同名種子可能已被改成 "name (1)"，
+                        # 重新推導會再往上加一個後綴、找不到既有進度。
+                        root_name=state.get('root_name'),
                     )
                     # 記錄實際掃描到的 .bt_tmp 目錄，刪除時才能精準清掉；目錄名可能是
                     # 舊版留下的哨兵值（如 'nohash'），無法靠 source 的 info hash 推導。

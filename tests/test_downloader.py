@@ -11,6 +11,7 @@ from downloader import (DownloadTask, DownloadManager, format_size,
                         _better_filename, _filename_from_url,
                         _looks_like_endpoint,
                         LINE_FAIL_THRESHOLD, LINE_QUARANTINE_SECONDS)
+from bt_downloader import BTTask
 
 
 class TestFormatSize(unittest.TestCase):
@@ -725,6 +726,71 @@ class TestCompleteGuard(unittest.TestCase):
         self.assertEqual(t.status, 'completed')
         self.assertTrue(os.path.exists(t.filepath))
         self.assertFalse(os.path.exists(t.temp_filepath))
+
+
+class TestSpeedLimitAllocation(unittest.TestCase):
+    """全域限速要同時約束 HTTP 與 BT：BT 的資料由 libtorrent 寫盤，應用層的
+    RateLimiter 攔不到，只能逐任務設 download_limit，因此按活躍任務數均分。"""
+
+    def setUp(self):
+        self.manager = DownloadManager()
+        self.manager.config_file = os.path.join(tempfile.mkdtemp(), "config.json")
+
+    def _add(self, task, status):
+        task.status = status
+        tid = self.manager.next_id
+        self.manager.next_id += 1
+        self.manager.task_ids[tid] = task
+        return tid
+
+    def _bt(self):
+        return BTTask('magnet:?xt=urn:btih:' + 'a' * 40, tempfile.mkdtemp())
+
+    def _http(self):
+        return DownloadTask('http://example.com/f.bin', tempfile.mkdtemp(),
+                            filename='f.bin')
+
+    def test_bt_gets_whole_limit_when_alone(self):
+        bt = self._bt()
+        self._add(bt, 'downloading')
+        self.manager.set_speed_limit(1024 * 1024)
+        self.assertEqual(bt.download_rate_limit, 1024 * 1024)
+
+    def test_mixed_tasks_split_evenly(self):
+        bt = self._bt()
+        http = self._http()
+        self._add(bt, 'downloading')
+        self._add(http, 'downloading')
+        self.manager.set_speed_limit(1000)
+        self.assertEqual(bt.download_rate_limit, 500)
+        # HTTP 任務共用同一個桶，桶速率 = 每任務配額 × HTTP 任務數
+        self.assertEqual(self.manager.rate_limiter.get_rate(), 500)
+
+    def test_paused_task_not_counted(self):
+        bt = self._bt()
+        http = self._http()
+        self._add(bt, 'downloading')
+        self._add(http, 'paused')
+        self.manager.set_speed_limit(1000)
+        self.assertEqual(bt.download_rate_limit, 1000)
+
+    def test_zero_limit_clears_bt_cap(self):
+        bt = self._bt()
+        self._add(bt, 'downloading')
+        bt.download_rate_limit = 4096
+        self.manager.set_speed_limit(0)
+        self.assertEqual(bt.download_rate_limit, 0)
+        self.assertEqual(self.manager.rate_limiter.get_rate(), 0)
+
+    def test_cancel_task_reallocates(self):
+        bt = self._bt()
+        http = self._http()
+        self._add(bt, 'downloading')
+        tid = self._add(http, 'downloading')
+        self.manager.set_speed_limit(1000)
+        self.assertEqual(bt.download_rate_limit, 500)
+        self.manager.cancel_task(tid)
+        self.assertEqual(bt.download_rate_limit, 1000)
 
 
 if __name__ == "__main__":

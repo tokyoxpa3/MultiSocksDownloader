@@ -49,11 +49,14 @@ class DownloadRequestHandler(BaseHTTPRequestHandler):
         if path == '/tasks':
             self._set_response()
             tasks = []
-            for tid, task in self.download_manager.task_ids.items():
-                p = task.get_progress()
+            # 用 get_all_tasks() 取得快照，不要直接迭代 task_ids：這個處理程序跑在
+            # HTTP 執行緒，UI 同時新增/刪除任務時會拋 RuntimeError（dictionary
+            # changed size during iteration），擴充端輪詢就會收到 500。
+            for item in self.download_manager.get_all_tasks():
+                p = item['progress']
                 tasks.append({
-                    'id': tid,
-                    'filename': task.filename,
+                    'id': item['id'],
+                    'filename': item['filename'],
                     'status': p['status'],
                     'percentage': p['percentage'],
                     'downloaded_size': p['downloaded_size'],
