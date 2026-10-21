@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 import hashlib
 import tempfile
 import unittest
@@ -11,7 +12,7 @@ import libtorrent as lt
 from bt_downloader import (
     BTTask, is_magnet, source_kind, magnet_display_name, partition_ranges, LineSession,
     torrent_file_tree, bt_info_hash, _downsample_blocks, _verified_done,
-    _stall_timeout_for, _update_stall,
+    _stall_timeout_for, _update_stall, renamed_files_for, BT_GIVE_UP_SECONDS,
 )
 
 
@@ -711,6 +712,112 @@ class TestPieceProgress(unittest.TestCase):
         p = t.get_progress()
         self.assertEqual(p['blocks'], [])
         self.assertEqual(p['block_count'], 0)
+
+
+class TestSameNameIsolation(unittest.TestCase):
+    """同名種子隔離：不同 info hash 但同 name 時，後加入的加後綴分家。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _task(self, info_hash):
+        t = BTTask('magnet:?xt=urn:btih:' + '1' * 40, self.tmp)
+        t._info_hash_hex = info_hash
+        return t
+
+    def test_renamed_files_single(self):
+        ti, _ = make_torrent_info(16384, [('a.bin', b'A' * 16384)])
+        self.assertEqual(renamed_files_for(ti, 'b.bin'), {0: 'b.bin'})
+        self.assertEqual(renamed_files_for(ti, 'a.bin'), {})
+
+    def test_renamed_files_multi_keeps_subpath(self):
+        ti, _ = make_torrent_info(16384, [('sub/x.txt', b'X' * 16384),
+                                          ('y.txt', b'Y' * 16384)])
+        self.assertEqual(renamed_files_for(ti, 'root (1)'),
+                         {0: 'root (1)/sub/x.txt', 1: 'root (1)/y.txt'})
+
+    def test_conflict_adds_suffix(self):
+        ti, _ = make_torrent_info(16384, [('a.bin', b'A' * 16384)])
+        self.assertEqual(self._task('h1')._resolve_root_name(ti), 'a.bin')
+        other, _ = make_torrent_info(16384, [('a.bin', b'B' * 16384)])
+        self.assertEqual(self._task('h2')._resolve_root_name(other), 'a (1).bin')
+
+    def test_same_content_keeps_name(self):
+        """磁碟上已有同內容資料時沿用原名，交給 libtorrent 校驗，不亂改名。"""
+        ti, stream = make_torrent_info(16384, [('a.bin', b'A' * 32768)])
+        with open(os.path.join(self.tmp, 'a.bin'), 'wb') as f:
+            f.write(stream)
+        self.assertEqual(self._task('h3')._resolve_root_name(ti), 'a.bin')
+
+    def test_same_size_different_content_renames(self):
+        """同名、同大小、不同內容：抽驗首尾 piece 後改名，避免覆寫既有檔案。"""
+        ti, _ = make_torrent_info(16384, [('a.bin', b'A' * 32768)])
+        with open(os.path.join(self.tmp, 'a.bin'), 'wb') as f:
+            f.write(b'B' * 32768)
+        self.assertEqual(self._task('h4')._resolve_root_name(ti), 'a (1).bin')
+
+    def test_resume_keeps_name(self):
+        """續傳（.bt_tmp 有紀錄）不因磁碟內容改名，否則 libtorrent 找不到進度。"""
+        ti, _ = make_torrent_info(16384, [('a.bin', b'A' * 32768)])
+        with open(os.path.join(self.tmp, 'a.bin'), 'wb') as f:
+            f.write(b'B' * 1024)
+        t = self._task('h5')
+        t._work_root = os.path.join(self.tmp, '.bt_tmp', 'h5')
+        os.makedirs(t._work_root)
+        t._resuming = True
+        self.assertEqual(t._resolve_root_name(ti), 'a.bin')
+
+    def test_claim_released_allows_reuse(self):
+        ti, _ = make_torrent_info(16384, [('a.bin', b'A' * 16384)])
+        t1 = self._task('h6')
+        self.assertEqual(t1._resolve_root_name(ti), 'a.bin')
+        t1._release_root_claim()
+        other, _ = make_torrent_info(16384, [('a.bin', b'B' * 16384)])
+        self.assertEqual(self._task('h7')._resolve_root_name(other), 'a.bin')
+
+
+class TestGiveUp(unittest.TestCase):
+    """任務層級放棄：連續 BT_GIVE_UP_SECONDS 完全沒有新位元組就標成 error。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.t = BTTask('magnet:?xt=urn:btih:' + '2' * 40, self.tmp)
+        self.t.status = 'downloading'
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_gives_up_after_timeout(self):
+        self.t._give_up_done = 100
+        self.t._give_up_since = time.time() - (BT_GIVE_UP_SECONDS + 1)
+        self.t._check_give_up(100)
+        self.assertEqual(self.t.status, 'error')
+        self.assertIn('沒有收到任何資料', self.t.error_message)
+
+    def test_progress_resets_timer(self):
+        self.t._give_up_done = 100
+        self.t._give_up_since = time.time() - (BT_GIVE_UP_SECONDS + 1)
+        self.t._check_give_up(200)
+        self.assertEqual(self.t.status, 'downloading')
+        self.assertEqual(self.t._give_up_done, 200)
+        self.assertGreater(self.t._give_up_since, time.time() - 5)
+
+    def test_first_call_starts_timer(self):
+        self.t._check_give_up(0)
+        self.assertEqual(self.t.status, 'downloading')
+        self.assertIsNotNone(self.t._give_up_since)
+
+    def test_paused_not_affected(self):
+        self.t.status = 'paused'
+        self.t._give_up_done = 0
+        self.t._give_up_since = time.time() - (BT_GIVE_UP_SECONDS + 1)
+        self.t._check_give_up(0)
+        self.assertEqual(self.t.status, 'paused')
 
 
 if __name__ == '__main__':
