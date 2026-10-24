@@ -135,6 +135,9 @@ jobs:
           foreach ($subject in $subjects) {
             if ([string]::IsNullOrWhiteSpace($subject)) { continue }
             $text = $subject -replace '[，,、]?\s*發佈\s*v?\d+\.\d+(?:\.\d+)?\s*$', ''
+            # chore 是內部維護（版控整理、暫存檔、本機概念稿），對使用者沒有意義，
+            # 直接跳過；否則它會落在「其他」並把原始前綴一起印出來。
+            if ($text -match '^chore(?:\(.+\))?[:：]') { continue }
             $category = '其他'
             foreach ($key in $rules.Keys) {
               if ($text -match $rules[$key]) { $category = $key; $text = $Matches[1]; break }
