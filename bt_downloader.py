@@ -741,11 +741,25 @@ class BTTask:
     # 同名種子隔離
     # ------------------------------------------------------------------ #
     def _matches_torrent_data(self, ti):
-        """既有路徑上的資料大小是否與 torrent 相符（用來判斷是不是同一顆種子）。
+        """既有路徑上的資料是否屬於本 torrent（用來決定要不要沿用原名）。
 
-        只比大小、不讀內容：libtorrent 加入後本來就會做全量 hash 校驗（壞的 piece
-        自動重下），大小相符就交給它；大小不符則幾乎確定是另一顆同名種子，改名
-        保護既有檔案。讀內容做 hash 對大檔太貴，而且等於重複 libtorrent 的工作。
+        這是「要不要改名分家」的判斷，不是完整性檢查：內容對不對一律交給 libtorrent
+        加入後的 checking_files 做全量 hash 校驗，壞的 piece 它會自動重下。
+
+        必須允許「只下載了一部分」：libtorrent 在 sparse 模式下不會預先把檔案擴到
+        最終大小，而是寫到哪長到哪（實測 9 MiB 三檔種子下到 4.5 MiB 時，各檔是
+        3031040 / 3145728 / 3129344，沒有一個等於 torrent 記載的長度）。若拿「大小
+        完全相等」當條件，換磁碟後重新加入就會被誤判成另一顆同名種子，於是被改名成
+        "name (1)"、從 0 開始下載，原本下載好的幾十 GB 全成孤兒。
+        （單檔種子僥倖躲過，因為 libtorrent 會先把它擴到全長。）
+
+        因此放寬成「結構相符、且沒有任何檔案超過 torrent 記載的長度」：
+        - 單檔：檔案存在且 0 <= 大小 <= 期望大小；大小完全相符時才抽驗首尾 piece。
+        - 多檔：根目錄存在，清單內的檔案「存在則不得超過期望大小」，允許尚未建立
+          （完全沒下載到的檔案 libtorrent 不會建立）。
+        出現任何超長檔案就幾乎確定是另一顆同名種子，維持改名保護。放寬的代價是
+        「另一顆同名種子的殘缺資料」可能被當成本 torrent，但 libtorrent 校驗後會把
+        不符的 piece 重下，最壞只是覆寫那份本來就不完整的資料。
         """
         if ti is None:
             return False
@@ -758,17 +772,26 @@ class BTTask:
             first = fs.file_path(0).replace('\\', '/').split('/')
             if n == 1 and len(first) <= 1:
                 # 單檔種子：save_dir/<name> 就是檔案本身
-                if not os.path.isfile(root) or os.path.getsize(root) != fs.file_size(0):
+                if not os.path.isfile(root):
                     return False
-                return self._sample_piece_matches(root, ti)
+                size = os.path.getsize(root)
+                full = fs.file_size(0)
+                if size > full:
+                    return False
+                if size == full:
+                    return self._sample_piece_matches(root, ti)
+                # 部分下載：內容還在變，抽驗意義不大（下載順序不保證從第 0 片開始），
+                # 交給 libtorrent 全量校驗。
+                return True
             if not os.path.isdir(root):
                 return False
             for i in range(n):
                 parts = fs.file_path(i).replace('\\', '/').split('/')
                 target = os.path.join(root, *parts[1:]) if len(parts) > 1 else root
                 if not os.path.isfile(target):
-                    return False
-                if os.path.getsize(target) != fs.file_size(i):
+                    # 完全沒下載到的檔案不存在是正常的（sparse 只建有寫入的檔案）
+                    continue
+                if os.path.getsize(target) > fs.file_size(i):
                     return False
             return True
         except Exception as e:
