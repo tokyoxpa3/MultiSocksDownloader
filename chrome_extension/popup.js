@@ -113,6 +113,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const map = {
       'pending': '等待中',
       'downloading': '下載中',
+      'checking': '校驗中',
       'completed': '已完成',
       'failed': '失敗',
       'paused': '已暫停',

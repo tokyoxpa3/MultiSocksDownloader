@@ -2244,7 +2244,8 @@ class DownloadTask:
 
 # 「進行中」的任務狀態：尚未進入終態（已完成／失敗／取消）。
 # 同一 URL 若已有此類任務，就視為重複、不再重複加入；終態任務則允許重新下載。
-ACTIVE_TASK_STATUSES = ('initialized', 'downloading', 'paused', 'seeding')
+# checking 是 BT 換磁碟後重新加入時的 hash 校驗階段，同樣屬於「還在處理中」。
+ACTIVE_TASK_STATUSES = ('initialized', 'downloading', 'checking', 'paused', 'seeding')
 
 
 class DownloadManager:
@@ -2758,7 +2759,10 @@ class DownloadManager:
         with self._lock:
             if source in self.tasks:
                 existing = self.tasks[source]
-                if existing.status in ('initialized', 'downloading', 'seeding', 'paused'):
+                # checking 也算進行中：換磁碟後重新加入同一顆種子時，任務會先進入
+                # 校驗狀態，若不視為重複就會再建一個任務同時掃同一批檔案。
+                if existing.status in ('initialized', 'downloading', 'seeding',
+                                       'checking', 'paused'):
                     return existing.task_id
                 self.task_ids.pop(existing.task_id, None)
             elif ih:
@@ -2766,7 +2770,7 @@ class DownloadManager:
                 # 用 info hash 再查一次，避免建立重複任務。
                 existing = self._find_bt_task_by_hash(ih)
                 if existing is not None and existing.status in (
-                        'initialized', 'downloading', 'seeding', 'paused'):
+                        'initialized', 'downloading', 'seeding', 'checking', 'paused'):
                     return existing.task_id
 
         save_dir = save_dir or self.save_dir
@@ -2818,7 +2822,7 @@ class DownloadManager:
             return False
         # 已在執行中的任務不再重啟：重複拖入同種子/URL 時 add_task 會去重返還同一個
         # task_id，若此處再呼叫 start() 會把進行中的校驗/下載中斷並從頭重來。
-        if getattr(task, 'status', None) in ('downloading', 'seeding'):
+        if getattr(task, 'status', None) in ('downloading', 'seeding', 'checking'):
             return True
         result = task.start()
         self._apply_speed_limit()

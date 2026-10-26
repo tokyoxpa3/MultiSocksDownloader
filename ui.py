@@ -2372,7 +2372,12 @@ class MainWindow(QMainWindow):
                 # 更新進度條：總量未知（chunked 回應無 Content-Length）時改用忙碌
                 # 樣式，否則顯示 0~100 的實際百分比。
                 progress_bar = self.task_table.cellWidget(row, 2)
-                if progress['total_size'] > 0:
+                if progress['status'] == 'checking':
+                    # 校驗進度 libtorrent 不回報（checking_files 期間 total_wanted_done
+                    # 恆為 0），只能用忙碌條表示「還在動、不是卡住」。換磁碟續傳時
+                    # 幾十 GB 的校驗會停在這裡幾分鐘，總比停在 0% 像進度歸零好。
+                    progress_bar.setRange(0, 0)
+                elif progress['total_size'] > 0:
                     progress_bar.setRange(0, 100)
                     progress_bar.setValue(int(progress['percentage']))
                 elif progress['status'] == 'downloading':
@@ -2386,7 +2391,10 @@ class MainWindow(QMainWindow):
                 self.task_table.setItem(row, 3, QTableWidgetItem(self.get_status_text(status)))
 
                 # 更新速度（下載綠 ↓、上傳藍 ↑）
-                if status in ['paused', 'error', 'completed', 'canceled']:
+                if status == 'checking':
+                    # 校驗純讀磁碟，沒有網路流量；顯示 0 B/s 會讓人以為線路斷了
+                    speed_html = '<span style="color:#98a2ad;">--</span>'
+                elif status in ['paused', 'error', 'completed', 'canceled']:
                     speed_html = '<span style="color:#98a2ad;">0 B/s</span>'
                 elif status == 'seeding':
                     ul = progress.get('upload_speed', 0) or 0
@@ -2400,7 +2408,9 @@ class MainWindow(QMainWindow):
                 self._set_speed_cell(row, speed_html)
 
                 # 更新剩餘時間
-                if status in ['paused', 'error', 'completed', 'canceled']:
+                if status == 'checking':
+                    time_text = "校驗中…"
+                elif status in ['paused', 'error', 'completed', 'canceled']:
                     # 暫停、錯誤或完成狀態下沒有剩餘時間
                     if status == 'completed':
                         time_text = "已完成"
@@ -2439,6 +2449,9 @@ class MainWindow(QMainWindow):
                     status_item.setToolTip(err_msg)
                 elif status == 'paused':
                     status_item.setForeground(QColor(Qt.GlobalColor.blue))
+                elif status == 'checking':
+                    # 橘色：介於「進行中」與「暫停」之間，表示正在讀磁碟核對資料
+                    status_item.setForeground(QColor(196, 120, 0))
 
                 # 完成時記錄歷史並通知；做種中的任務仍停留在列表上，等真正完成才移除
                 if status == 'completed':
@@ -2486,6 +2499,7 @@ class MainWindow(QMainWindow):
         status_map = {
             'initialized': '初始化',
             'downloading': '下載中',
+            'checking': '校驗中',
             'seeding': '做種中',
             'paused': '已暫停',
             'completed': '已完成',
@@ -2682,7 +2696,7 @@ class MainWindow(QMainWindow):
         task = self.download_manager.task_ids.get(task_id)
         if not task:
             return
-        if task.status in ('downloading', 'seeding'):
+        if task.status in ('downloading', 'seeding', 'checking'):
             self.pause_task(task_id)
         elif task.status == 'paused':
             self.resume_task(task_id)
@@ -2796,10 +2810,10 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "錯誤詳情", err_msg)
 
     def pause_all_tasks(self):
-        """暫停所有下載中與做種中的任務"""
+        """暫停所有下載中、做種中與校驗中的任務"""
         paused = 0
         for task_id, task in self.download_manager.task_ids.items():
-            if task.status in ('downloading', 'seeding'):
+            if task.status in ('downloading', 'seeding', 'checking'):
                 if self.download_manager.pause_task(task_id):
                     paused += 1
         self.statusBar().showMessage(f"已暫停 {paused} 個任務", 2000)
@@ -3044,7 +3058,7 @@ class MainWindow(QMainWindow):
 
         # 暫停所有仍在下載的任務，確保進度保存
         for task_id, task in self.download_manager.task_ids.items():
-            if task.status == 'downloading':
+            if task.status in ('downloading', 'checking'):
                 logger.info("關閉應用程式時自動暫停下載任務: %s", task.filename)
                 self.download_manager.pause_task(task_id)
 

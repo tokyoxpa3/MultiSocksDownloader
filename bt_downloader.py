@@ -325,6 +325,18 @@ def _verified_done(st):
     return st.total_wanted > 0 and st.total_wanted_done >= st.total_wanted
 
 
+def _is_checking(st):
+    """session 是否正在對磁碟既有資料做 hash 校驗。
+
+    加入種子（尤其是換磁碟後重新加入）時，libtorrent 會先掃過既有檔案重算 SHA1，
+    幾十 GB 的種子要跑幾分鐘。這段期間 total_wanted_done 恆為 0，若不另外標示，
+    UI 會停在 0% 的「下載中」，看起來就像進度歸零、又要從頭下載。
+    """
+    return getattr(st, 'state', None) in (
+        lt.torrent_status.checking_files,
+        lt.torrent_status.checking_resume_data)
+
+
 def _stall_timeout_for(remaining_total):
     """依剩餘 piece 數回傳卡死判定時間窗；收尾階段縮短以加速救援。"""
     if remaining_total <= BT_ENDGAME_PIECES:
@@ -1541,24 +1553,48 @@ class BTTask:
         self._coordinator.start()
         return True
 
-    def pause(self):
-        if self.status not in ('downloading', 'seeding'):
-            return False
-        self.status = 'paused'
+    def _pause_handles(self):
+        """暫停所有已加入的 handle，並先清掉 auto_managed。
+
+        libtorrent 的 auto_managed 意思是「開始/暫停交給 session 的佇列管理器決定」，
+        官方文件對它的說明就寫著：要手動暫停一個種子，必須先清掉 auto_managed。
+        只要旗標還在，佇列管理器每次重新評估（checking_files 剛跑完、別的種子結束
+        讓佇列往前推、呼叫 resume 類 API）都會把它重新啟動。
+
+        實測（既有資料、一啟動就進 checking_files，按下暫停）：畫面顯示「已暫停」，
+        但校驗一結束種子就自己跑起來，6 秒內多收了 4.5 MB payload、落盤多 6.5 MB。
+        這就是「按了暫停還在下載」的來源。
+        """
         for line in self._active_lines:
             h = line.handle
             if h is None:
                 continue
-            if not self._can_multi():
+            try:
+                h.unset_flags(lt.torrent_flags.auto_managed)
+            except Exception as e:
+                logger.debug('清除 auto_managed 失敗: %s', e)
+            try:
+                h.pause()
+            except Exception as e:
+                logger.warning('BT pause 失敗: %s', e)
+
+    def pause(self):
+        # 校驗中也要能暫停：換磁碟後第一次加入會先校驗既有資料，使用者若想先
+        # 停下來處理磁碟空間，不該因為狀態是 checking 而按不動。
+        if self.status not in ('downloading', 'seeding', 'checking'):
+            return False
+        self.status = 'paused'
+        if not self._can_multi():
+            for line in self._active_lines:
+                h = line.handle
+                if h is None:
+                    continue
                 try:
                     h.save_resume_data(
                         lt.save_resume_flags_t.flush_disk_cache | lt.save_resume_flags_t.save_info_dict)
                 except Exception:
                     pass
-            try:
-                h.pause()
-            except Exception as e:
-                logger.warning('BT pause 失敗: %s', e)
+        self._pause_handles()
         # 不在這裡同步等 save_resume_data_alert。pause() 由 UI 執行緒呼叫，過去等
         # 3 秒等於整個視窗凍結（實測固定 3.03 秒）；而且 alert 幾乎都被協調迴圈的
         # _collect_block_progress 先收走並持久化，這裡根本等不到。
@@ -1582,6 +1618,12 @@ class BTTask:
         for line in self._active_lines:
             h = line.handle
             if h is not None:
+                # 暫停時清掉的 auto_managed 要裝回去，否則這個種子再也不會被
+                # 佇列管理器接手（多任務時會變成永遠排在最後的孤兒）。
+                try:
+                    h.set_flags(lt.torrent_flags.auto_managed)
+                except Exception as e:
+                    logger.debug('還原 auto_managed 失敗: %s', e)
                 try:
                     h.resume()
                 except Exception as e:
@@ -1676,15 +1718,10 @@ class BTTask:
             '連續 %d 分鐘沒有收到任何資料，可能已無可用來源（peers 全部離線）。'
             '可按「重試」重新嘗試。' % (BT_GIVE_UP_SECONDS // 60))
         self.status = 'error'
-        # 只暫停 handle、不結束協調迴圈：retry() 會重建 handle 從原進度繼續
-        for line in self._active_lines:
-            h = line.handle
-            if h is None:
-                continue
-            try:
-                h.pause()
-            except Exception:
-                pass
+        # 只暫停 handle、不結束協調迴圈：retry() 會重建 handle 從原進度繼續。
+        # 同樣要清掉 auto_managed，否則佇列管理器會把「已放棄」的種子重新啟動，
+        # 使用者看到的是「錯誤」卻還在吃流量。
+        self._pause_handles()
 
     def _coordinator_loop(self):
         while not self._stop.is_set():
@@ -1741,6 +1778,7 @@ class BTTask:
                 total_upload = 0
                 total_download = 0
                 line_done = {}
+                any_checking = False
                 num_pieces = self._num_pieces
                 merged_done = [False] * num_pieces
                 # line_idx -> (total_wanted_done, download_rate)，供卡死偵測判斷
@@ -1754,6 +1792,8 @@ class BTTask:
                     if h is None or not h.is_valid():
                         continue
                     st = h.status()
+                    if _is_checking(st):
+                        any_checking = True
                     wanted = st.total_wanted
                     done = st.total_wanted_done
                     total_wanted += wanted
@@ -1842,6 +1882,21 @@ class BTTask:
                     self._last_upload = total_upload
                     if pieces_frac:
                         self._pieces = pieces_frac
+
+                # 校驗狀態：加入種子後 libtorrent 會先對磁碟既有資料做 hash 校驗，
+                # 這段時間 total_wanted_done 恆為 0。換磁碟續傳時幾十 GB 要校驗幾分鐘，
+                # 若不標示，畫面會停在 0% 的「下載中」，看起來就像進度歸零重下。
+                # 只在 downloading <-> checking 之間切換，不覆蓋使用者的暫停/錯誤狀態。
+                if any_checking and self.status == 'downloading':
+                    self.status = 'checking'
+                elif not any_checking and self.status == 'checking':
+                    self.status = 'downloading'
+                if any_checking or self.status == 'checking':
+                    # 校驗期間 total_done 不動是正常現象，不能算進「沒有來源」的停滯
+                    # 計時；進入與離開校驗都重設，否則校驗花掉的時間會直接計入，
+                    # 恢復下載後可能立刻被 BT_GIVE_UP_SECONDS 誤判成 swarm 沒來源。
+                    self._give_up_done = None
+                    self._give_up_since = None
 
                 # 任務層級的放棄判定：swarm 真的沒來源時，過去會永遠停在 downloading
                 # （HTTP 有停滯判定會報錯，BT 沒有）。
