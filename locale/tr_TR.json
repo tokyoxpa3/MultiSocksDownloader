@@ -293,5 +293,22 @@
  "立即重新啟動": "Şimdi yeniden başlat",
  "稍後": "Daha sonra",
  "重新啟動失敗": "Yeniden başlatma başarısız",
- "重新啟動失敗，請手動關閉並重新開啟程式。": "Yeniden başlatılamadı. Lütfen uygulamayı elle kapatıp yeniden açın."
+ "重新啟動失敗，請手動關閉並重新開啟程式。": "Yeniden başlatılamadı. Lütfen uygulamayı elle kapatıp yeniden açın.",
+ "校驗中": "Doğrulanıyor",
+ "校驗中…": "Doğrulanıyor…",
+ "檔案進度": "Dosya ilerlemesi",
+ "檔案進度 - {}": "Dosya ilerlemesi - {}",
+ "檔案": "Dosya",
+ "已下載": "İndirilen",
+ "未完成": "Tamamlanmadı",
+ "未開始": "Başlamadı",
+ "未選擇": "Seçilmedi",
+ "只顯示未完成": "Yalnızca tamamlanmayanları göster",
+ "共 {} 個檔案，已完成 {} 個；未完成 {} 個，還缺 {}": "Toplam {} dosya, {} tamamlandı; {} tamamlanmadı, {} kaldı",
+ "複製未完成清單": "Tamamlanmayan listesini kopyala",
+ "關閉": "Kapat",
+ "複製路徑": "Yolu kopyala",
+ "已複製 {} 個未完成檔案的路徑": "{} tamamlanmayan dosyanın yolu kopyalandı",
+ "沒有未完成的檔案": "Tamamlanmayan dosya yok",
+ "尚無檔案資訊（等待種子 metadata）": "Henüz dosya bilgisi yok (metadata bekleniyor)"
 }

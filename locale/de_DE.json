@@ -293,5 +293,22 @@
  "立即重新啟動": "Jetzt neu starten",
  "稍後": "Später",
  "重新啟動失敗": "Neustart fehlgeschlagen",
- "重新啟動失敗，請手動關閉並重新開啟程式。": "Neustart fehlgeschlagen. Bitte die App manuell schließen und erneut öffnen."
+ "重新啟動失敗，請手動關閉並重新開啟程式。": "Neustart fehlgeschlagen. Bitte die App manuell schließen und erneut öffnen.",
+ "校驗中": "Wird geprüft",
+ "校驗中…": "Wird geprüft…",
+ "檔案進度": "Dateifortschritt",
+ "檔案進度 - {}": "Dateifortschritt - {}",
+ "檔案": "Datei",
+ "已下載": "Heruntergeladen",
+ "未完成": "Unvollständig",
+ "未開始": "Nicht gestartet",
+ "未選擇": "Nicht ausgewählt",
+ "只顯示未完成": "Nur unvollständige anzeigen",
+ "共 {} 個檔案，已完成 {} 個；未完成 {} 個，還缺 {}": "{} Dateien insgesamt, {} abgeschlossen; {} unvollständig, {} fehlen",
+ "複製未完成清單": "Liste der unvollständigen kopieren",
+ "關閉": "Schließen",
+ "複製路徑": "Pfad kopieren",
+ "已複製 {} 個未完成檔案的路徑": "Pfade von {} unvollständigen Dateien kopiert",
+ "沒有未完成的檔案": "Keine unvollständigen Dateien",
+ "尚無檔案資訊（等待種子 metadata）": "Noch keine Dateiinformationen (warte auf Metadaten)"
 }

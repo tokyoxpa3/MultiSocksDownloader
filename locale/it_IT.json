@@ -293,5 +293,22 @@
  "立即重新啟動": "Riavvia ora",
  "稍後": "Più tardi",
  "重新啟動失敗": "Riavvio non riuscito",
- "重新啟動失敗，請手動關閉並重新開啟程式。": "Riavvio non riuscito. Chiudi e riapri l'applicazione manualmente."
+ "重新啟動失敗，請手動關閉並重新開啟程式。": "Riavvio non riuscito. Chiudi e riapri l'applicazione manualmente.",
+ "校驗中": "Verifica in corso",
+ "校驗中…": "Verifica in corso…",
+ "檔案進度": "Avanzamento file",
+ "檔案進度 - {}": "Avanzamento file - {}",
+ "檔案": "File",
+ "已下載": "Scaricato",
+ "未完成": "Incompleto",
+ "未開始": "Non avviato",
+ "未選擇": "Non selezionato",
+ "只顯示未完成": "Mostra solo incompleti",
+ "共 {} 個檔案，已完成 {} 個；未完成 {} 個，還缺 {}": "{} file in totale, {} completati; {} incompleti, mancano {}",
+ "複製未完成清單": "Copia elenco incompleti",
+ "關閉": "Chiudi",
+ "複製路徑": "Copia percorso",
+ "已複製 {} 個未完成檔案的路徑": "Copiati i percorsi di {} file incompleti",
+ "沒有未完成的檔案": "Nessun file incompleto",
+ "尚無檔案資訊（等待種子 metadata）": "Nessuna informazione sui file (in attesa dei metadati)"
 }

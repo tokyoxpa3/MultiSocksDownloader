@@ -293,5 +293,22 @@
  "立即重新啟動": "Khởi động lại ngay",
  "稍後": "Để sau",
  "重新啟動失敗": "Khởi động lại thất bại",
- "重新啟動失敗，請手動關閉並重新開啟程式。": "Khởi động lại thất bại. Vui lòng đóng và mở lại ứng dụng thủ công."
+ "重新啟動失敗，請手動關閉並重新開啟程式。": "Khởi động lại thất bại. Vui lòng đóng và mở lại ứng dụng thủ công.",
+ "校驗中": "Đang xác minh",
+ "校驗中…": "Đang xác minh…",
+ "檔案進度": "Tiến độ tệp",
+ "檔案進度 - {}": "Tiến độ tệp - {}",
+ "檔案": "Tệp",
+ "已下載": "Đã tải",
+ "未完成": "Chưa xong",
+ "未開始": "Chưa bắt đầu",
+ "未選擇": "Chưa chọn",
+ "只顯示未完成": "Chỉ hiện chưa xong",
+ "共 {} 個檔案，已完成 {} 個；未完成 {} 個，還缺 {}": "Tổng {} tệp, đã xong {}; chưa xong {}, còn thiếu {}",
+ "複製未完成清單": "Sao chép danh sách chưa xong",
+ "關閉": "Đóng",
+ "複製路徑": "Sao chép đường dẫn",
+ "已複製 {} 個未完成檔案的路徑": "Đã sao chép đường dẫn của {} tệp chưa xong",
+ "沒有未完成的檔案": "Không có tệp nào chưa xong",
+ "尚無檔案資訊（等待種子 metadata）": "Chưa có thông tin tệp (đang chờ metadata)"
 }

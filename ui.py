@@ -1318,6 +1318,238 @@ class TorrentDialog(QDialog):
         self.accept()
 
 
+class _NumericTableItem(QTableWidgetItem):
+    """顯示文字與排序用的數值分開，讓「9.8%」「100.0%」按數值而非字串排序。"""
+
+    def __init__(self, text, value=0):
+        super().__init__(text)
+        self._value = value
+
+    def set_value(self, text, value):
+        self._value = value
+        if self.text() != text:
+            self.setText(text)
+
+    def __lt__(self, other):
+        if isinstance(other, _NumericTableItem):
+            return self._value < other._value
+        return super().__lt__(other)
+
+
+class FileProgressDialog(QDialog):
+    """BT 任務的逐檔完成度。
+
+    任務列表只有整體百分比，「99% 卡住」時看不出還缺什麼。這裡把 piece 完成度
+    依重疊位元組攤回每個檔案，並把未完成的排在最前面（依完成度由低到高），
+    一眼就能看出剩下的是某個大檔的尾巴，還是好幾個從沒開始的小檔。
+    """
+
+    # 未完成的檔案會隨時間變動，但整張表重建很貴（上千列），因此只在「未完成
+    # 的檔案集合」真的變了才重建，其餘重新整理只就地改儲存格文字。
+    def __init__(self, task, parent=None):
+        super().__init__(parent)
+        self.task = task
+        self._data = []
+        self._by_index = {}
+        self._items = {}
+        self._signature = None
+
+        self.setWindowTitle(f"檔案進度 - {task.filename}")
+        self.setMinimumSize(780, 520)
+        self.resize(900, 620)
+
+        layout = QVBoxLayout(self)
+
+        self.summary_label = QLabel("")
+        layout.addWidget(self.summary_label)
+
+        self.only_incomplete = QCheckBox("只顯示未完成")
+        self.only_incomplete.toggled.connect(self._rebuild)
+        layout.addWidget(self.only_incomplete)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["檔案", "大小", "已下載", "進度", "狀態"])
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_menu)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col, width in ((1, 110), (2, 110), (3, 90), (4, 90)):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+            header.resizeSection(col, width)
+        layout.addWidget(self.table, 1)
+
+        btn_row = QHBoxLayout()
+        self.copy_btn = QPushButton("複製未完成清單")
+        self.copy_btn.clicked.connect(self._copy_incomplete)
+        close_btn = QPushButton("關閉")
+        close_btn.clicked.connect(self.close)
+        btn_row.addStretch()
+        btn_row.addWidget(self.copy_btn)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start()
+
+        self.refresh()
+
+    # -- 資料 -------------------------------------------------------------- #
+    def refresh(self):
+        try:
+            data = self.task.get_file_progress()
+        except Exception as e:
+            logger.debug('讀取檔案進度失敗: %s', e)
+            data = []
+        self._data = data
+        self._by_index = {d['index']: d for d in data}
+        if not data:
+            self.summary_label.setText("尚無檔案資訊（等待種子 metadata）")
+            self.table.setSortingEnabled(False)
+            self.table.setRowCount(0)
+            self._items = {}
+            self._signature = None
+            self.copy_btn.setEnabled(False)
+            return
+
+        incomplete = [d for d in data if d['state'] not in ('done', 'skipped')]
+        remaining = sum(d['size'] - d['done'] for d in incomplete)
+        self.summary_label.setText(
+            f"共 {len(data)} 個檔案，已完成 {len(data) - len(incomplete)} 個；"
+            f"未完成 {len(incomplete)} 個，還缺 {format_size(remaining)}")
+        self.copy_btn.setEnabled(bool(incomplete))
+
+        signature = frozenset(d['index'] for d in incomplete)
+        if signature != self._signature:
+            self._rebuild()
+        else:
+            self._update_cells()
+
+    def _visible_rows(self):
+        only = self.only_incomplete.isChecked()
+        return [d for d in self._data
+                if not only or d['state'] not in ('done', 'skipped')]
+
+    def _rebuild(self):
+        rows = self._visible_rows()
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        self.table.setRowCount(len(rows))
+        self._items = {}
+        for row, d in enumerate(rows):
+            path_item = QTableWidgetItem(d['path'])
+            path_item.setToolTip(d['path'])
+            path_item.setData(Qt.ItemDataRole.UserRole, d['index'])
+            self.table.setItem(row, 0, path_item)
+            size_item = _NumericTableItem(format_size(d['size']), d['size'])
+            done_item = _NumericTableItem(format_size(d['done']), d['done'])
+            pct_item = _NumericTableItem(f"{d['progress']:.1f}%", d['progress'])
+            state_item = QTableWidgetItem(self._state_text(d['state']))
+            state_item.setData(Qt.ItemDataRole.UserRole, d['state'])
+            state_item.setForeground(self._state_color(d['state']))
+            for col, item in ((1, size_item), (2, done_item), (3, pct_item), (4, state_item)):
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.table.setItem(row, col, item)
+            self._items[d['index']] = (done_item, pct_item, state_item)
+        self._signature = frozenset(
+            d['index'] for d in self._data if d['state'] not in ('done', 'skipped'))
+        self.table.setSortingEnabled(True)
+        # 預設依進度遞增：未完成（0% 起）自然聚在頂端，完成的一律沉到最下面。
+        self.table.sortItems(3, Qt.SortOrder.AscendingOrder)
+
+    def _update_cells(self):
+        for d in self._data:
+            refs = self._items.get(d['index'])
+            if refs is None:
+                continue
+            done_item, pct_item, state_item = refs
+            done_item.set_value(format_size(d['done']), d['done'])
+            pct_item.set_value(f"{d['progress']:.1f}%", d['progress'])
+            if state_item.data(Qt.ItemDataRole.UserRole) != d['state']:
+                state_item.setData(Qt.ItemDataRole.UserRole, d['state'])
+                state_item.setText(self._state_text(d['state']))
+                state_item.setForeground(self._state_color(d['state']))
+
+    @staticmethod
+    def _state_text(state):
+        return {
+            'done': '已完成',
+            'partial': '未完成',
+            'pending': '未開始',
+            'skipped': '未選擇',
+        }.get(state, '未完成')
+
+    @staticmethod
+    def _state_color(state):
+        if state == 'done':
+            return QColor(26, 156, 92)
+        if state == 'partial':
+            return QColor(196, 120, 0)
+        return QColor(138, 151, 163)
+
+    # -- 互動 -------------------------------------------------------------- #
+    def _full_path(self, rel):
+        """把 torrent 內的相對路徑組成磁碟上的完整路徑（單檔種子時即檔案本身）。"""
+        base = self.task.filepath or self.task.save_dir or ''
+        rel = rel.replace('\\', '/')
+        if len(self._data) == 1 and '/' not in rel and not os.path.isdir(base):
+            # 單檔種子：task.filepath 就是檔案本身，再拼一層會變成 name/name
+            return base
+        return os.path.join(base, *rel.split('/'))
+
+    def _show_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        item = self.table.item(row, 0)
+        if item is None:
+            return
+        data = self._by_index.get(item.data(Qt.ItemDataRole.UserRole))
+        if data is None:
+            return
+        full = self._full_path(data['path'])
+        menu = QMenu(self)
+        copy_path_action = menu.addAction("複製路徑")
+        open_action = menu.addAction("打開所在資料夾")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen == copy_path_action:
+            QApplication.clipboard().setText(full)
+        elif chosen == open_action:
+            self._open_location(full)
+
+    def _open_location(self, path):
+        parent = self.parent()
+        if hasattr(parent, 'open_file_location'):
+            parent.open_file_location(path)
+            return
+        folder = os.path.dirname(path)
+        if os.path.isdir(folder):
+            os.startfile(folder)
+
+    def closeEvent(self, event):
+        # 關掉視窗後不該再每秒掃一次 piece 表
+        self._timer.stop()
+        super().closeEvent(event)
+
+    def _copy_incomplete(self):
+        rows = [d for d in self._data if d['state'] not in ('done', 'skipped')]
+        if not rows:
+            QMessageBox.information(self, "檔案進度", "沒有未完成的檔案")
+            return
+        lines = []
+        for d in rows:
+            lines.append(f"{self._full_path(d['path'])}\t{format_size(d['done'])}"
+                         f"/{format_size(d['size'])}\t{d['progress']:.1f}%")
+        QApplication.clipboard().setText("\n".join(lines))
+        QMessageBox.information(self, "檔案進度",
+                               f"已複製 {len(rows)} 個未完成檔案的路徑")
+
+
 # 主窗口
 class MainWindow(QMainWindow):
     # 攔截下載請求信號：由 HTTP 伺服器 worker 執行緒發射，跨執行緒排入 UI
@@ -1341,6 +1573,9 @@ class MainWindow(QMainWindow):
 
         # 已通知完成的任務 ID，避免重複通知
         self.notified_completed = set()
+
+        # 已開啟的「檔案進度」視窗：task_id -> dialog（避免同一任務開出多個）
+        self._file_dialogs = {}
 
         # 全域聚合分線速度狀態：(上次時間, 上次聚合位元組快照)
         self._global_line_state = None
@@ -2642,17 +2877,27 @@ class MainWindow(QMainWindow):
         if not task:
             return
 
+        menu = self._build_task_menu(task_id, task)
+        menu.exec(self.task_table.mapToGlobal(position))
+
+    def _build_task_menu(self, task_id, task):
+        """組出任務列的右鍵選單（與彈出分開，方便測試逐項檢查）。"""
         menu = QMenu(self)
 
         # 添加複製下載連結選項
         copy_url_action = menu.addAction("複製下載連結")
         copy_url_action.triggered.connect(lambda: self.copy_download_url(task.url))
 
+        # BT 任務才有逐檔進度：整體 99% 卡住時，這裡看得出還缺哪個檔案
+        if hasattr(task, 'get_file_progress'):
+            file_action = menu.addAction("檔案進度")
+            file_action.triggered.connect(lambda: self.show_file_progress(task_id))
+
         # 添加分隔線
         menu.addSeparator()
 
         # 根據任務狀態顯示不同的菜單項
-        if task.status in ('downloading', 'seeding'):
+        if task.status in ('downloading', 'seeding', 'checking'):
             pause_action = menu.addAction("暫停")
             pause_action.triggered.connect(lambda: self.pause_task(task_id))
         elif task.status == 'paused':
@@ -2676,7 +2921,22 @@ class MainWindow(QMainWindow):
             open_folder_action = menu.addAction("打開所在資料夾")
             open_folder_action.triggered.connect(lambda: self.open_folder(task.filepath))
 
-        menu.exec(self.task_table.mapToGlobal(position))
+        return menu
+
+    def show_file_progress(self, task_id):
+        """開啟（或帶到前景）該任務的逐檔進度視窗；同一任務只開一個。"""
+        task = self.download_manager.task_ids.get(task_id)
+        if task is None or not hasattr(task, 'get_file_progress'):
+            return
+        dlg = self._file_dialogs.get(task_id)
+        if dlg is not None:
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+        dlg = FileProgressDialog(task, self)
+        self._file_dialogs[task_id] = dlg
+        dlg.finished.connect(lambda _=0, tid=task_id: self._file_dialogs.pop(tid, None))
+        dlg.show()
 
     def pause_task(self, task_id):
         if self.download_manager.pause_task(task_id):

@@ -293,5 +293,22 @@
  "立即重新啟動": "Nu herstarten",
  "稍後": "Later",
  "重新啟動失敗": "Herstarten mislukt",
- "重新啟動失敗，請手動關閉並重新開啟程式。": "Herstarten mislukt. Sluit de app en open deze handmatig opnieuw."
+ "重新啟動失敗，請手動關閉並重新開啟程式。": "Herstarten mislukt. Sluit de app en open deze handmatig opnieuw.",
+ "校驗中": "Verifiëren",
+ "校驗中…": "Verifiëren…",
+ "檔案進度": "Bestandsvoortgang",
+ "檔案進度 - {}": "Bestandsvoortgang - {}",
+ "檔案": "Bestand",
+ "已下載": "Gedownload",
+ "未完成": "Onvolledig",
+ "未開始": "Niet gestart",
+ "未選擇": "Niet geselecteerd",
+ "只顯示未完成": "Alleen onvolledige tonen",
+ "共 {} 個檔案，已完成 {} 個；未完成 {} 個，還缺 {}": "{} bestanden totaal, {} voltooid; {} onvolledig, {} resterend",
+ "複製未完成清單": "Lijst met onvolledige kopiëren",
+ "關閉": "Sluiten",
+ "複製路徑": "Pad kopiëren",
+ "已複製 {} 個未完成檔案的路徑": "Paden van {} onvolledige bestanden gekopieerd",
+ "沒有未完成的檔案": "Geen onvolledige bestanden",
+ "尚無檔案資訊（等待種子 metadata）": "Nog geen bestandsinfo (wachten op metadata)"
 }

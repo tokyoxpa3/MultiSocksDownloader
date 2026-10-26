@@ -702,6 +702,8 @@ class BTTask:
         self._blocks_done = []
         self._blocks_per_piece = []
         self._last_block_ts = []
+        # 逐檔進度的版面快取：(torrent_info, [(index, 路徑, 起始位移, 大小), ...])
+        self._file_cache = None
 
         # PT（private）種子標記：載入 metadata 後於 start()/協調迴圈填入。
         self.is_private = False
@@ -2022,26 +2024,150 @@ class BTTask:
         for rp in resume_params:
             self._persist_resume_data(rp)
 
+    def _piece_fracs(self):
+        """每 piece 的完成比例（0~1）。只回傳數字、不建 dict，供需要逐 piece 掃過
+        整個種子的路徑（區塊視覺、逐檔進度）共用同一套計算，避免兩邊算法走樣。"""
+        n = self._num_pieces
+        pieces = self._pieces
+        blocks_done = self._blocks_done
+        blocks_per = self._blocks_per_piece
+        out = [0.0] * n
+        for i in range(n):
+            if i < len(pieces) and pieces[i] >= 0.999:
+                out[i] = 1.0
+                continue
+            denom = blocks_per[i] if i < len(blocks_per) else 0
+            if denom > 0:
+                done_blocks = blocks_done[i] if i < len(blocks_done) else 0
+                if done_blocks > 0:
+                    out[i] = min(1.0, done_blocks / denom)
+        return out
+
     def _compute_piece_states(self, now=None):
         """合併完成位元圖與 block 計數，算出每 piece 的 frac（0~1）與 active。"""
         now = time.time() if now is None else now
-        n = self._num_pieces
         states = []
-        for i in range(n):
-            if i < len(self._pieces) and self._pieces[i] >= 0.999:
-                states.append({'frac': 1.0, 'active': False})
-                continue
-            denom = self._blocks_per_piece[i] if i < len(self._blocks_per_piece) else 0
-            done_blocks = self._blocks_done[i] if i < len(self._blocks_done) else 0
-            frac = min(1.0, done_blocks / denom) if denom > 0 else 0.0
+        for i, frac in enumerate(self._piece_fracs()):
             active = (
                 frac < 1.0
-                and done_blocks > 0
+                and frac > 0.0
                 and i < len(self._last_block_ts)
                 and now - self._last_block_ts[i] <= BT_PIECE_ACTIVE_WINDOW
             )
             states.append({'frac': frac, 'active': active})
         return states
+
+    # ------------------------------------------------------------------ #
+    # 逐檔進度（「檔案進度」視窗用）
+    # ------------------------------------------------------------------ #
+    def _file_entries(self):
+        """回傳 [(index, 相對路徑, 起始位移, 大小), ...]；metadata 未到回 None。
+
+        逐檔查 file_offset 是 O(files)，而檔案進度視窗每秒刷新一次，因此以
+        torrent_info 物件本身為鍵快取；magnet 取得 metadata 後 ti 換人，自然重建。
+        """
+        ti = self._ti
+        if ti is None:
+            return None
+        cache = self._file_cache
+        if cache is not None and cache[0] is ti:
+            return cache[1]
+        entries = []
+        try:
+            fs = ti.files()
+            # libtorrent 的 file_path() 對多檔種子會帶上根目錄名（"pkg\\sub\\b.bin"），
+            # 單檔種子則只有檔名。這裡統一成「相對於根目錄」的形式，UI 才能用
+            # task.filepath（= save_dir/根目錄）拼回完整路徑而不重複一層。
+            root = (ti.name() or '').replace('\\', '/').strip('/')
+            prefix = root + '/' if root else ''
+            for i in range(fs.num_files()):
+                size = fs.file_size(i)
+                try:
+                    is_pad = fs.pad_file_at(i)
+                except Exception:
+                    is_pad = False
+                # pad 檔（BT v2 用來對齊 piece 的填充）不是使用者要的檔案
+                if is_pad or size <= 0:
+                    continue
+                rel = fs.file_path(i).replace('\\', '/')
+                if prefix and rel.startswith(prefix):
+                    rel = rel[len(prefix):]
+                entries.append((i, rel, fs.file_offset(i), size))
+        except Exception as e:
+            logger.debug('建立檔案清單失敗: %s', e)
+            return None
+        self._file_cache = (ti, entries)
+        return entries
+
+    def get_file_progress(self):
+        """逐檔完成度：把每個 piece 的完成比例依「與檔案重疊的位元組」攤回檔案。
+
+        piece 邊界通常不落在檔案邊界上（同一個 piece 可能橫跨兩個檔案），若直接算
+        「完成的 piece 數 ÷ 該檔的 piece 數」，小檔會被臨界 piece 拖成 0% 或 100%，
+        看不出真正缺在哪。因此用重疊長度加權，只有當整個檔案覆蓋到的 piece 都完成
+        時 done 才會等於 size（frac 為 1.0 時是精確整數相加，不會有浮點誤差）。
+
+        回傳 list[dict]（依 torrent 內的檔案順序）：
+        index / path / size / done / progress(0~100) / state
+        state：done 完成、partial 部分完成、pending 未開始、skipped 未勾選下載。
+        metadata 尚未取得（磁力還在找 peers）時回空清單。
+        """
+        entries = self._file_entries()
+        if not entries:
+            return []
+        with self._lock:
+            fracs = self._piece_fracs()
+            n = self._num_pieces
+            selected = list(self.selected_files or [])
+        ti = self._ti
+        if ti is None or n <= 0:
+            return []
+        try:
+            piece_len = ti.piece_length()
+            total = ti.total_size()
+        except Exception:
+            return []
+        if piece_len <= 0 or total <= 0:
+            return []
+        # libtorrent 除最後一個 piece 外皆為固定長度，直接算而不逐塊呼叫
+        # piece_size()：上萬塊的種子每秒刷新一次時，那些 C++ 呼叫會變成瓶頸。
+        last_size = total - piece_len * (n - 1)
+        if last_size <= 0:
+            last_size = piece_len
+        sel = set(selected)
+        out = []
+        for index, path, offset, size in entries:
+            file_end = offset + size
+            first = offset // piece_len
+            last = min((file_end - 1) // piece_len, n - 1)
+            done = 0.0
+            for p in range(first, last + 1):
+                p_start = p * piece_len
+                p_end = p_start + (last_size if p == n - 1 else piece_len)
+                lo = p_start if p_start > offset else offset
+                hi = p_end if p_end < file_end else file_end
+                if hi > lo:
+                    done += (hi - lo) * fracs[p]
+            done_bytes = int(done)
+            if done_bytes > size:
+                done_bytes = size
+            if sel and index not in sel:
+                state = 'skipped'
+            elif done_bytes >= size:
+                state = 'done'
+            elif done_bytes <= 0:
+                state = 'pending'
+            else:
+                state = 'partial'
+            out.append({
+                'index': index,
+                'path': path,
+                'size': size,
+                'done': done_bytes,
+                'progress': (done_bytes / size * 100.0) if size > 0 else 100.0,
+                'state': state,
+            })
+        return out
 
     def get_progress(self, detail=True):
         """detail=False 時略過 piece 明細：/tasks 這種每秒輪詢只要百分比，

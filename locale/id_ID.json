@@ -293,5 +293,22 @@
  "立即重新啟動": "Mulai ulang sekarang",
  "稍後": "Nanti",
  "重新啟動失敗": "Gagal memulai ulang",
- "重新啟動失敗，請手動關閉並重新開啟程式。": "Gagal memulai ulang. Silakan tutup dan buka lagi aplikasi secara manual."
+ "重新啟動失敗，請手動關閉並重新開啟程式。": "Gagal memulai ulang. Silakan tutup dan buka lagi aplikasi secara manual.",
+ "校驗中": "Memverifikasi",
+ "校驗中…": "Memverifikasi…",
+ "檔案進度": "Progres file",
+ "檔案進度 - {}": "Progres file - {}",
+ "檔案": "File",
+ "已下載": "Terunduh",
+ "未完成": "Belum selesai",
+ "未開始": "Belum mulai",
+ "未選擇": "Tidak dipilih",
+ "只顯示未完成": "Hanya tampilkan yang belum selesai",
+ "共 {} 個檔案，已完成 {} 個；未完成 {} 個，還缺 {}": "Total {} file, {} selesai; {} belum selesai, sisa {}",
+ "複製未完成清單": "Salin daftar yang belum selesai",
+ "關閉": "Tutup",
+ "複製路徑": "Salin jalur",
+ "已複製 {} 個未完成檔案的路徑": "Jalur {} file yang belum selesai disalin",
+ "沒有未完成的檔案": "Tidak ada file yang belum selesai",
+ "尚無檔案資訊（等待種子 metadata）": "Belum ada info file (menunggu metadata)"
 }

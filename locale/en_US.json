@@ -293,5 +293,22 @@
  "立即重新啟動": "Restart Now",
  "稍後": "Later",
  "重新啟動失敗": "Restart Failed",
- "重新啟動失敗，請手動關閉並重新開啟程式。": "Restart failed. Please close and reopen the app manually."
+ "重新啟動失敗，請手動關閉並重新開啟程式。": "Restart failed. Please close and reopen the app manually.",
+ "校驗中": "Verifying",
+ "校驗中…": "Verifying…",
+ "檔案進度": "File progress",
+ "檔案進度 - {}": "File progress - {}",
+ "檔案": "File",
+ "已下載": "Downloaded",
+ "未完成": "Incomplete",
+ "未開始": "Not started",
+ "未選擇": "Not selected",
+ "只顯示未完成": "Show incomplete only",
+ "共 {} 個檔案，已完成 {} 個；未完成 {} 個，還缺 {}": "{} files total, {} complete; {} incomplete, {} remaining",
+ "複製未完成清單": "Copy incomplete list",
+ "關閉": "Close",
+ "複製路徑": "Copy path",
+ "已複製 {} 個未完成檔案的路徑": "Copied paths of {} incomplete files",
+ "沒有未完成的檔案": "No incomplete files",
+ "尚無檔案資訊（等待種子 metadata）": "No file info yet (waiting for torrent metadata)"
 }
