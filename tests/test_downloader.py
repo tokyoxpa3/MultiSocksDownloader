@@ -371,14 +371,19 @@ class TestPopRun(unittest.TestCase):
         return t
 
     def test_claims_contiguous_span(self):
-        t = self._make()
+        # 顆粒改成「剩餘未認領 / (worker × RUN_SPLIT_FACTOR)」：400 塊、1 個
+        # worker → 一次認領 100 塊。這裡驗的仍是「連續」而非逐塊散著拿。
+        t = self._make(block_size=100, block_count=400)
+        t._target_workers = 1
         run = t._pop_run()
-        self.assertEqual(run, (0, 9))
-        for i in range(10):
+        self.assertEqual(run, (0, 99))
+        for i in range(100):
             self.assertTrue(t._is_block_claimed(i))
+        self.assertFalse(t._is_block_claimed(100))
 
     def test_stops_at_done_block(self):
-        t = self._make()
+        t = self._make(block_size=100, block_count=400)
+        t._target_workers = 1
         t._set_block_done(3)
         run = t._pop_run()
         self.assertEqual(run, (0, 2))
@@ -611,11 +616,23 @@ class TestWorkerRespawn(unittest.TestCase):
         self.assertTrue(t._maintain_workers(_StopFlag()))
         self.assertEqual(spawned, [2])
 
-    def test_no_respawn_while_worker_alive(self):
+    def test_respawns_to_target_while_work_remains(self):
+        # 舊行為是「只要還有 worker 活著就不補」，於是慢線的 worker 退場後它
+        # 釋放的區塊永遠沒人下載。現在只要有未認領區塊就補到目標數。
         t = self._make()
         spawned = []
         t._spawn_http_workers = lambda stop, count: spawned.append(count)
         t._workers = [_AliveThread()]
+        self.assertTrue(t._maintain_workers(_StopFlag()))
+        self.assertEqual(spawned, [1])
+
+    def test_no_respawn_when_all_blocks_done(self):
+        t = self._make()
+        spawned = []
+        t._spawn_http_workers = lambda stop, count: spawned.append(count)
+        t._workers = [_AliveThread()]
+        for i in range(t.block_count):
+            t._set_block_done(i)
         self.assertFalse(t._maintain_workers(_StopFlag()))
         self.assertEqual(spawned, [])
 
