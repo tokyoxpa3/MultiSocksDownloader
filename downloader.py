@@ -35,6 +35,30 @@ MAX_BLOCKS = 4096
 # 導致分攤不均、預取失效、完成時 worker 驟減造成速率斷崖。64 MiB 為平衡值。
 TARGET_RUN_BYTES = 64 * 1024 * 1024
 
+# 動態顆粒：run 大小 = 剩餘未認領區塊 / (活躍 worker × RUN_SPLIT_FACTOR)，上限
+# 仍是 TARGET_RUN_BYTES。固定 64 MiB 顆粒在檔案不大時會退化成「開場即靜態均分」：
+# 只要 worker 數 × 顆粒 ≥ 檔案大小，全部區塊在啟動瞬間被認領，快線下完自己那份
+# 就再也沒有東西可搶，只能等慢線把剩下的爬完（實測 384 MiB 檔案 = 恰好 50/50）。
+# 業界（aria2 --min-split-size、libtorrent 的 piece picker）都是讓工作單元遠小於
+# 總量；除以 4 是為了讓「已認領」永遠只佔剩餘量的四分之一，留四分之三給快的線路搶。
+RUN_SPLIT_FACTOR = 4
+RUN_MIN_BLOCKS = 1
+
+# 慢線判定，對應 libtorrent 的 peer snub：速率低於最快線路的 SNUB_RATIO 且持續
+# SNUB_WINDOW 秒，就讓它手上的 run 提前收工、把剩餘區塊還回池子給快線接手。
+# 用「最快線路」而非中位數當基準：只有兩條線時中位數等於平均值，門檻會隨慢線
+# 自己下沉，永遠判定不出來。
+SNUB_RATIO = 0.34
+SNUB_WINDOW = 3.0
+# 同一條線兩次搶佔的最短間隔。BT 端 _stall_rescue 與 _rebalance 會互抵，靠的就是
+# 這類冷卻時間；這裡同理，否則慢線剛領到小段就被再次打斷，永遠前進不了。
+LINE_PREEMPT_COOLDOWN = 20.0
+
+# 認領租約。worker 若因例外／行程被砍而沒走到釋放路徑，它認領的區塊會永遠沒人
+# 下載（_pop_run 看到 claimed 就跳過），任務卡在 downloading 直到停滯判定。
+# 租約過期後該區塊視為可重新認領；代價是可能重複下載一小段，換取自我修復。
+CLAIM_LEASE_SECONDS = 90.0
+
 # config.json 的寫入鎖：save_config() 會被 UI、HTTP 與代理測試執行緒同時呼叫，
 # 兩個執行緒同時寫同一個檔案會互相截斷，留下半截 JSON。
 _CONFIG_SAVE_LOCK = threading.Lock()
@@ -281,6 +305,11 @@ class DownloadTask:
     # 交由其他線路接手。設有全域限速時不啟用，避免低速但正常的下載被誤判。
     STALL_WINDOW = 30.0
     STALL_MIN_BYTES = 8 * 1024
+    # 慢線判定與搶佔參數（模組頂部常數的預設值）。放成類別屬性，測試才能把
+    # 窗口縮到秒級而不必等 3 秒；正式執行一律用預設值。
+    SNUB_RATIO = SNUB_RATIO
+    SNUB_WINDOW = SNUB_WINDOW
+    LINE_PREEMPT_COOLDOWN = LINE_PREEMPT_COOLDOWN
     # 單線模式失敗重試的退避基準（秒）：base * 2^(n-1)，上限 10 秒。
     RETRY_BACKOFF = 1.0
 
@@ -393,6 +422,25 @@ class DownloadTask:
         self._lines = []
         self._line_fail = {}                 # line_key -> 連續失敗次數
         self._line_quarantine_until = {}     # line_key -> 隔離到期（monotonic）
+        # 速率感知調度（對應 libtorrent 的 snub）：窗口內的位元組差分 → 各線速率，
+        # 低於最快線路 1/3 且持續 SNUB_WINDOW 秒即搶佔。_line_slow_since 記錄慢線
+        # 開始變慢的時刻，避免瞬時抖動就觸發。
+        self._line_rate = {}                 # line_key -> 最近窗口速率（bytes/s）
+        self._rate_samples = deque(maxlen=8)  # [(monotonic, {line_key: bytes})]
+        self._line_slow_since = {}
+        self._line_preempt_at = {}
+        self._preempt_count = 0      # 被打斷的 run 次數
+        self._snub_count = 0         # 由速率判定觸發的搶佔
+        self._steal_count = 0        # 池子空時主動接管別人尾巴的次數
+        # 每個 HTTP worker 的執行狀態（線路鍵、搶佔旗標、目前認領的 run）。
+        # 搶佔需要「指定某一個 worker 停手」，所以必須有 per-worker 的可定址物件。
+        self._slots = []
+        self._live_workers = 0
+        # 正在等工作的 worker 數。>0 表示有人在餓：被搶佔的線路要讓路而不是
+        # 立刻把剛釋放的區塊搶回去。
+        self._starving = 0
+        # 認領租約：block_idx -> 認領時刻（monotonic）
+        self._claim_at = {}
 
         self._speed_history = deque(maxlen=30)
         self._last_time = time.time()
@@ -1194,49 +1242,274 @@ class DownloadTask:
         if len(self._claimed) == 0:
             self._claimed = bytearray((self.block_count + 7) // 8)
         self._claimed[idx >> 3] |= (1 << (idx & 7))
+        self._claim_at[idx] = time.monotonic()
 
     def _clear_block_claimed(self, idx):
+        self._claim_at.pop(idx, None)
         if not self._claimed:
             return
         self._claimed[idx >> 3] &= ~(1 << (idx & 7))
+
+    def _claim_expired(self, idx, now):
+        """認領租約是否過期（持有者已消失，區塊可以重新被認領）。"""
+        t = self._claim_at.get(idx)
+        return t is not None and (now - t) > CLAIM_LEASE_SECONDS
 
     def _reset_claims(self):
         """新世代開始前清空所有認領位（進行中區塊一律視為未佔用）。"""
         with self._lock:
             self._claimed = bytearray((self.block_count + 7) // 8)
+            self._claim_at = {}
+
+    def _run_block_cap(self):
+        """單一 run 的區塊數上限（對應 TARGET_RUN_BYTES）。"""
+        if not self.block_size:
+            return 1
+        return max(1, TARGET_RUN_BYTES // self.block_size)
+
+    def _worker_scale(self):
+        """參與分攤的 worker 數。用 target 而非 live：worker 是陸續起來的，
+        只看 live 會讓先起跑的幾個拿到超大 run，正好是我們要消除的行為。"""
+        return max(1, self._target_workers or self._live_workers or 1)
+
+    def _count_unclaimed_locked(self):
+        n = 0
+        for i in range(self.block_count):
+            if not self._is_block_done(i) and not self._is_block_claimed(i):
+                n += 1
+        return n
+
+    def _has_unclaimed(self):
+        with self._lock:
+            return self._count_unclaimed_locked() > 0
 
     def _pop_run(self):
         """認領一段連續、尚未完成且未被佔用的區塊，回傳 (start, end) 或 None。
 
-        與逐塊 _pop_block 的差異：一次抓一大段連續區塊（約 TARGET_RUN_BYTES），
-        讓 worker 用單一 Range 請求串流整段，避免每塊都付一次簽章/跳轉延遲。
+        顆粒是動態的：`剩餘未認領 / (活躍 worker × RUN_SPLIT_FACTOR)`，夾在
+        [RUN_MIN_BLOCKS, TARGET_RUN_BYTES 對應的區塊數]。固定 64 MiB 在檔案不大時
+        會讓 worker 數 × 顆粒 ≥ 檔案大小，開場就把所有區塊分光，快的線路再也沒有
+        可搶的工作（見模組頂部 RUN_SPLIT_FACTOR 的說明）。
         """
-        max_blocks = max(1, TARGET_RUN_BYTES // self.block_size) if self.block_size else 1
         with self._lock:
             n = self.block_count
+            now = time.monotonic()
             start = 0
-            while start < n and (self._is_block_done(start) or self._is_block_claimed(start)):
-                start += 1
+            while start < n:
+                if self._is_block_done(start):
+                    start += 1
+                    continue
+                if (self._is_block_claimed(start)
+                        and not self._claim_expired(start, now)):
+                    start += 1
+                    continue
+                break
             if start >= n:
                 return None
+
+            unclaimed = self._count_unclaimed_locked()
+            want = unclaimed // (self._worker_scale() * RUN_SPLIT_FACTOR)
+            max_blocks = max(RUN_MIN_BLOCKS, min(self._run_block_cap(), want))
+
             end = start
             while end + 1 < n and (end - start + 1) < max_blocks:
                 nxt = end + 1
-                if self._is_block_done(nxt) or self._is_block_claimed(nxt):
+                if self._is_block_done(nxt):
+                    break
+                if (self._is_block_claimed(nxt)
+                        and not self._claim_expired(nxt, now)):
                     break
                 end = nxt
             for b in range(start, end + 1):
                 self._set_block_claimed(b)
             return (start, end)
 
-    def _worker(self, proxy, stop):
+    # ------------------------------------------------------------------ #
+    # 速率感知調度（libtorrent peer snub 的對應物）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _set_slot_run(slot, run):
+        if slot is not None:
+            slot['run'] = run
+
+    def _is_line_snubbed(self, key):
+        return key in self._line_slow_since
+
+    def _should_prefetch(self, key):
+        """是否值得為這條線路預取下一段。
+
+        兩個條件：本線路沒被判定為慢線，且池子裡的未認領區塊多於一個 worker
+        的量（預取等於替自己多佔一段，沒有富餘時就變成純粹的囤積）。
+        """
+        if self._is_line_snubbed(key):
+            return False
+        with self._lock:
+            return self._count_unclaimed_locked() > self._worker_scale()
+
+    def _update_line_rates(self):
+        """用位元組差分算各線路的窗口速率（bytes/s）。"""
+        now = time.monotonic()
+        with self._lock:
+            cur = dict(self._line_bytes)
+            self._rate_samples.append((now, cur))
+            if len(self._rate_samples) < 2:
+                return
+            t0, b0 = self._rate_samples[0]
+            dt = now - t0
+            if dt <= 0:
+                return
+            for k, v in cur.items():
+                self._line_rate[k] = max(0.0, (v - b0.get(k, 0)) / dt)
+
+    def _run_remaining_bytes(self, run):
+        """run 內尚未完成的位元組數。
+
+        slot['run'] 在 run 寫完後不會立刻清掉（要等下一次認領才覆寫），所以
+        不能拿區間長度當「它還握著多少」。對著已經做完的 run 設搶佔旗標，等於
+        什麼都沒讓出來——實測就是這樣讓快線白等了 1.5 秒然後退場。
+        """
+        block = max(1, self.block_size)
+        with self._lock:
+            left = sum(1 for b in range(run[0], run[1] + 1)
+                       if not self._is_block_done(b))
+        return left * block
+
+    def _pick_preempt_slot(self, key):
+        """挑該線路上「手上剩餘量最大」的 worker 來打斷。"""
+        best = None
+        for s in list(self._slots):
+            if s.get('line') != key or s.get('run') is None:
+                continue
+            size = self._run_remaining_bytes(s['run'])
+            if size <= 0:
+                continue
+            if best is None or size > best[0]:
+                best = (size, s)
+        return best[1] if best else None
+
+    def _steal_tail(self, key):
+        """池子空了但仍有區塊卡在別人手上時，請對方讓出剩下的尾巴。
+
+        這是 IDM 動態分段的核心行為：連線空出來不是退場，而是去切別人手上還沒
+        下完的那一段。少了這步，快線在「沒有未認領區塊、慢線還握著兩段」時只能
+        閒置到任務結束——就是使用者看到的「socks5 下完一半開始發呆」。
+
+        一次讓多個 worker 讓位（不是只挑一個）：池子空的那一刻，慢線上所有還
+        握著剩餘量的 worker 都應該交出尾巴，否則 12 個 worker 排隊輪流讓位，
+        光冷卻時間就吃掉好幾秒。
+
+        只搶明顯比自己慢的線路（1.2 倍餘裕），避免兩條同速線路互相搶、來回換手。
+        """
+        now = time.monotonic()
+        with self._lock:
+            # 至少要有一個完整取樣窗才有速率可比。開場（小檔案、區塊瞬間被
+            # 分光）時大家都沒速率，此時去搶別人的 run 只會把正在跑的工作
+            # 打斷再重抓，純虧。
+            if len(self._rate_samples) < 2:
+                return False
+        mine = self._line_rate.get(key, 0.0)
+        candidates = []
+        for s in list(self._slots):
+            other = s.get('line')
+            run = s.get('run')
+            if not other or other == key or run is None:
+                continue
+            theirs = self._line_rate.get(other, 0.0)
+            if mine > 0 and theirs > 0 and mine <= theirs * 1.2:
+                continue
+            if now - self._line_preempt_at.get(other, 0.0) < 0.5:
+                continue
+            size = self._run_remaining_bytes(run)
+            if size <= 0:
+                continue
+            candidates.append((size, other, s))
+        if not candidates:
+            return False
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        total = 0
+        for size, other, slot in candidates[:8]:
+            slot['preempt'].set()
+            self._line_preempt_at[other] = now
+            self._steal_count += 1
+            total += size
+        logger.info("event=tail_steal task_id=%s from=%s slots=%s bytes=%s",
+                    self.task_id, candidates[0][1],
+                    min(len(candidates), 8), total)
+        return True
+
+    def _claim_or_steal(self, key, stop, timeout=3.0):
+        """取得下一段工作；池子空時持續接管別人手上的尾巴並等它釋放。
+
+        等待期間反覆嘗試搶佔（每次換一條線路），因為對方要等到下一個 chunk
+        邊界才會看到旗標；只試一次就放棄等於讓快線提早退場。
+        """
+        run = self._pop_run()
+        if run is not None:
+            return run
+        with self._lock:
+            self._starving += 1
+        try:
+            deadline = time.monotonic() + timeout
+            while not stop.is_set() and time.monotonic() < deadline:
+                if self._all_blocks_done():
+                    return None
+                self._steal_tail(key)
+                time.sleep(0.05)
+                run = self._pop_run()
+                if run is not None:
+                    return run
+            return None
+        finally:
+            with self._lock:
+                self._starving = max(0, self._starving - 1)
+
+    def _snub_slow_lines(self, now):
+        """把速率長期低於最快線路 1/3 的線路手上的 run 打斷，讓快線接手。
+
+        為什麼不是「停用慢線」：慢線仍然有頻寬可用，只是不該佔著一大段。
+        打斷後它會重領一個更小的 run（_pop_run 依剩餘量收縮），釋出的部分由
+        快線吃掉——這正是 IDM 動態分段的行為。
+        """
+        with self._lock:
+            rates = dict(self._line_rate)
+        if len(rates) < 2:
+            return
+        best = max(rates.values())
+        if best <= 0:
+            return
+        for key, rate in rates.items():
+            if rate >= self.SNUB_RATIO * best:
+                self._line_slow_since.pop(key, None)
+                continue
+            since = self._line_slow_since.setdefault(key, now)
+            if now - since < self.SNUB_WINDOW:
+                continue
+            if now - self._line_preempt_at.get(key, 0.0) < self.LINE_PREEMPT_COOLDOWN:
+                continue
+            slot = self._pick_preempt_slot(key)
+            if slot is None:
+                continue
+            slot['preempt'].set()
+            self._line_preempt_at[key] = now
+            self._snub_count += 1
+            logger.info(
+                "event=line_snub task_id=%s line=%s rate=%.0f best=%.0f",
+                self.task_id, key, rate, best)
+
+    def _worker(self, proxy, stop, slot=None):
         # 初始去同步：隨機延遲一小段，避免多線同時首次握手形成併發共振。
         time.sleep(random.uniform(0, 0.2))
+        key = self._line_key(proxy)
+        with self._lock:
+            self._live_workers += 1
+        if slot is not None:
+            slot['line'] = key
         session = self._make_session(proxy)
         try:
-            run = self._pop_run()
+            run = self._claim_or_steal(key, stop)
             if run is None:
                 return
+            self._set_slot_run(slot, run)
             state = self._request_run(run[0], run[1], session, stop, proxy)
             while not stop.is_set():
                 if state in ('done', 'fail'):
@@ -1251,22 +1524,29 @@ class DownloadTask:
                 _, start_idx, end_idx, req_start, end, r = state
 
                 # 認領下一個 run 並在背景預取：把握手/跳轉延遲藏進本次串流。
-                nxt = self._pop_run()
+                # 慢線不預取——它多握一段只是把區塊鎖在低頻寬的線路上，等於人為
+                # 製造「快線沒活可幹、慢線手上一堆活」。
+                nxt = self._pop_run() if self._should_prefetch(key) else None
                 box = {}
                 thr = None
                 if nxt is not None:
+                    self._set_slot_run(slot, nxt)
                     thr = threading.Thread(
                         target=self._prefetch_run,
                         args=(nxt[0], nxt[1], proxy, stop, box), daemon=True)
                     thr.start()
 
-                # 寫入當前 run
+                # 寫入當前 run。preempt 由看門狗設定：慢線被判定為 snub 時提前
+                # 收工，保留 _partial 讓別條線路從斷點接手，不重抓。
+                if slot is not None:
+                    slot['preempt'].clear()
                 with self._lock:
                     for b in range(start_idx, end_idx + 1):
                         self._active_blocks.add(b)
                 try:
                     result = self._write_run(
-                        start_idx, end_idx, req_start, end, r, stop, proxy)
+                        start_idx, end_idx, req_start, end, r, stop, proxy,
+                        preempt=None if slot is None else slot['preempt'])
                 finally:
                     with self._lock:
                         for b in range(start_idx, end_idx + 1):
@@ -1285,7 +1565,24 @@ class DownloadTask:
                     break
 
                 # 取用預取的下一個 run；無下一個或已被取消則結束。
-                if thr is None or stop.is_set():
+                if thr is None:
+                    if result == 'preempted':
+                        if stop.is_set() or self._starving > 0:
+                            # 有人正在等這批區塊：直接退場，讓它接手。否則剛讓出
+                            # 的區塊會立刻被自己用慢連線搶回去，搶佔等於白做
+                            # （實測每輪多花 1 秒，四輪就多 4 秒）。
+                            break
+                        # 沒人在等：退避一下再重領，避免跟搶佔者同時撲上去。
+                        time.sleep(random.uniform(0.1, 0.25))
+                    nxt = self._claim_or_steal(key, stop)
+                    if nxt is None:
+                        break
+                    self._set_slot_run(slot, nxt)
+                    session = self._make_session(proxy)
+                    state = self._request_run(nxt[0], nxt[1], session, stop, proxy)
+                    continue
+                if stop.is_set():
+                    thr.join(timeout=1)
                     break
                 thr.join()
                 got = box.get('result')
@@ -1293,6 +1590,11 @@ class DownloadTask:
                     break
                 session, state = got
         finally:
+            if slot is not None:
+                slot['line'] = None
+                slot['run'] = None
+            with self._lock:
+                self._live_workers = max(0, self._live_workers - 1)
             try:
                 if session is not None:
                     session.close()
@@ -1385,7 +1687,8 @@ class DownloadTask:
         state = self._request_run(start_idx, end_idx, session, stop, proxy)
         box['result'] = (session, state)
 
-    def _write_run(self, start_idx, end_idx, req_start, end, r, stop, proxy=None):
+    def _write_run(self, start_idx, end_idx, req_start, end, r, stop, proxy=None,
+                   preempt=None):
         need = end - req_start + 1
         key = self._line_key(proxy)
         pos = req_start
@@ -1424,6 +1727,12 @@ class DownloadTask:
                             else:
                                 self._partial[cur_idx] = pos - bstart
                                 break
+                    if preempt is not None and preempt.is_set():
+                        # 慢線讓位：_partial 已由上面的區塊邊界處理更新到最新，
+                        # 直接收工即可，接手的人會從斷點續傳。
+                        r.close()
+                        return self._handle_run_preempted(
+                            start_idx, end_idx, cur_idx)
                     if self._stall_check_enabled():
                         now = time.monotonic()
                         if now - win_start >= self.STALL_WINDOW:
@@ -1470,6 +1779,22 @@ class DownloadTask:
                 if not self._is_block_done(b):
                     self._clear_block_claimed(b)
         return 'fallback'
+
+    def _handle_run_preempted(self, start_idx, end_idx, cur_idx):
+        """慢線主動讓出：保留 _partial（續傳偏移），把尚未完成的區塊還回池子。
+
+        刻意不共用 _handle_run_failure：那不是線路故障，是調度決策。若照失敗
+        路徑記一次重試，同一段被搶佔三次就會把正常區塊推到 MAX_RETRIES，
+        整個任務被誤判成 error。
+        """
+        with self._lock:
+            self._preempt_count += 1
+            for b in range(cur_idx, end_idx + 1):
+                if not self._is_block_done(b):
+                    self._clear_block_claimed(b)
+        logger.info("event=run_preempted task_id=%s run=%s-%s at=%s",
+                    self.task_id, start_idx, end_idx, cur_idx)
+        return 'preempted'
 
     def _handle_run_failure(self, start_idx, end_idx, failed_idx, reason, stop,
                             proxy=None, line_fault=True):
@@ -1908,27 +2233,42 @@ class DownloadTask:
             if line is _NO_LINE:
                 # 所有線路都在隔離中：不派工，等隔離期滿由看門狗再試。
                 return
-            t = threading.Thread(target=self._worker, args=(line, stop), daemon=True)
+            # 每個 worker 一個 slot：搶佔要能指定「哪一個 worker 停手」，
+            # 只有線路層級的旗標會讓同一條線的 6 個 worker 一起斷，白白浪費。
+            # line 先填好再起執行緒：_maintain_workers 用「line 為 None」判斷
+            # slot 已回收，留 None 會讓剛建立、還沒跑起來的 slot 被誤刪。
+            slot = {'line': self._line_key(line), 'preempt': threading.Event(),
+                    'run': None}
+            self._slots.append(slot)
+            t = threading.Thread(target=self._worker, args=(line, stop, slot),
+                                 daemon=True)
             self._workers.append(t)
             self.threads.append(t)
             t.start()
 
     def _maintain_workers(self, stop):
-        """回收已結束的 worker；若一個都不剩且仍有未完成區塊，補開新 worker。
+        """回收已結束的 worker，並把數量補回目標值。
 
-        回傳 True 表示這次有補開。補開前先清空認領位，清掉可能由已退場
-        worker 或孤兒預取執行緒殘留的認領，讓新 worker 能重新認領區塊。
+        過去的條件是「一個都不剩」才補位。那在有兩條線時會踩到：慢線的 worker
+        失敗退場後，只要還有其他 worker 活著就不補，它釋放的區塊永遠沒人下載，
+        任務無聲卡到停滯判定。改成「有未認領區塊就補到目標數」。
+        全部死光時仍先清空認領位，順手回收孤兒預取執行緒留下的殘留。
         """
         alive = [t for t in self._workers if t.is_alive()]
         if len(alive) != len(self._workers):
             self._workers = alive
             self.threads = [t for t in self.threads if t.is_alive()]
-        if alive:
+        self._slots = [s for s in self._slots if s.get('line') is not None]
+        if len(alive) >= self._target_workers:
             return False
-        self._reset_claims()
-        self._spawn_http_workers(stop, self._target_workers)
-        logger.warning("event=workers_respawned task_id=%s count=%s",
-                       self.task_id, self._target_workers)
+        if not self._has_unclaimed():
+            return False
+        if not alive:
+            self._reset_claims()
+        count = self._target_workers - len(alive)
+        self._spawn_http_workers(stop, count)
+        logger.warning("event=workers_respawned task_id=%s count=%s alive=%s",
+                       self.task_id, count, len(alive))
         return True
 
     def _supervisor_loop(self, stop):
@@ -1938,6 +2278,9 @@ class DownloadTask:
         就再也沒人會下載，任務會永遠停在 downloading（進度凍結、不報錯也
         不重試）。此迴圈定期把 worker 補回目標數，並在整條任務連續多輪
         完全沒有位元組進展時判定停滯失敗，讓使用者能重試而不是無聲卡住。
+
+        另外負責速率感知調度：每輪更新各線路速率，並把長期偏慢的線路手上的
+        run 打斷，讓快線接手（見 _snub_slow_lines）。
         """
         last_save = time.time()
         last_progress = self._downloaded()
@@ -1951,7 +2294,9 @@ class DownloadTask:
             if now - last_save >= 5:
                 self.save_progress()
                 last_save = now
+            self._update_line_rates()
             self._maintain_workers(stop)
+            self._snub_slow_lines(time.monotonic())
             cur = self._downloaded()
             if cur > last_progress:
                 last_progress = cur
@@ -1972,8 +2317,22 @@ class DownloadTask:
                 self._set_status('error', reason='stalled')
                 stop.set()
                 break
+        if self._all_blocks_done():
+            # 收尾前先讓 worker 收手：Windows 無法 replace 仍被開啟的檔案，
+            # 而 worker 可能還在跑最後一次 _write_run（重複下載的區段）。
+            stop.set()
+            self._join_workers(2.0)
         if stop is self._stop:
             self.complete_download()
+
+    def _join_workers(self, budget):
+        """以總預算 join worker 執行緒（不逐個 join(timeout)，避免與數量成正比）。"""
+        deadline = time.monotonic() + budget
+        for t in list(self._workers):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            t.join(timeout=left)
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -2029,6 +2388,17 @@ class DownloadTask:
         self._spawn_index = 0
         self._line_fail = {}
         self._line_quarantine_until = {}
+        # 速率窗口與搶佔狀態屬於「這一代」，續傳/重試都要重新量測：
+        # 留著上一代的速率會讓剛恢復的慢線一啟動就被判定 snub。
+        self._line_rate = {}
+        self._rate_samples.clear()
+        self._line_slow_since = {}
+        self._line_preempt_at = {}
+        self._preempt_count = 0
+        self._snub_count = 0
+        self._steal_count = 0
+        self._slots = []
+        self._starving = 0
         # 工作者數不應超過剩餘區塊數，避免空轉的線程
         max_workers = len(self._lines) * self.threads_per_proxy
         if self.block_count > 0:
@@ -2143,6 +2513,23 @@ class DownloadTask:
                     pass
         return True
 
+    @staticmethod
+    def _replace_with_retry(src, dst, budget=3.0):
+        """Windows 上檔案若仍被 worker 或防毒握著，os.replace 會丟 WinError 32。
+
+        所有區塊都已完成，但 worker 可能還在跑最後一次 _write_run（重複下載的
+        區段）或剛好還沒關檔。短暫重試即可，不必為幾百毫秒把整個任務判成失敗。
+        """
+        deadline = time.monotonic() + budget
+        while True:
+            try:
+                os.replace(src, dst)
+                return
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+
     def complete_download(self):
         if not self._completion_lock.acquire(blocking=False):
             return
@@ -2160,7 +2547,7 @@ class DownloadTask:
                 if os.path.exists(self.temp_filepath):
                     if os.path.exists(self.filepath):
                         os.remove(self.filepath)
-                    os.replace(self.temp_filepath, self.filepath)
+                    self._replace_with_retry(self.temp_filepath, self.filepath)
                 if os.path.exists(self.progress_filepath):
                     os.remove(self.progress_filepath)
                 succeeded = True
